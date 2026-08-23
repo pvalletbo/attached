@@ -1,0 +1,251 @@
+name: CI
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+      - converted_to_draft
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Core Rust quality gates
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install Linux build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential \
+            cmake \
+            pkg-config
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.97.1
+          components: clippy, rustfmt
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-on-failure: true
+      - name: Check core Rust formatting
+        run: >-
+          cargo fmt
+          --package attached
+          --package attached-session-sync-protocol
+          --package attached-session-sync-worker
+          --package attached-tunnel-protocol
+          -- --check
+      - name: Run core workspace tests
+        run: >-
+          cargo test --workspace --locked
+          --exclude attached-browser-iroh
+          --exclude attached-browser-sync
+          --exclude herdr-tui-protocol
+      - name: Run Clippy on the core workspace
+        run: >-
+          cargo clippy --workspace --all-targets --locked
+          --exclude attached-browser-iroh
+          --exclude attached-browser-sync
+          --exclude herdr-tui-protocol
+          -- -D warnings
+      - name: Build the core release workspace
+        run: >-
+          cargo build --workspace --release --locked
+          --exclude attached-browser-iroh
+          --exclude attached-browser-sync
+          --exclude herdr-tui-protocol
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --version 0.20.2 --locked
+      - name: Check dependency, license, and source policy
+        run: cargo deny check bans licenses sources
+      - name: Check whitespace
+        run: git diff --check
+
+  cloudflare-worker:
+    name: Cloudflare Worker build and local integration
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: crates/session-sync-worker
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install Linux build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential \
+            pkg-config \
+            libssl-dev
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.97.1
+          targets: wasm32-unknown-unknown
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: cloudflare-worker
+          cache-on-failure: true
+      - name: Install worker-build
+        run: cargo install worker-build --version 0.8.5 --locked
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - name: Enable the pinned pnpm version
+        run: corepack enable
+      - name: Install Worker dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build Rust Worker
+        run: pnpm run build
+      - name: Run Worker against local Durable Objects
+        run: pnpm run test:integration
+
+  web:
+    name: Experimental web and browser quality gates
+    # The browser client remains available for explicit, temporary opt-in runs.
+    if: >-
+      vars.ENABLE_EXPERIMENTAL_WEB == 'true' &&
+      (github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.draft == false)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CC: clang-18
+      CXX: clang++-18
+      CC_wasm32_unknown_unknown: clang-18
+      CXX_wasm32_unknown_unknown: clang++-18
+      CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_LINKER: wasm-ld-18
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install native build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential \
+            clang-18 \
+            lld-18
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.97.1
+          targets: wasm32-unknown-unknown
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: browser-wasm
+          cache-on-failure: true
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - name: Enable the pinned pnpm version
+        working-directory: experimental/web-client
+        run: corepack enable
+      - name: Install web dependencies
+        working-directory: experimental/web-client
+        run: pnpm install --frozen-lockfile
+      - name: Run web unit tests
+        working-directory: experimental/web-client
+        run: pnpm test
+      - name: Run ESLint
+        working-directory: experimental/web-client
+        run: pnpm run lint
+      - name: Install matching wasm-bindgen CLI
+        run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+      - name: Assemble Attached browser client
+        working-directory: experimental/web-client
+        run: pnpm run build
+      - name: Install Playwright Chromium
+        working-directory: experimental/web-client
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Smoke-test assembled browser client
+        working-directory: experimental/web-client
+        run: pnpm exec playwright test
+
+  macos:
+    name: Core macOS workspace
+    # Set this repository variable to true to opt in to supplemental macOS checks.
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.draft == false) &&
+      vars.ENABLE_GITHUB_HOSTED_MACOS == 'true'
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      # macOS exposes /var as a symlink to /private/var. Use the canonical
+      # temporary root so secure-state tests can retain no-symlink traversal.
+      TMPDIR: /private/tmp
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.97.1
+          components: clippy, rustfmt
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: macos
+          cache-on-failure: true
+      - name: Check core formatting on macOS
+        run: >-
+          cargo fmt
+          --package attached
+          --package attached-session-sync-protocol
+          --package attached-session-sync-worker
+          --package attached-tunnel-protocol
+          -- --check
+      - name: Run core workspace tests on macOS
+        run: >-
+          cargo test --workspace --locked
+          --exclude attached-browser-iroh
+          --exclude attached-browser-sync
+          --exclude herdr-tui-protocol
+      - name: Run Clippy on the core macOS workspace
+        run: >-
+          cargo clippy --workspace --all-targets --locked
+          --exclude attached-browser-iroh
+          --exclude attached-browser-sync
+          --exclude herdr-tui-protocol
+          -- -D warnings
+      - name: Build the core release workspace on macOS
+        run: >-
+          cargo build --workspace --release --locked
+          --exclude attached-browser-iroh
+          --exclude attached-browser-sync
+          --exclude herdr-tui-protocol
+      - name: Install cargo-deny on macOS
+        run: cargo install cargo-deny --version 0.20.2 --locked
+      - name: Check dependency, license, and source policy on macOS
+        run: cargo deny check bans licenses sources
+      - name: Check whitespace on macOS
+        run: git diff --check

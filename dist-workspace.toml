@@ -1,0 +1,10 @@
+[workspace]
+members = ["cargo:."]
+
+# Non-publishing cargo-dist configuration. It builds only the user-facing CLI;
+# the workspace's supporting crates remain implementation details.
+[dist]
+cargo-dist-version = "0.32.0"
+packages = ["attached"]
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+installers = []

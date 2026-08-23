@@ -1,0 +1,41 @@
+name = "attached-session-sync"
+main = "build/index.js"
+compatibility_date = "2026-08-18"
+workers_dev = false
+preview_urls = false
+send_metrics = false
+routes = [
+  { pattern = "herdr.attached.sh", zone_name = "attached.sh", custom_domain = true },
+]
+
+[build]
+command = "worker-build --release"
+
+[durable_objects]
+bindings = [
+  { name = "ACCOUNTS", class_name = "AccountObject" },
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["AccountObject"]
+
+[observability]
+enabled = true
+head_sampling_rate = 0.01
+
+[observability.logs]
+invocation_logs = false
+
+[env.dev]
+name = "attached-session-sync-dev"
+routes = [
+  { pattern = "herdr.dev.attached.sh", zone_name = "attached.sh", custom_domain = true },
+]
+
+# Bindings are not inherited by named Wrangler environments. The top-level
+# migration list is inherited and applies independently to this Worker.
+[env.dev.durable_objects]
+bindings = [
+  { name = "ACCOUNTS", class_name = "AccountObject" },
+]

@@ -1,0 +1,67 @@
+[workspace]
+members = [
+    "crates/cli",
+    "experimental/crates/browser-iroh",
+    "experimental/crates/browser-sync",
+    "experimental/crates/herdr-tui-protocol",
+    "crates/session-sync-protocol",
+    "crates/session-sync-worker",
+    "crates/tunnel-protocol",
+]
+default-members = ["crates/cli"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+repository = "https://github.com/pvalletbo/attached"
+homepage = "https://github.com/pvalletbo/attached"
+description = "Discover and securely attach to synchronized Herdr sessions over Iroh"
+# Distribution is via signed/checksummed release archives and a future Homebrew
+# tap. Publishing these workspace crates to a registry is intentionally disabled.
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.dependencies]
+anyhow = "1.0"
+base64 = "=0.22.1"
+bincode = { version = "2", features = ["serde"] }
+chacha20poly1305 = { version = "=0.11.0", default-features = false, features = ["alloc", "getrandom", "zeroize"] }
+chrono = { version = "=0.4.45", default-features = false, features = ["serde", "std"] }
+clap = { version = "4.5", features = ["derive"] }
+fs4 = "=1.1.0"
+futures-util = "=0.3.33"
+getrandom = "=0.4.3"
+attached-session-sync-protocol = { path = "crates/session-sync-protocol", default-features = false }
+attached-tunnel-protocol = { path = "crates/tunnel-protocol" }
+hkdf = "=0.13.0"
+iroh = "1.0.3"
+iroh-tickets = "1.0.0"
+n0-future = "0.3"
+postcard = { version = "1", features = ["use-std"] }
+rand_core = "=0.10.1"
+reqwest = { version = "=0.13.4", default-features = false, features = ["json", "rustls"] }
+rustix = { version = "1.1.4", features = ["fs", "process"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+sha2 = { version = "=0.11.0", default-features = false, features = ["alloc", "zeroize"] }
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+url = "=2.5.8"
+uuid = "=1.24.0"
+zeroize = { version = "=1.9.0", features = ["derive"] }
+wasm-bindgen = "=0.2.126"
+wasm-bindgen-futures = "=0.4.76"
+worker = "=0.8.5"
+
+# The profile used by cargo-dist for distributable CLI artifacts.
+[profile.dist]
+inherits = "release"
+lto = "thin"

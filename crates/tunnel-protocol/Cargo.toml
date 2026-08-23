@@ -1,0 +1,21 @@
+[package]
+name = "attached-tunnel-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+description = "Authenticated Iroh tunnel protocol for Attached"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+iroh.workspace = true
+postcard.workspace = true
+serde.workspace = true
+tokio = { version = "1", features = ["io-util"] }
+zeroize.workspace = true

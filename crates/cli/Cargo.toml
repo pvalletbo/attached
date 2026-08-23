@@ -1,0 +1,40 @@
+[package]
+name = "attached"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+description.workspace = true
+
+[lints]
+workspace = true
+
+# Release archives are intentionally enabled even though crates.io publication is
+# disabled at the workspace level.
+[package.metadata.dist]
+dist = true
+
+[dependencies]
+anyhow.workspace = true
+chrono = { workspace = true, features = ["clock"] }
+clap.workspace = true
+fs4.workspace = true
+futures-util.workspace = true
+attached-session-sync-protocol = { workspace = true, features = ["session-access"] }
+attached-tunnel-protocol.workspace = true
+iroh.workspace = true
+iroh-tickets.workspace = true
+reqwest.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+zeroize.workspace = true

@@ -1,0 +1,38 @@
+[package]
+name = "attached-session-sync-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+description = "Bounded protocol and cryptography primitives for Herdr session synchronization"
+
+[lints]
+workspace = true
+
+[features]
+default = ["session-access"]
+session-access = [
+    "dep:chacha20poly1305",
+    "dep:chrono",
+    "dep:attached-tunnel-protocol",
+    "dep:hkdf",
+    "dep:iroh-tickets",
+]
+
+[dependencies]
+base64.workspace = true
+chacha20poly1305 = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+getrandom = { workspace = true, features = ["wasm_js"] }
+attached-tunnel-protocol = { workspace = true, optional = true }
+hkdf = { workspace = true, optional = true }
+iroh-tickets = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+url.workspace = true
+uuid.workspace = true
+zeroize.workspace = true

@@ -1,0 +1,13 @@
+.git
+.github
+.idea
+.opencode
+target
+experimental/web-client/node_modules
+experimental/web-client/dist
+experimental/web-client/src/protocol-bindings
+experimental/web-client/src/sync-bindings
+experimental/web-client/src/iroh-bindings
+experimental/web-client/test-results
+experimental/web-client/playwright-report
+*.bundle

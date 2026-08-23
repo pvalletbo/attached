@@ -1,0 +1,29 @@
+[package]
+name = "attached-browser-iroh"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+description = "Browser WebAssembly Iroh transport for Attached"
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+attached-tunnel-protocol.workspace = true
+iroh.workspace = true
+iroh-tickets.workspace = true
+n0-future.workspace = true
+tokio = { version = "1", features = ["io-util", "macros", "sync"] }
+tokio-util.workspace = true
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true

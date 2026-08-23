@@ -1,0 +1,33 @@
+[package]
+name = "attached-session-sync-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+description = "Cloudflare Worker synchronization API backed by per-account Durable Objects"
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+futures-util.workspace = true
+getrandom = { workspace = true, features = ["wasm_js"] }
+attached-session-sync-protocol.workspace = true
+serde.workspace = true
+uuid = { workspace = true, features = ["js", "v7"] }
+wasm-bindgen.workspace = true
+worker.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+reqwest.workspace = true
+rustix.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
