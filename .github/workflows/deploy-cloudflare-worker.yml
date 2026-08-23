@@ -25,9 +25,7 @@ concurrency:
 jobs:
   deploy:
     name: Deploy Worker
-    if: >-
-      vars.ENABLE_CLOUDFLARE_DEPLOY == 'true' &&
-      (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main')
+    if: github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     environment:
