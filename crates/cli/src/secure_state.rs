@@ -93,7 +93,7 @@ fn acquire_lock(directory: &StateDir, state_dir: &Path, lock_name: &str) -> Resu
 }
 
 pub fn prepare_private_dir(path: &Path) -> Result<()> {
-    StateDir::open(path).map(drop)
+    open_state_directory(path, true, true).map(drop)
 }
 
 /// Creates a credential export as a new owner-only file without involving the
@@ -147,11 +147,11 @@ pub(crate) struct StateDir {
 
 impl StateDir {
     pub(crate) fn open(path: &Path) -> Result<Self> {
-        open_state_directory(path, true).map(|directory| Self { directory })
+        open_state_directory(path, true, false).map(|directory| Self { directory })
     }
 
     fn open_existing(path: &Path) -> Result<Self> {
-        open_state_directory(path, false).map(|directory| Self { directory })
+        open_state_directory(path, false, false).map(|directory| Self { directory })
     }
 
     pub(crate) fn open_private_lock_file(&self, name: &str, create: bool) -> Result<Option<File>> {
@@ -307,7 +307,7 @@ impl StateDir {
     }
 }
 
-fn open_state_directory(path: &Path, create: bool) -> Result<File> {
+fn open_state_directory(path: &Path, create: bool, repair_permissions: bool) -> Result<File> {
     ensure!(!path.as_os_str().is_empty(), "state path is empty");
     let start = if path.is_absolute() { "/" } else { "." };
     let mut directory = open_directory_path(Path::new(start))?;
@@ -328,6 +328,18 @@ fn open_state_directory(path: &Path, create: bool) -> Result<File> {
         }
     }
 
+    if repair_permissions {
+        let metadata = directory.metadata()?;
+        ensure!(
+            metadata.uid() == geteuid().as_raw(),
+            "{} is not owned by the current user",
+            path.display()
+        );
+        if metadata.mode() & 0o7777 != 0o700 {
+            protect_directory(&directory)
+                .with_context(|| format!("failed to protect state directory {}", path.display()))?;
+        }
+    }
     validate_private_dir(&directory, path)?;
     Ok(directory)
 }
@@ -614,29 +626,26 @@ mod tests {
     }
 
     #[test]
-    fn existing_directory_with_unsafe_permissions_is_rejected_without_repair() {
+    fn existing_directory_with_unsafe_permissions_is_repaired() {
         // APFS may clear setgid during chmod, so use permission changes that
         // every supported filesystem preserves. Other Unix targets also cover
         // the special-bit case.
         #[cfg(target_os = "macos")]
-        let modes = [0o755, 0o750];
+        let modes = [0o775, 0o755, 0o750];
         #[cfg(not(target_os = "macos"))]
-        let modes = [0o755, 0o750, 0o2700];
+        let modes = [0o775, 0o755, 0o750, 0o2700];
 
         for mode in modes {
             let root = crate::test_support::canonical_tempdir();
             let state = root.path().join("state");
             fs::create_dir(&state).unwrap();
             fs::set_permissions(&state, fs::Permissions::from_mode(mode)).unwrap();
-            assert!(
-                prepare_private_dir(&state)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("unsafe permissions")
-            );
+
+            prepare_private_dir(&state).unwrap();
+
             assert_eq!(
                 fs::metadata(&state).unwrap().permissions().mode() & 0o7777,
-                mode
+                0o700
             );
         }
     }
