@@ -428,6 +428,9 @@ async fn authenticate_client(
 fn spawn_herdr(herdr_bin: &Path, tui_socket: &Path) -> Result<Child> {
     let mut command = Command::new(herdr_bin);
     command
+        // The proxy exposes only Herdr's TUI socket. Bare `herdr` also probes the
+        // default API socket and can reject an unrelated stale local server.
+        .arg("client")
         .env_remove("HERDR_SOCKET_PATH")
         .env("HERDR_CLIENT_SOCKET_PATH", tui_socket)
         // A proxied socket attach otherwise looks local to Herdr and requests the
