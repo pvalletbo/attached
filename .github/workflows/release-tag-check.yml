@@ -1,0 +1,29 @@
+name: Validate stable release tag
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Require a stable vX.Y.Z tag
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Validate release ref
+        shell: bash
+        env:
+          RELEASE_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+
+          # Pull requests run `dist plan` without publishing a release.
+          if [[ "$RELEASE_REF" == refs/pull/* ]]; then
+            exit 0
+          fi
+
+          if [[ ! "$RELEASE_REF" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            printf 'release tags must match vX.Y.Z; got %s\n' "$RELEASE_REF" >&2
+            exit 1
+          fi

@@ -1,10 +1,46 @@
 [workspace]
 members = ["cargo:."]
 
-# Non-publishing cargo-dist configuration. It builds only the user-facing CLI;
-# the workspace's supporting crates remain implementation details.
+# Config for 'dist'
 [dist]
+# Pin the dist version used to generate and run release CI.
 cargo-dist-version = "0.32.0"
+# Only distribute the user-facing CLI from this multi-package workspace.
 packages = ["attached"]
-targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
-installers = []
+# Build only the selected CLI package rather than every workspace member.
+precise-builds = true
+# Generate the GitHub release workflow and publish to GitHub Releases.
+ci = "github"
+hosting = "github"
+# Build a curl-compatible shell installer.
+installers = ["shell"]
+install-path = "CARGO_HOME"
+install-updater = false
+# Native runners avoid cross-compilation for all supported platforms.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-gnu",
+]
+# Validate the release plan on pull requests without building or publishing artifacts.
+pr-run-mode = "plan"
+# Reject anything except stable vX.Y.Z tags before release builds start.
+plan-jobs = ["./release-tag-check"]
+# Generate checksums and attest every artifact before creating the GitHub Release.
+checksum = "sha256"
+github-attestations = true
+github-attestations-phase = "host"
+
+# Build prerequisites for GNU/Linux targets.
+[dist.dependencies.apt]
+build-essential = "*"
+cmake = "*"
+pkg-config = "*"
+
+# Pin generated workflow actions to reviewed commits.
+[dist.github-action-commits]
+"actions/checkout" = "d23441a48e516b6c34aea4fa41551a30e30af803" # v6.1.0
+"actions/upload-artifact" = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" # v7.0.1
+"actions/download-artifact" = "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c" # v8.0.1
+"actions/attest" = "1e69f48acb82d1966a394da916b4c1698aa569d6" # v4.2.2
