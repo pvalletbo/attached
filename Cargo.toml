@@ -19,8 +19,6 @@ license = "MIT"
 repository = "https://github.com/pvalletbo/attached"
 homepage = "https://github.com/pvalletbo/attached"
 description = "Discover and securely attach to synchronized Herdr sessions over Iroh"
-# Distribution is via signed/checksummed release archives and a future Homebrew
-# tap. Publishing these workspace crates to a registry is intentionally disabled.
 publish = false
 
 [workspace.lints.rust]
@@ -61,7 +59,7 @@ wasm-bindgen = "=0.2.126"
 wasm-bindgen-futures = "=0.4.76"
 worker = "=0.8.5"
 
-# The profile used by cargo-dist for distributable CLI artifacts.
+# The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
 lto = "thin"

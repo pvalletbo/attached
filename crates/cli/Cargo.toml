@@ -12,8 +12,7 @@ description.workspace = true
 [lints]
 workspace = true
 
-# Release archives are intentionally enabled even though crates.io publication is
-# disabled at the workspace level.
+# The CLI is distributed as release artifacts even though crates.io publishing is disabled.
 [package.metadata.dist]
 dist = true
 
