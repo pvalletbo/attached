@@ -43,6 +43,9 @@ impl Session {
     pub async fn attach_local(&self, herdr_bin: &Path) -> Result<i32> {
         self.validate()?;
         let status = Command::new(herdr_bin)
+            // The selected server is already running and its TUI socket was validated.
+            // Skip bare Herdr's unrelated default-API-server compatibility probe.
+            .arg("client")
             .env_remove("HERDR_SOCKET_PATH")
             .env("HERDR_CLIENT_SOCKET_PATH", &self.tui_socket)
             .env_remove("HERDR_REMOTE_KEYBINDINGS")
@@ -155,7 +158,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_attach_uses_only_the_selected_tui_socket() {
+    async fn local_attach_uses_direct_client_mode_for_the_selected_tui_socket() {
         let root = tempfile::tempdir().unwrap();
         let tui_socket = root.path().join("tui.sock");
         let _tui_listener = std::os::unix::net::UnixListener::bind(&tui_socket).unwrap();
@@ -164,7 +167,8 @@ mod tests {
 test -z "$HERDR_SOCKET_PATH" || exit 11
 test -S "$HERDR_CLIENT_SOCKET_PATH" || exit 12
 test -z "$HERDR_REMOTE_KEYBINDINGS" || exit 13
-test "$#" -eq 0 || exit 14
+test "$#" -eq 1 || exit 14
+test "$1" = client || exit 15
 exit 7
 "#,
         );

@@ -24,14 +24,14 @@ fn maps_normal_and_signal_exit_statuses() {
 }
 
 #[tokio::test]
-async fn spawned_herdr_is_interactive_only_and_requests_local_keybindings() {
+async fn spawned_herdr_uses_direct_client_mode_and_local_keybindings() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let root = tempfile::tempdir().unwrap();
     let executable = root.path().join("herdr");
     std::fs::write(
         &executable,
-        b"#!/bin/sh\ntest -z \"$HERDR_SOCKET_PATH\" && test \"$HERDR_CLIENT_SOCKET_PATH\" = /tmp/tui.sock && test \"$HERDR_REMOTE_KEYBINDINGS\" = local && test \"$#\" -eq 0\n",
+        b"#!/bin/sh\ntest -z \"$HERDR_SOCKET_PATH\" && test \"$HERDR_CLIENT_SOCKET_PATH\" = /tmp/tui.sock && test \"$HERDR_REMOTE_KEYBINDINGS\" = local && test \"$#\" -eq 1 && test \"$1\" = client\n",
     )
     .unwrap();
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
