@@ -96,11 +96,16 @@ async fn refresh_sessions_with_registry(
     let mut accepted = Vec::with_capacity(index.records.len());
     for indexed in index.records {
         let previous = existing.remove(&indexed.record_id);
-        if previous
-            .as_ref()
-            .is_some_and(|record| record.service_revision == indexed.revision)
+        if let Some(record) = previous.filter(|record| record.service_revision == indexed.revision)
         {
-            accepted.push(previous.expect("checked as present"));
+            tracing::debug!(
+                record_id = %indexed.record_id,
+                revision = indexed.revision,
+                source = "cache",
+                reason = "unchanged_revision",
+                "synchronized record accepted"
+            );
+            accepted.push(record);
             continue;
         }
 
@@ -132,17 +137,46 @@ async fn refresh_sessions_with_registry(
             now,
             local_version,
         };
-        let opened = open_session_access_descriptor_cursorless_for_native_upgrade(
+        let opened = match open_session_access_descriptor_cursorless_for_native_upgrade(
             &envelope,
             account.account_root_key(),
             &context,
-        )
-        .with_context(|| format!("synchronized record {} was rejected", indexed.record_id))?;
-        accepted.push(CatalogRecord::from_opened(
-            indexed.record_id,
-            fetched.revision,
-            &opened,
-        ));
+        ) {
+            Ok(opened) => opened,
+            Err(error) => {
+                tracing::warn!(
+                    record_id = %indexed.record_id,
+                    revision = fetched.revision,
+                    source = "service",
+                    reason = "envelope_rejected",
+                    "synchronized record rejected"
+                );
+                return Err(error).with_context(|| {
+                    format!("synchronized record {} was rejected", indexed.record_id)
+                });
+            }
+        };
+        let descriptor = opened.descriptor();
+        tracing::debug!(
+            record_id = %indexed.record_id,
+            revision = fetched.revision,
+            source = "service",
+            reason = "opened_envelope",
+            host = descriptor.host_label(),
+            sessions = ?descriptor.sessions(),
+            "synchronized record accepted"
+        );
+        let record = CatalogRecord::from_opened(indexed.record_id, fetched.revision, &opened);
+        accepted.push(record);
+    }
+    for removed in existing.values() {
+        tracing::debug!(
+            record_id = %removed.record_id,
+            revision = removed.service_revision,
+            source = "live_index",
+            reason = "absent",
+            "synchronized record removed"
+        );
     }
     accepted.sort_by_key(|record| record.record_id);
     catalog.records = accepted;
@@ -198,8 +232,15 @@ mod tests {
     };
     use attached_tunnel_protocol::CapabilitySecret;
     use iroh_tickets::endpoint::EndpointTicket;
-    use std::{collections::BTreeMap, os::unix::fs::PermissionsExt as _, time::Duration};
+    use std::{
+        collections::BTreeMap,
+        io::Write,
+        os::unix::fs::PermissionsExt as _,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tracing::instrument::WithSubscriber as _;
 
     const ENDPOINT: &str = "endpointacxfr74igmsbvsbnn73wcecg5vt3kbzncqwfrdiampuufwnhkublmaqacbuhi5dqhixs6zdfojyc43lffyxqcad7aaaadaai";
     const ENDPOINT_ID: [u8; 32] = [
@@ -208,13 +249,45 @@ mod tests {
         0x02, 0xb6,
     ];
 
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CaptureWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for Capture {
+        type Writer = CaptureWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            CaptureWriter(self.0.clone())
+        }
+    }
+
+    impl Capture {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
     async fn serve_catalog(
         listener: tokio::net::TcpListener,
         index_path: String,
-        index_body: Vec<u8>,
+        index_bodies: Vec<Vec<u8>>,
         records: BTreeMap<String, Vec<u8>>,
     ) -> anyhow::Result<()> {
-        for _ in 0..=records.len() {
+        let request_count = records.len() + index_bodies.len();
+        let mut index_bodies = index_bodies.into_iter();
+        for _ in 0..request_count {
             let (mut stream, _) = listener.accept().await?;
             let mut request = Vec::new();
             loop {
@@ -234,12 +307,18 @@ mod tests {
                 .and_then(|line| line.split_ascii_whitespace().nth(1))
                 .ok_or_else(|| anyhow::anyhow!("malformed HTTP request"))?;
             let (body, etag) = if path == index_path {
-                (&index_body, None)
+                (
+                    index_bodies
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("unexpected extra index request"))?,
+                    None,
+                )
             } else {
                 (
                     records
                         .get(path)
-                        .ok_or_else(|| anyhow::anyhow!("unexpected HTTP path {path}"))?,
+                        .ok_or_else(|| anyhow::anyhow!("unexpected HTTP path {path}"))?
+                        .clone(),
                     Some("ETag: \"1\"\r\n"),
                 )
             };
@@ -249,7 +328,7 @@ mod tests {
                 body.len()
             );
             stream.write_all(response.as_bytes()).await?;
-            stream.write_all(body).await?;
+            stream.write_all(&body).await?;
             stream.shutdown().await?;
         }
         Ok(())
@@ -259,7 +338,8 @@ mod tests {
     async fn native_refresh_persists_versions_and_fails_when_the_service_is_unavailable() {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let listener_addr = listener.local_addr().unwrap();
+            let origin = format!("http://{listener_addr}");
             let root = crate::test_support::canonical_tempdir();
             let state_dir = root.path().join("state");
             let registry_dir = root.path().join("registry-user/live-endpoints");
@@ -315,6 +395,13 @@ mod tests {
                     SessionAccessVersion::new(2, 9, 9),
                     remote_endpoint,
                 ),
+                (
+                    13_u8,
+                    "absent-host",
+                    "gone",
+                    SessionAccessVersion::new(3, 2, 1),
+                    ENDPOINT.to_owned(),
+                ),
             ];
             let mut entries = Vec::new();
             let mut records = BTreeMap::new();
@@ -346,15 +433,94 @@ mod tests {
                     revision: 1,
                 });
             }
-            let index = LiveRecordIndex::new(entries).unwrap();
+            let index = LiveRecordIndex::new(entries.clone()).unwrap();
             let index_body = serde_json::to_vec(&index).unwrap();
             let index_path = format!("/v1/accounts/{}/records", account.account_id());
-            let server = tokio::spawn(serve_catalog(listener, index_path, index_body, records));
+            let retained_entry = *entries
+                .iter()
+                .find(|entry| entry.record_id == RecordId::from_bytes([9; 16]))
+                .unwrap();
+            let reuse_index = LiveRecordIndex::new(vec![retained_entry]).unwrap();
+            let reuse_index_body = serde_json::to_vec(&reuse_index).unwrap();
+            let rejected_id = RecordId::from_bytes([14; 16]);
+            let rejected_descriptor = SessionAccessDescriptor::new(
+                "rejected-host".to_owned(),
+                now - Duration::from_secs(1),
+                now + Duration::from_secs(300),
+                ENDPOINT.to_owned(),
+                CapabilitySecret::from_bytes([14; 32]),
+                SessionAccessVersion::new(3, 2, 1),
+                vec!["rejected-session".to_owned()],
+            )
+            .unwrap();
+            let rejected_crypto = seal_session_access_descriptor(
+                &rejected_descriptor,
+                account.account_root_key(),
+                account.account_id().as_bytes(),
+                rejected_id.as_bytes(),
+            )
+            .unwrap();
+            let (rejected_nonce, mut rejected_ciphertext) = rejected_crypto.into_parts();
+            rejected_ciphertext[0] ^= 1;
+            let rejected_body =
+                serde_json::to_vec(&Envelope::new(rejected_nonce, rejected_ciphertext).unwrap())
+                    .unwrap();
+            records.insert(
+                format!(
+                    "/v1/accounts/{}/records/{rejected_id}",
+                    account.account_id()
+                ),
+                rejected_body,
+            );
+            let rejected_index = LiveRecordIndex::new(vec![LiveRecordIndexEntry {
+                record_id: rejected_id,
+                revision: 1,
+            }])
+            .unwrap();
+            let rejected_index_body = serde_json::to_vec(&rejected_index).unwrap();
+            let server = tokio::spawn(serve_catalog(
+                listener,
+                index_path,
+                vec![index_body, reuse_index_body, rejected_index_body],
+                records,
+            ));
             let _guard = crate::endpoint_registry::register(&registry_dir, ENDPOINT_ID).unwrap();
 
+            let capture = Capture::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_writer(capture.clone())
+                .without_time()
+                .with_target(false)
+                .with_ansi(false)
+                .finish();
             let refreshed = refresh_sessions_with_registry(&state_dir, local, &registry_dir)
+                .with_subscriber(subscriber)
                 .await
                 .unwrap();
+            let log = capture.contents();
+            let accepted_id = RecordId::from_bytes([9; 16]);
+            for expected in [
+                "synchronized record accepted".to_owned(),
+                format!("record_id={accepted_id}"),
+                "revision=1".to_owned(),
+                "source=\"service\"".to_owned(),
+                "reason=\"opened_envelope\"".to_owned(),
+                "host=\"duplicate-host\"".to_owned(),
+                "sessions=[\"work\"]".to_owned(),
+            ] {
+                assert!(log.contains(&expected), "missing {expected:?} in {log:?}");
+            }
+            for forbidden in [
+                ENDPOINT,
+                "capability",
+                "nonce",
+                "ciphertext",
+                "payload",
+                "registry-user",
+            ] {
+                assert!(!log.contains(forbidden), "leaked {forbidden:?} in {log:?}");
+            }
             assert_eq!(refreshed.warnings.len(), 1, "{:?}", refreshed.warnings);
             assert!(
                 refreshed.warnings[0]
@@ -405,6 +571,91 @@ mod tests {
                     .unwrap()
                 );
             }
+            let capture = Capture::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_writer(capture.clone())
+                .without_time()
+                .with_target(false)
+                .with_ansi(false)
+                .finish();
+            let reused = refresh_sessions_with_registry(&state_dir, local, &registry_dir)
+                .with_subscriber(subscriber)
+                .await
+                .unwrap();
+            assert_eq!(reused.sessions.len(), 1);
+            let log = capture.contents();
+            let retained_id = RecordId::from_bytes([9; 16]);
+            for expected in [
+                "synchronized record accepted".to_owned(),
+                format!("record_id={retained_id}"),
+                "revision=1".to_owned(),
+                "source=\"cache\"".to_owned(),
+                "reason=\"unchanged_revision\"".to_owned(),
+            ] {
+                assert!(log.contains(&expected), "missing {expected:?} in {log:?}");
+            }
+            let removed_id = RecordId::from_bytes([13; 16]);
+            for expected in [
+                "synchronized record removed".to_owned(),
+                format!("record_id={removed_id}"),
+                "revision=1".to_owned(),
+                "source=\"live_index\"".to_owned(),
+                "reason=\"absent\"".to_owned(),
+            ] {
+                assert!(log.contains(&expected), "missing {expected:?} in {log:?}");
+            }
+            for forbidden in [
+                ENDPOINT,
+                "duplicate-host",
+                "work",
+                "capability",
+                "nonce",
+                "ciphertext",
+                "payload",
+                "registry-user",
+            ] {
+                assert!(!log.contains(forbidden), "leaked {forbidden:?} in {log:?}");
+            }
+
+            let capture = Capture::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_writer(capture.clone())
+                .without_time()
+                .with_target(false)
+                .with_ansi(false)
+                .finish();
+            let rejection = refresh_sessions_with_registry(&state_dir, local, &registry_dir)
+                .with_subscriber(subscriber)
+                .await
+                .unwrap_err();
+            assert!(
+                rejection.to_string().contains("was rejected"),
+                "{rejection:#}"
+            );
+            let log = capture.contents();
+            for expected in [
+                "synchronized record rejected".to_owned(),
+                format!("record_id={rejected_id}"),
+                "revision=1".to_owned(),
+                "source=\"service\"".to_owned(),
+                "reason=\"envelope_rejected\"".to_owned(),
+            ] {
+                assert!(log.contains(&expected), "missing {expected:?} in {log:?}");
+            }
+            for forbidden in [
+                ENDPOINT,
+                "rejected-host",
+                "rejected-session",
+                "capability",
+                "nonce",
+                "ciphertext",
+                "payload",
+                "registry-user",
+            ] {
+                assert!(!log.contains(forbidden), "leaked {forbidden:?} in {log:?}");
+            }
             server.await.unwrap().unwrap();
 
             let error = refresh_sessions_with_registry(&state_dir, local, &registry_dir)
@@ -413,7 +664,7 @@ mod tests {
                 .to_string();
             assert!(error.contains("record index"), "{error}");
             assert!(
-                state_catalog::attachment(&state_dir, &account, "patch-host", "patch", now,)
+                state_catalog::attachment(&state_dir, &account, "duplicate-host", "work", now,)
                     .unwrap()
                     .is_some(),
                 "a failed refresh replaced the previous catalog"

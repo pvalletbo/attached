@@ -109,6 +109,19 @@ fn picker_candidates(
                 selection_identity(&left.selection).cmp(selection_identity(&right.selection))
             })
     });
+    for (index, candidate) in candidates.iter().enumerate() {
+        let kind = match candidate.selection {
+            SessionSelection::Local(_) => "local",
+            SessionSelection::Synchronized(_) => "synchronized",
+        };
+        tracing::debug!(
+            index,
+            kind,
+            host = candidate.host,
+            session = candidate.session,
+            "picker display candidate"
+        );
+    }
     candidates
 }
 
@@ -176,9 +189,37 @@ fn parse_selection(selected: &str, candidates: &[PickerCandidate]) -> Result<Ses
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{
+        io::Write,
+        path::PathBuf,
+        sync::{Arc, Mutex},
+    };
 
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CaptureWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for Capture {
+        type Writer = CaptureWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            CaptureWriter(self.0.clone())
+        }
+    }
 
     #[test]
     fn picker_lists_local_sessions_first_and_keeps_selection_kinds_distinct() {
@@ -191,7 +232,26 @@ mod tests {
             host: "office".to_owned(),
             session: "deep-work".to_owned(),
         }];
-        let candidates = picker_candidates(&local, &synchronized);
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(capture.clone())
+            .without_time()
+            .with_target(false)
+            .with_ansi(false)
+            .finish();
+        let candidates = tracing::subscriber::with_default(subscriber, || {
+            picker_candidates(&local, &synchronized)
+        });
+        let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        let local_event = "picker display candidate index=0 kind=\"local\" host=\"(local)\" session=\"local-work\"";
+        let synchronized_event = "picker display candidate index=1 kind=\"synchronized\" host=\"office\" session=\"deep-work\"";
+        assert!(log.contains(local_event), "{log}");
+        assert!(log.contains(synchronized_event), "{log}");
+        assert!(
+            log.find(local_event) < log.find(synchronized_event),
+            "events were not emitted in display order: {log}"
+        );
         let (input, header) = render_input(&candidates).unwrap();
         let rows = input.lines().collect::<Vec<_>>();
 

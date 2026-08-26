@@ -3,6 +3,7 @@ use std::{
     io::{Read, Write},
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::{Component, Path},
+    sync::Mutex,
 };
 
 use anyhow::{Context, Result, ensure};
@@ -11,6 +12,8 @@ use rustix::{
     fs::{AtFlags, Mode, OFlags},
     process::geteuid,
 };
+
+static UMASK_LOCK: Mutex<()> = Mutex::new(());
 
 /// Runs a state mutation while holding an owner-only inter-process lock.
 ///
@@ -362,7 +365,7 @@ fn open_or_create_directory_at(parent: &File, name: &[u8], create: bool) -> Resu
         && create
         && error.kind() == std::io::ErrorKind::NotFound
     {
-        match rustix::fs::mkdirat(parent, name, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
+        match mkdir_private_at(parent, name) {
             Ok(()) => created = true,
             Err(error) if error == rustix::io::Errno::EXIST => {}
             Err(error) => {
@@ -389,6 +392,17 @@ fn open_or_create_directory_at(parent: &File, name: &[u8], create: bool) -> Resu
         tests::record_directory_sync(name, "parent");
     }
     Ok(directory)
+}
+
+fn mkdir_private_at(parent: &File, name: &[u8]) -> rustix::io::Result<()> {
+    let _guard = UMASK_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    // A process may inherit a fully restrictive umask such as 0777. Temporarily
+    // use an owner-only umask so this directory can be reopened and validated;
+    // concurrent creations can become more restrictive, never group/world visible.
+    let previous = rustix::process::umask(Mode::from_bits_retain(0o077));
+    let result = rustix::fs::mkdirat(parent, name, Mode::RUSR | Mode::WUSR | Mode::XUSR);
+    rustix::process::umask(previous);
+    result
 }
 
 fn openat_directory(parent: &File, name: &[u8]) -> std::io::Result<File> {

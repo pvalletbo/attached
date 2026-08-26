@@ -148,7 +148,18 @@ fn sessions_with_filter(
     let mut sessions = catalog
         .records
         .iter()
-        .filter(|record| now < record.expires_at && !suppress(record))
+        .filter(|record| {
+            if now >= record.expires_at {
+                tracing::debug!(
+                    record_id = %record.record_id,
+                    reason = "expired",
+                    "catalog record skipped"
+                );
+                false
+            } else {
+                !suppress(record)
+            }
+        })
         .flat_map(|record| {
             let target_host = record.host_label.clone();
             record.sessions.iter().map(move |session| SyncedSession {
@@ -171,9 +182,22 @@ pub(super) fn sessions_excluding_local_endpoints(
     let mut registry_unavailable = false;
     let sessions = sessions_with_filter(state_dir, account, now, |record| {
         match crate::endpoint_registry::is_active(registry_dir, record.endpoint_identity) {
-            Ok(active) => active,
+            Ok(true) => {
+                tracing::debug!(
+                    record_id = %record.record_id,
+                    reason = "active_local_endpoint",
+                    "catalog record skipped"
+                );
+                true
+            }
+            Ok(false) => false,
             Err(_) => {
                 registry_unavailable = true;
+                tracing::warn!(
+                    record_id = %record.record_id,
+                    reason = "endpoint_registry_unavailable",
+                    "catalog record retained"
+                );
                 false
             }
         }
@@ -267,8 +291,55 @@ fn validate(catalog: &Catalog, account: &AccountCredentials) -> Result<()> {
 mod tests {
     use super::*;
     use attached_session_sync_protocol::account::ApiKeyScope;
+    use std::{
+        io::Write,
+        sync::{Arc, Mutex},
+    };
 
     const ENDPOINT: &str = "endpointacxfr74igmsbvsbnn73wcecg5vt3kbzncqwfrdiampuufwnhkublmaqacbuhi5dqhixs6zdfojyc43lffyxqcad7aaaadaai";
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CaptureWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for Capture {
+        type Writer = CaptureWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            CaptureWriter(self.0.clone())
+        }
+    }
+
+    impl Capture {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    fn capture_info(operation: impl FnOnce()) -> String {
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(capture.clone())
+            .without_time()
+            .with_target(false)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, operation);
+        capture.contents()
+    }
 
     fn timestamp(seconds: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(seconds, 0).expect("fixture timestamp")
@@ -311,19 +382,58 @@ mod tests {
         save(&state_dir, &account, &catalog).unwrap();
         let _guard = crate::endpoint_registry::register(&registry_dir, identity).unwrap();
 
-        let listed = sessions_excluding_local_endpoints(
-            &state_dir,
-            &account,
-            timestamp(1_700_000_000),
-            &registry_dir,
-        )
-        .unwrap();
+        let mut listed = None;
+        let log = capture_info(|| {
+            listed = Some(
+                sessions_excluding_local_endpoints(
+                    &state_dir,
+                    &account,
+                    timestamp(1_700_000_000),
+                    &registry_dir,
+                )
+                .unwrap(),
+            );
+        });
+        let listed = listed.unwrap();
 
         assert!(
             listed.sessions.is_empty(),
             "locally served session was listed twice"
         );
         assert!(!listed.registry_unavailable);
+        assert!(log.contains("catalog record skipped"), "{log}");
+        assert!(log.contains("reason=\"active_local_endpoint\""), "{log}");
+    }
+
+    #[test]
+    fn expired_records_emit_a_safe_meaningful_skip_event() {
+        let root = crate::test_support::canonical_tempdir();
+        let state_dir = root.path().join("state");
+        super::super::state::test_support::create_account(&state_dir, "https://sync.example")
+            .unwrap();
+        let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
+        let mut catalog = Catalog::empty(&account);
+        let expired = record(0x51, "expired-host", "private-session");
+        let record_id = expired.record_id.to_string();
+        catalog.records.push(expired);
+        save(&state_dir, &account, &catalog).unwrap();
+
+        let log = capture_info(|| {
+            let sessions =
+                sessions_with_filter(&state_dir, &account, timestamp(1_900_000_000), |_| false)
+                    .unwrap();
+            assert!(sessions.is_empty());
+        });
+
+        assert!(log.contains("catalog record skipped"), "{log}");
+        assert!(log.contains("reason=\"expired\""), "{log}");
+        assert!(log.contains(&format!("record_id={record_id}")), "{log}");
+        for secret in [ENDPOINT, "private-session", "expired-host", "07070707"] {
+            assert!(
+                !log.contains(secret),
+                "sensitive value {secret:?} leaked in {log:?}"
+            );
+        }
     }
 
     #[test]
@@ -374,13 +484,19 @@ mod tests {
         std::fs::create_dir(&registry_dir).unwrap();
         std::fs::set_permissions(&registry_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let listed = sessions_excluding_local_endpoints(
-            &state_dir,
-            &account,
-            timestamp(1_700_000_000),
-            &registry_dir,
-        )
-        .unwrap();
+        let mut listed = None;
+        let log = capture_info(|| {
+            listed = Some(
+                sessions_excluding_local_endpoints(
+                    &state_dir,
+                    &account,
+                    timestamp(1_700_000_000),
+                    &registry_dir,
+                )
+                .unwrap(),
+            );
+        });
+        let listed = listed.unwrap();
 
         assert_eq!(
             listed.sessions.len(),
@@ -388,5 +504,10 @@ mod tests {
             "registry error hid a remote session"
         );
         assert!(listed.registry_unavailable);
+        assert!(log.contains("catalog record retained"), "{log}");
+        assert!(
+            log.contains("reason=\"endpoint_registry_unavailable\""),
+            "{log}"
+        );
     }
 }

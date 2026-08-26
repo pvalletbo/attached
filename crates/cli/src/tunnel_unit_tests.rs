@@ -12,9 +12,10 @@ async fn missing_selected_session_socket_is_reported_without_fallback() {
 
     let error = connect_session_tui_socket(&selected).await.unwrap_err();
     let message = format!("{error:#}");
-    assert!(message.contains("Herdr session `selected`"));
-    assert!(message.contains("selected-tui-missing.sock"));
-    assert!(!message.contains("other.sock"));
+    assert!(message.contains("Herdr session `selected`"), "{message}");
+    assert!(message.contains("socket is unavailable"), "{message}");
+    assert!(!message.contains("selected-tui-missing.sock"), "{message}");
+    assert!(!message.contains("other.sock"), "{message}");
 }
 
 #[test]

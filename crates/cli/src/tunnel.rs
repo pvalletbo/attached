@@ -201,14 +201,16 @@ async fn serve_stream(
 }
 
 async fn connect_session_tui_socket(session: &Session) -> Result<UnixStream> {
-    let socket_path = session.validated_tui_socket()?;
-    UnixStream::connect(socket_path).await.with_context(|| {
-        format!(
-            "Herdr session `{}` socket {} is unavailable; the selected session may have stopped",
-            session.name(),
-            socket_path.display()
+    let unavailable = || {
+        anyhow!(
+            "Herdr session `{}` socket is unavailable; the selected session may have stopped",
+            session.name()
         )
-    })
+    };
+    let socket_path = session.validated_tui_socket().map_err(|_| unavailable())?;
+    UnixStream::connect(socket_path)
+        .await
+        .map_err(|_| unavailable())
 }
 
 pub async fn connect(

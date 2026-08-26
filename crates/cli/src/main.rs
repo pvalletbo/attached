@@ -26,10 +26,13 @@ use cli::Cli;
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     let verbosity = cli.verbosity();
-    if let Err(error) = diagnostics::init(verbosity) {
-        eprintln!("Error: {error}");
-        return ExitCode::FAILURE;
-    }
+    let _diagnostics_guard = match diagnostics::init(verbosity) {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("Error: {error:#}");
+            return ExitCode::FAILURE;
+        }
+    };
     match cli.run().await {
         Ok(code) => exit_code(code),
         Err(error) => {
