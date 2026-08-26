@@ -176,7 +176,7 @@ pub fn format_error(error: &anyhow::Error, verbosity: u8) -> String {
     if verbosity == 0 {
         error.to_string()
     } else {
-        format!("{error:#}")
+        format!("{error:?}")
     }
 }
 
