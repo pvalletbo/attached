@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, fmt, path::Path};
 
 use anyhow::{Context as _, Result, ensure};
 use attached_session_sync_protocol::{
-    account::ApiKeyScope,
+    account::{ApiKeyScope, RecordId},
     canonical::HerdrVersion as SessionAccessHerdrVersion,
     crypto::{
         Envelope as CryptoEnvelope, VerificationContext,
@@ -26,6 +26,10 @@ pub struct RefreshResult {
 #[derive(Debug)]
 pub enum RefreshWarning {
     CatalogRebuilt(anyhow::Error),
+    RecordDiscarded {
+        record_id: RecordId,
+        error: anyhow::Error,
+    },
     EndpointRegistryUnavailable,
 }
 
@@ -35,6 +39,10 @@ impl fmt::Display for RefreshWarning {
             Self::CatalogRebuilt(error) => write!(
                 formatter,
                 "could not load synchronized session catalog; rebuilt it after a successful refresh: {error}"
+            ),
+            Self::RecordDiscarded { record_id, error } => write!(
+                formatter,
+                "discarded synchronized record {record_id} from the local catalog: {error}"
             ),
             Self::EndpointRegistryUnavailable => formatter.write_str(
                 "could not inspect the local endpoint registry; remote sessions were retained",
@@ -65,6 +73,21 @@ async fn refresh_sessions_with_registry(
     local_version: HerdrVersion,
     registry_dir: &Path,
 ) -> Result<RefreshResult> {
+    refresh_sessions_with_registry_at(
+        state_dir,
+        local_version,
+        registry_dir,
+        super::utc_now_seconds(),
+    )
+    .await
+}
+
+async fn refresh_sessions_with_registry_at(
+    state_dir: &Path,
+    local_version: HerdrVersion,
+    registry_dir: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<RefreshResult> {
     let mut warnings = Vec::new();
     let Some(account) = state::load_account_optional(state_dir, ApiKeyScope::Download)
         .context("could not load synchronization account")?
@@ -74,7 +97,6 @@ async fn refresh_sessions_with_registry(
             warnings,
         });
     };
-    let now = super::utc_now_seconds();
     let local_version = descriptor_version(local_version)?;
     let mut catalog = match state_catalog::load(state_dir, &account) {
         Ok(catalog) => catalog,
@@ -96,11 +118,23 @@ async fn refresh_sessions_with_registry(
     let mut accepted = Vec::with_capacity(index.records.len());
     for indexed in index.records {
         let previous = existing.remove(&indexed.record_id);
-        if previous
-            .as_ref()
-            .is_some_and(|record| record.service_revision == indexed.revision)
+        if let Some(previous) = previous
+            && previous.service_revision == indexed.revision
         {
-            accepted.push(previous.expect("checked as present"));
+            if previous.is_expired_at(now) {
+                let error = anyhow::anyhow!("session access descriptor expired");
+                tracing::debug!(
+                    record_id = %indexed.record_id,
+                    reason = %error,
+                    "discarded invalid synchronized record during refresh"
+                );
+                warnings.push(RefreshWarning::RecordDiscarded {
+                    record_id: indexed.record_id,
+                    error,
+                });
+                continue;
+            }
+            accepted.push(previous);
             continue;
         }
 
@@ -132,12 +166,25 @@ async fn refresh_sessions_with_registry(
             now,
             local_version,
         };
-        let opened = open_session_access_descriptor_cursorless_for_native_upgrade(
+        let opened = match open_session_access_descriptor_cursorless_for_native_upgrade(
             &envelope,
             account.account_root_key(),
             &context,
-        )
-        .with_context(|| format!("synchronized record {} was rejected", indexed.record_id))?;
+        ) {
+            Ok(opened) => opened,
+            Err(error) => {
+                tracing::debug!(
+                    record_id = %indexed.record_id,
+                    reason = %error,
+                    "discarded invalid synchronized record during refresh"
+                );
+                warnings.push(RefreshWarning::RecordDiscarded {
+                    record_id: indexed.record_id,
+                    error: error.into(),
+                });
+                continue;
+            }
+        };
         accepted.push(CatalogRecord::from_opened(
             indexed.record_id,
             fetched.revision,
@@ -213,8 +260,9 @@ mod tests {
         index_path: String,
         index_body: Vec<u8>,
         records: BTreeMap<String, Vec<u8>>,
+        request_count: usize,
     ) -> anyhow::Result<()> {
-        for _ in 0..=records.len() {
+        for _ in 0..request_count {
             let (mut stream, _) = listener.accept().await?;
             let mut request = Vec::new();
             loop {
@@ -281,11 +329,40 @@ mod tests {
             let remote_endpoint = EndpointTicket::new(remote_addr).to_string();
             let fixtures = [
                 (
+                    5_u8,
+                    "aging-host",
+                    "soonexpired",
+                    SessionAccessVersion::new(3, 2, 1),
+                    remote_endpoint.clone(),
+                    now - Duration::from_secs(300),
+                    now + Duration::from_secs(1),
+                ),
+                (
+                    6_u8,
+                    "invalid-host",
+                    "corrupt",
+                    SessionAccessVersion::new(3, 2, 1),
+                    remote_endpoint.clone(),
+                    now - Duration::from_secs(1),
+                    now + Duration::from_secs(300),
+                ),
+                (
+                    7_u8,
+                    "expired-host",
+                    "stale",
+                    SessionAccessVersion::new(3, 2, 1),
+                    remote_endpoint.clone(),
+                    now - Duration::from_secs(300),
+                    now - Duration::from_secs(1),
+                ),
+                (
                     8_u8,
                     "duplicate-host",
                     "work",
                     SessionAccessVersion::new(3, 2, 1),
                     ENDPOINT.to_owned(),
+                    now - Duration::from_secs(1),
+                    now + Duration::from_secs(300),
                 ),
                 (
                     9_u8,
@@ -293,6 +370,8 @@ mod tests {
                     "work",
                     SessionAccessVersion::new(3, 2, 1),
                     remote_endpoint.clone(),
+                    now - Duration::from_secs(1),
+                    now + Duration::from_secs(300),
                 ),
                 (
                     10_u8,
@@ -300,6 +379,8 @@ mod tests {
                     "patch",
                     SessionAccessVersion::new(3, 2, 0),
                     remote_endpoint.clone(),
+                    now - Duration::from_secs(1),
+                    now + Duration::from_secs(300),
                 ),
                 (
                     11_u8,
@@ -307,6 +388,8 @@ mod tests {
                     "minor",
                     SessionAccessVersion::new(3, 1, 9),
                     remote_endpoint.clone(),
+                    now - Duration::from_secs(1),
+                    now + Duration::from_secs(300),
                 ),
                 (
                     12_u8,
@@ -314,16 +397,18 @@ mod tests {
                     "major",
                     SessionAccessVersion::new(2, 9, 9),
                     remote_endpoint,
+                    now - Duration::from_secs(1),
+                    now + Duration::from_secs(300),
                 ),
             ];
             let mut entries = Vec::new();
             let mut records = BTreeMap::new();
-            for (byte, host, session, version, endpoint_ticket) in fixtures {
+            for (byte, host, session, version, endpoint_ticket, issued_at, expires_at) in fixtures {
                 let record_id = RecordId::from_bytes([byte; 16]);
                 let descriptor = SessionAccessDescriptor::new(
                     host.to_owned(),
-                    now - Duration::from_secs(1),
-                    now + Duration::from_secs(300),
+                    issued_at,
+                    expires_at,
                     endpoint_ticket,
                     CapabilitySecret::from_bytes([byte; 32]),
                     version,
@@ -338,6 +423,7 @@ mod tests {
                 )
                 .unwrap();
                 let (nonce, ciphertext) = crypto.into_parts();
+                let ciphertext = if byte == 6 { vec![0] } else { ciphertext };
                 let body = serde_json::to_vec(&Envelope::new(nonce, ciphertext).unwrap()).unwrap();
                 let path = format!("/v1/accounts/{}/records/{record_id}", account.account_id());
                 records.insert(path, body);
@@ -349,21 +435,90 @@ mod tests {
             let index = LiveRecordIndex::new(entries).unwrap();
             let index_body = serde_json::to_vec(&index).unwrap();
             let index_path = format!("/v1/accounts/{}/records", account.account_id());
-            let server = tokio::spawn(serve_catalog(listener, index_path, index_body, records));
+            let request_count = records.len() + 4;
+            let server = tokio::spawn(serve_catalog(
+                listener,
+                index_path,
+                index_body,
+                records,
+                request_count,
+            ));
             let _guard = crate::endpoint_registry::register(&registry_dir, ENDPOINT_ID).unwrap();
 
-            let refreshed = refresh_sessions_with_registry(&state_dir, local, &registry_dir)
-                .await
-                .unwrap();
-            assert_eq!(refreshed.warnings.len(), 1, "{:?}", refreshed.warnings);
+            let refreshed =
+                refresh_sessions_with_registry_at(&state_dir, local, &registry_dir, now)
+                    .await
+                    .unwrap();
+            assert_eq!(refreshed.warnings.len(), 3, "{:?}", refreshed.warnings);
             assert!(
-                refreshed.warnings[0]
+                refreshed.warnings.iter().any(|warning| warning
                     .to_string()
-                    .contains("rebuilt it after a successful refresh"),
+                    .contains("rebuilt it after a successful refresh")),
                 "{:?}",
                 refreshed.warnings
             );
-            assert_eq!(refreshed.sessions.len(), 4);
+            assert!(
+                refreshed.warnings.iter().any(|warning| {
+                    let warning = warning.to_string();
+                    warning.contains("discarded synchronized record")
+                        && warning.contains(&RecordId::from_bytes([7; 16]).to_string())
+                        && warning.contains("expired")
+                }),
+                "{:?}",
+                refreshed.warnings
+            );
+            assert!(
+                refreshed.warnings.iter().any(|warning| {
+                    let warning = warning.to_string();
+                    warning.contains("discarded synchronized record")
+                        && warning.contains(&RecordId::from_bytes([6; 16]).to_string())
+                        && warning.contains("decryption failed")
+                }),
+                "{:?}",
+                refreshed.warnings
+            );
+            assert_eq!(refreshed.sessions.len(), 5);
+            assert!(
+                refreshed
+                    .sessions
+                    .iter()
+                    .any(|session| session.target == "aging-host/soonexpired")
+            );
+
+            let refreshed_after_expiration = refresh_sessions_with_registry_at(
+                &state_dir,
+                local,
+                &registry_dir,
+                now + Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                refreshed_after_expiration.sessions.len(),
+                4,
+                "an expired cached record hid otherwise valid sessions"
+            );
+            assert!(
+                refreshed_after_expiration.warnings.iter().any(|warning| {
+                    let warning = warning.to_string();
+                    warning.contains(&RecordId::from_bytes([5; 16]).to_string())
+                        && warning.contains("expired")
+                }),
+                "{:?}",
+                refreshed_after_expiration.warnings
+            );
+            let persisted_catalog = state_catalog::load(&state_dir, &account).unwrap();
+            assert!(
+                persisted_catalog.records.iter().all(|record| {
+                    ![
+                        RecordId::from_bytes([5; 16]),
+                        RecordId::from_bytes([6; 16]),
+                        RecordId::from_bytes([7; 16]),
+                    ]
+                    .contains(&record.record_id)
+                }),
+                "discarded records remained in the local catalog"
+            );
             assert_eq!(
                 refreshed
                     .sessions
