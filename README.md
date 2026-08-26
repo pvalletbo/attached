@@ -1,6 +1,6 @@
 # Attached
 
-Discover and attach to synchronized [Herdr](https://herdr.dev) sessions over Iroh.
+Attach to remote Herdr session no matter where they run. No networking setup required!
 
 ## Demo
 
