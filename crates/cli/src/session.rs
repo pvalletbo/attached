@@ -1,18 +1,25 @@
 use std::{
+    os::unix::process::CommandExt as _,
     os::unix::{fs::FileTypeExt, process::ExitStatusExt as _},
     path::{Path, PathBuf},
-    process::{ExitStatus, Stdio},
+    process::{Child, Command as StdCommand, ExitStatus, Stdio},
+    sync::mpsc,
+    thread,
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use tokio::process::Command;
+use tracing::{info, warn};
 
-use crate::bounded_process;
+use crate::{bounded_process, secure_state};
 
 const SESSION_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_SESSION_DISCOVERY_BYTES: u64 = 4096;
+const DEFAULT_SESSION_START_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_SESSION_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const DEFAULT_SESSION_BOOTSTRAP_LOCK: &str = "herdr-bootstrap.lock";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Session {
@@ -95,12 +102,17 @@ impl SessionManager {
     }
 
     pub fn active_sessions(&self) -> Result<Vec<Session>> {
+        self.active_sessions_with_timeout(SESSION_DISCOVERY_TIMEOUT)
+    }
+
+    fn active_sessions_with_timeout(&self, timeout: Duration) -> Result<Vec<Session>> {
+        ensure!(!timeout.is_zero(), "Herdr session discovery timed out");
         let output = bounded_process::run(
             &self.herdr_bin,
             ["session", "list", "--json"]
                 .map(std::ffi::OsStr::new)
                 .as_slice(),
-            SESSION_DISCOVERY_TIMEOUT,
+            timeout.min(SESSION_DISCOVERY_TIMEOUT),
             MAX_SESSION_DISCOVERY_BYTES,
         )?;
         if !output.status.success() {
@@ -113,6 +125,195 @@ impl SessionManager {
         }
         sessions_from_json(&output.stdout)
     }
+}
+
+struct StartingDefaultServer {
+    child: Option<Child>,
+    reaper: Option<DetachedChildReaper>,
+}
+
+struct DetachedChildReaper {
+    child: mpsc::SyncSender<Child>,
+}
+
+impl DetachedChildReaper {
+    fn start() -> Result<Self> {
+        let (child, receiver) = mpsc::sync_channel::<Child>(1);
+        thread::Builder::new()
+            .name("attached-herdr-reaper".to_owned())
+            .spawn(move || {
+                let Ok(mut child) = receiver.recv() else {
+                    return;
+                };
+                let pid = child.id();
+                match child.wait() {
+                    Ok(status) => {
+                        warn!(pid, %status, "detached default Herdr session exited");
+                    }
+                    Err(error) => {
+                        warn!(pid, %error, "failed to reap detached default Herdr session");
+                    }
+                }
+            })
+            .context("failed to start the default Herdr session reaper")?;
+        Ok(Self { child })
+    }
+}
+
+impl StartingDefaultServer {
+    fn command(herdr_bin: &Path) -> StdCommand {
+        let mut command = StdCommand::new(herdr_bin);
+        command
+            .arg("server")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .env_remove("HERDR_SOCKET_PATH")
+            .env_remove("HERDR_CLIENT_SOCKET_PATH")
+            .env_remove("HERDR_REMOTE_KEYBINDINGS")
+            .process_group(0);
+        command
+    }
+
+    fn spawn(herdr_bin: &Path) -> Result<Self> {
+        Self::spawn_with_reaper(herdr_bin, DetachedChildReaper::start)
+    }
+
+    fn spawn_with_reaper(
+        herdr_bin: &Path,
+        start_reaper: impl FnOnce() -> Result<DetachedChildReaper>,
+    ) -> Result<Self> {
+        let reaper = start_reaper()?;
+        let child = Self::command(herdr_bin).spawn().with_context(|| {
+            format!(
+                "failed to start the default Herdr session with {} server",
+                herdr_bin.display()
+            )
+        })?;
+        Ok(Self {
+            child: Some(child),
+            reaper: Some(reaper),
+        })
+    }
+
+    fn exited(&mut self) -> Result<Option<ExitStatus>> {
+        let child = self
+            .child
+            .as_mut()
+            .expect("default server child is present while starting");
+        let process_group = child.id();
+        let status = child
+            .try_wait()
+            .context("failed to inspect the starting default Herdr session")?;
+        if status.is_some() {
+            bounded_process::terminate_process_group(process_group);
+            self.child.take();
+        }
+        Ok(status)
+    }
+
+    fn detach(mut self) -> Result<()> {
+        let child = self
+            .child
+            .take()
+            .expect("default server child is present before detaching");
+        let reaper = self
+            .reaper
+            .take()
+            .expect("default server reaper is present before detaching");
+        match reaper.child.send(child) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.child = Some(error.0);
+                bail!("default Herdr session reaper stopped before accepting the child")
+            }
+        }
+    }
+}
+
+impl Drop for StartingDefaultServer {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        bounded_process::terminate_process_group(child.id());
+        let _ = child.wait();
+    }
+}
+
+fn ensure_active_blocking(bootstrap_lock_dir: PathBuf, herdr_bin: PathBuf) -> Result<Vec<Session>> {
+    let manager = SessionManager::new(herdr_bin.clone());
+    let deadline = std::time::Instant::now() + DEFAULT_SESSION_START_TIMEOUT;
+    let sessions = manager.active_sessions_with_timeout(
+        deadline.saturating_duration_since(std::time::Instant::now()),
+    )?;
+    if !sessions.is_empty() {
+        return Ok(sessions);
+    }
+
+    secure_state::with_exclusive_lock_until(
+        &bootstrap_lock_dir,
+        DEFAULT_SESSION_BOOTSTRAP_LOCK,
+        deadline,
+        |_| {
+            let sessions = manager.active_sessions_with_timeout(
+                deadline.saturating_duration_since(std::time::Instant::now()),
+            )?;
+            if !sessions.is_empty() {
+                return Ok(sessions);
+            }
+
+            info!("no active Herdr sessions found; starting the default session headlessly");
+            let mut server = StartingDefaultServer::spawn(&herdr_bin)?;
+            let mut last_discovery_error;
+            loop {
+                match manager.active_sessions_with_timeout(
+                    deadline.saturating_duration_since(std::time::Instant::now()),
+                ) {
+                    Ok(sessions) if !sessions.is_empty() => {
+                        info!(
+                            session_count = sessions.len(),
+                            "default Herdr session is ready"
+                        );
+                        server.detach()?;
+                        return Ok(sessions);
+                    }
+                    Ok(_) => last_discovery_error = None,
+                    Err(error) => last_discovery_error = Some(error),
+                }
+
+                if let Some(status) = server.exited()? {
+                    bail!(
+                        "`herdr server` exited with {status} before the default session became active"
+                    );
+                }
+                if std::time::Instant::now() >= deadline {
+                    if let Some(error) = last_discovery_error {
+                        return Err(error).context(
+                            "the default Herdr session did not become discoverable before startup timed out",
+                        );
+                    }
+                    bail!(
+                        "the default Herdr session did not become discoverable within {} seconds",
+                        DEFAULT_SESSION_START_TIMEOUT.as_secs()
+                    );
+                }
+                thread::sleep(
+                    DEFAULT_SESSION_POLL_INTERVAL
+                        .min(deadline.saturating_duration_since(std::time::Instant::now())),
+                );
+            }
+        },
+    )
+}
+
+pub async fn ensure_active(
+    bootstrap_lock_dir: PathBuf,
+    herdr_bin: PathBuf,
+) -> Result<Vec<Session>> {
+    tokio::task::spawn_blocking(move || ensure_active_blocking(bootstrap_lock_dir, herdr_bin))
+        .await
+        .context("default Herdr session startup worker failed")?
 }
 
 pub async fn discover_active(herdr_bin: PathBuf) -> Result<Vec<Session>> {
@@ -145,8 +346,65 @@ mod tests {
     use std::{
         fs,
         os::unix::fs::PermissionsExt,
+        process::Child as TestChild,
         time::{Duration, Instant},
     };
+
+    fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
+        let process = PathBuf::from(format!("/proc/{pid}"));
+        let deadline = Instant::now() + timeout;
+        while process.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        !process.exists()
+    }
+
+    fn stop_fake_server(pid_file: &Path, stop_file: &Path) {
+        let pid: u32 = fs::read_to_string(pid_file).unwrap().parse().unwrap();
+        fs::write(stop_file, b"stop").unwrap();
+        assert!(
+            wait_for_process_exit(pid, Duration::from_secs(1)),
+            "fake server {pid} was not reaped"
+        );
+    }
+
+    fn process_group_of(pid: u32) -> Option<u32> {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let fields = stat
+            .rsplit_once(") ")?
+            .1
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        fields.get(2)?.parse().ok()
+    }
+
+    struct TestProcess {
+        child: Option<TestChild>,
+    }
+
+    impl TestProcess {
+        fn spawn(command: &mut StdCommand) -> Self {
+            command.process_group(0);
+            Self {
+                child: Some(command.spawn().unwrap()),
+            }
+        }
+
+        fn wait(mut self) -> ExitStatus {
+            let status = self.child.as_mut().unwrap().wait().unwrap();
+            self.child.take();
+            status
+        }
+    }
+
+    impl Drop for TestProcess {
+        fn drop(&mut self) {
+            if let Some(child) = self.child.as_mut() {
+                bounded_process::terminate_process_group(child.id());
+                let _ = child.wait();
+            }
+        }
+    }
 
     fn fake_herdr(body: &[u8]) -> tempfile::TempPath {
         let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
@@ -177,6 +435,318 @@ exit 7
         let code = session.attach_local(&herdr).await.unwrap();
 
         assert_eq!(code, 7);
+    }
+
+    #[test]
+    fn starts_headless_default_server_when_no_session_is_active() {
+        let root = tempfile::tempdir().unwrap();
+        let ready = root.path().join("ready");
+        let pid_file = root.path().join("pid");
+        let stop = root.path().join("stop");
+        let session_dir = root.path().join("default");
+        let herdr = fake_herdr(
+            format!(
+                r#"
+if [ "$1" = session ] && [ "$2" = list ] && [ "$3" = --json ]; then
+    if [ -f '{ready}' ]; then
+        printf '{{"sessions":[{{"name":"default","running":true,"session_dir":"{session_dir}"}}]}}'
+    else
+        printf '{{"sessions":[]}}'
+    fi
+    exit 0
+fi
+if [ "$1" = server ]; then
+    printf '%s' "$$" > '{pid_file}'
+    : > '{ready}'
+    while [ ! -f '{stop}' ]; do sleep 0.01; done
+fi
+exit 9
+"#,
+                ready = ready.display(),
+                pid_file = pid_file.display(),
+                stop = stop.display(),
+                session_dir = session_dir.display(),
+            )
+            .as_bytes(),
+        );
+
+        let sessions =
+            ensure_active_blocking(root.path().join("state"), herdr.to_path_buf()).unwrap();
+        let session_count = sessions.len();
+        let session_name = sessions[0].name().to_owned();
+        stop_fake_server(&pid_file, &stop);
+
+        assert_eq!(session_count, 1);
+        assert_eq!(session_name, "default");
+    }
+
+    #[test]
+    fn detached_default_server_does_not_inherit_session_routing_overrides() {
+        let command = StartingDefaultServer::command(Path::new("herdr"));
+        for name in [
+            "HERDR_SOCKET_PATH",
+            "HERDR_CLIENT_SOCKET_PATH",
+            "HERDR_REMOTE_KEYBINDINGS",
+        ] {
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(key, value)| key == std::ffi::OsStr::new(name) && value.is_none()),
+                "{name} was not removed from the detached server environment"
+            );
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let ready = root.path().join("ready");
+        let pid_file = root.path().join("pid");
+        let stop = root.path().join("stop");
+        let environment_file = root.path().join("environment");
+        let session_dir = root.path().join("default");
+        let herdr = fake_herdr(
+                format!(
+                    r#"
+if [ "$1" = session ] && [ "$2" = list ] && [ "$3" = --json ]; then
+    if [ -f '{ready}' ]; then
+        printf '{{"sessions":[{{"name":"default","running":true,"session_dir":"{session_dir}"}}]}}'
+    else
+        printf '{{"sessions":[]}}'
+    fi
+    exit 0
+fi
+if [ "$1" = server ]; then
+    printf '%s\n%s\n%s\n' "$HERDR_SOCKET_PATH" "$HERDR_CLIENT_SOCKET_PATH" "$HERDR_REMOTE_KEYBINDINGS" > '{environment_file}'
+    printf '%s' "$$" > '{pid_file}'
+    : > '{ready}'
+    while [ ! -f '{stop}' ]; do sleep 0.01; done
+fi
+exit 9
+"#,
+                    ready = ready.display(),
+                    pid_file = pid_file.display(),
+                    stop = stop.display(),
+                    environment_file = environment_file.display(),
+                    session_dir = session_dir.display(),
+                )
+                .as_bytes(),
+            );
+
+        ensure_active_blocking(root.path().join("state"), herdr.to_path_buf()).unwrap();
+        let inherited = fs::read_to_string(&environment_file).unwrap();
+        stop_fake_server(&pid_file, &stop);
+
+        assert_eq!(inherited, "\n\n\n");
+    }
+
+    #[tokio::test]
+    async fn existing_active_session_does_not_start_another_server() {
+        let root = tempfile::tempdir().unwrap();
+        let started = root.path().join("started");
+        let session_dir = root.path().join("work");
+        let herdr = fake_herdr(
+            format!(
+                r#"
+if [ "$1" = session ] && [ "$2" = list ] && [ "$3" = --json ]; then
+    printf '{{"sessions":[{{"name":"work","running":true,"session_dir":"{session_dir}"}}]}}'
+    exit 0
+fi
+if [ "$1" = server ]; then
+    : > '{started}'
+    exit 0
+fi
+exit 9
+"#,
+                started = started.display(),
+                session_dir = session_dir.display(),
+            )
+            .as_bytes(),
+        );
+
+        let sessions = ensure_active(root.path().join("state"), herdr.to_path_buf())
+            .await
+            .unwrap();
+        assert_eq!(sessions[0].name(), "work");
+        assert!(!started.exists());
+    }
+
+    #[test]
+    fn bootstrap_process_helper() {
+        let Ok(herdr) = std::env::var("ATTACHED_TEST_BOOTSTRAP_HERDR") else {
+            return;
+        };
+        let state = std::env::var("ATTACHED_TEST_BOOTSTRAP_STATE").unwrap();
+        ensure_active_blocking(PathBuf::from(state), PathBuf::from(herdr)).unwrap();
+    }
+
+    #[test]
+    fn concurrent_serve_processes_launch_only_one_default_server() {
+        let root = crate::test_support::canonical_tempdir();
+        let first_discovery = root.path().join("first-discovery");
+        let second_discovery = root.path().join("second-discovery");
+        let launched = root.path().join("launched");
+        let duplicate = root.path().join("duplicate");
+        let ready = root.path().join("ready");
+        let server_pid = root.path().join("server-pid");
+        let stop = root.path().join("stop");
+        let session_dir = root.path().join("default");
+        let herdr = fake_herdr(
+            format!(
+                r#"
+if [ "$1" = session ] && [ "$2" = list ] && [ "$3" = --json ]; then
+    if [ -f '{ready}' ]; then
+        printf '{{"sessions":[{{"name":"default","running":true,"session_dir":"{session_dir}"}}]}}'
+        exit 0
+    fi
+    if mkdir '{first_discovery}' 2>/dev/null; then
+        while [ ! -d '{second_discovery}' ]; do sleep 0.01; done
+    else
+        mkdir '{second_discovery}' 2>/dev/null || true
+    fi
+    printf '{{"sessions":[]}}'
+    exit 0
+fi
+if [ "$1" = server ]; then
+    if mkdir '{launched}' 2>/dev/null; then
+        printf '%s' "$$" > '{server_pid}'
+        sleep 0.2
+        : > '{ready}'
+        while [ ! -f '{stop}' ]; do sleep 0.01; done
+    fi
+    : > '{duplicate}'
+    exit 41
+fi
+exit 9
+"#,
+                first_discovery = first_discovery.display(),
+                second_discovery = second_discovery.display(),
+                launched = launched.display(),
+                duplicate = duplicate.display(),
+                ready = ready.display(),
+                server_pid = server_pid.display(),
+                stop = stop.display(),
+                session_dir = session_dir.display(),
+            )
+            .as_bytes(),
+        );
+
+        let test_binary = std::env::current_exe().unwrap();
+        let command = || {
+            let mut command = StdCommand::new(&test_binary);
+            command
+                .args(["--exact", "session::tests::bootstrap_process_helper"])
+                .env("ATTACHED_TEST_BOOTSTRAP_HERDR", &herdr)
+                .env("ATTACHED_TEST_BOOTSTRAP_STATE", root.path().join("state"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            command
+        };
+        let first = TestProcess::spawn(&mut command());
+        let second = TestProcess::spawn(&mut command());
+
+        let first_status = first.wait();
+        let second_status = second.wait();
+        let launched_once = launched.exists();
+        let launched_duplicate = duplicate.exists();
+        stop_fake_server(&server_pid, &stop);
+
+        assert!(first_status.success());
+        assert!(second_status.success());
+        assert!(launched_once);
+        assert!(!launched_duplicate, "a second default server was launched");
+    }
+
+    #[tokio::test]
+    async fn reports_default_server_exit_before_session_is_ready() {
+        let root = crate::test_support::canonical_tempdir();
+        let herdr = fake_herdr(
+            br#"
+if [ "$1" = session ] && [ "$2" = list ] && [ "$3" = --json ]; then
+    printf '{"sessions":[]}'
+    exit 0
+fi
+if [ "$1" = server ]; then
+    exit 23
+fi
+exit 9
+"#,
+        );
+
+        let started = Instant::now();
+        let error = ensure_active(root.path().join("state"), herdr.to_path_buf())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exited with exit status: 23"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn early_server_exit_kills_its_surviving_process_group() {
+        let root = crate::test_support::canonical_tempdir();
+        let server_pid = root.path().join("server-pid");
+        let descendant_pid = root.path().join("descendant-pid");
+        let herdr = fake_herdr(
+            format!(
+                r#"
+if [ "$1" = session ] && [ "$2" = list ] && [ "$3" = --json ]; then
+    printf '{{"sessions":[]}}'
+    exit 0
+fi
+if [ "$1" = server ]; then
+    printf '%s' "$$" > '{server_pid}'
+    sleep 60 &
+    printf '%s' "$!" > '{descendant_pid}'
+    exit 23
+fi
+exit 9
+"#,
+                server_pid = server_pid.display(),
+                descendant_pid = descendant_pid.display(),
+            )
+            .as_bytes(),
+        );
+
+        let error = ensure_active_blocking(root.path().join("state"), herdr.to_path_buf())
+            .unwrap_err()
+            .to_string();
+        let process_group: u32 = fs::read_to_string(&server_pid).unwrap().parse().unwrap();
+        let descendant: u32 = fs::read_to_string(&descendant_pid)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let descendant_exited = wait_for_process_exit(descendant, Duration::from_millis(250));
+        if !descendant_exited && process_group_of(descendant) == Some(process_group) {
+            bounded_process::terminate_process_group(process_group);
+            let _ = wait_for_process_exit(descendant, Duration::from_secs(1));
+        }
+
+        assert!(error.contains("exited with exit status: 23"), "{error}");
+        assert!(
+            descendant_exited,
+            "server descendant {descendant} survived the early-exit error"
+        );
+    }
+
+    #[test]
+    fn reaper_setup_failure_happens_before_default_server_spawn() {
+        let root = tempfile::tempdir().unwrap();
+        let pid_file = root.path().join("server-pid");
+        let herdr = fake_herdr(
+            format!(
+                "if [ \"$1\" = server ]; then printf '%s' \"$$\" > '{}'; while :; do sleep 1; done; fi\nexit 9\n",
+                pid_file.display()
+            )
+            .as_bytes(),
+        );
+
+        let error = StartingDefaultServer::spawn_with_reaper(&herdr, || {
+            anyhow::bail!("synthetic reaper setup failure")
+        })
+        .err()
+        .unwrap();
+
+        assert!(error.to_string().contains("synthetic reaper setup failure"));
+        assert!(!pid_file.exists(), "server was spawned without a reaper");
     }
 
     #[test]
@@ -219,6 +789,57 @@ exit 7
         let error = manager.active_sessions().unwrap_err().to_string();
         assert!(error.contains("timed out"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn default_session_deadline_bounds_final_discovery_and_reaps_every_process_group() {
+        let root = tempfile::tempdir().unwrap();
+        let first_discovery = root.path().join("first-discovery");
+        let discovery_pid = root.path().join("discovery-pid");
+        let discovery_child_pid = root.path().join("discovery-child-pid");
+        let herdr = fake_herdr(
+            format!(
+                r#"
+if [ "$1" = session ] && [ "$2" = list ] && [ "$3" = --json ]; then
+    if mkdir '{first_discovery}' 2>/dev/null; then
+        printf '{{"sessions":[]}}'
+        exit 0
+    fi
+    printf '%s' "$$" > '{discovery_pid}'
+    sleep 60 &
+    printf '%s' "$!" > '{discovery_child_pid}'
+    wait
+fi
+if [ "$1" = server ]; then
+    while :; do sleep 1; done
+fi
+exit 9
+"#,
+                first_discovery = first_discovery.display(),
+                discovery_pid = discovery_pid.display(),
+                discovery_child_pid = discovery_child_pid.display(),
+            )
+            .as_bytes(),
+        );
+
+        let started = Instant::now();
+        let error =
+            ensure_active_blocking(root.path().join("state"), herdr.to_path_buf()).unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        assert!(
+            elapsed < DEFAULT_SESSION_START_TIMEOUT + Duration::from_millis(500),
+            "whole startup bound was exceeded: {elapsed:?}"
+        );
+        for pid_file in [&discovery_pid, &discovery_child_pid] {
+            let pid = fs::read_to_string(pid_file).unwrap();
+            let pid = pid.trim().parse().unwrap();
+            assert!(
+                wait_for_process_exit(pid, Duration::from_secs(1)),
+                "process {pid} was not reaped"
+            );
+        }
     }
 
     #[test]

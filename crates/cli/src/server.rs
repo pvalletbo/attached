@@ -66,12 +66,16 @@ pub async fn serve(
 
     let registry_dir = crate::endpoint_registry::default_dir()
         .context("could not locate the live local endpoint registry")?;
+    let bootstrap_lock_dir = registry_dir.clone();
     run_registered_lifecycle(
         &registry_dir,
         *endpoint.addr().id.as_bytes(),
         || async move {
             let initial_version = herdr_version::query(&herdr_bin)
                 .context("could not determine the local Herdr version")?;
+            session::ensure_active(bootstrap_lock_dir, herdr_bin.clone())
+                .await
+                .context("could not ensure an active Herdr session before serving")?;
             let (version, published_versions) = watch::channel(initial_version);
             let capability = CapabilitySecret::generate();
             let host_label =
