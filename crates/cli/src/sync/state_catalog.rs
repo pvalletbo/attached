@@ -77,6 +77,10 @@ impl Catalog {
 }
 
 impl CatalogRecord {
+    pub(super) fn is_expired_at(&self, now: DateTime<Utc>) -> bool {
+        self.expires_at <= now
+    }
+
     pub(super) fn from_opened(
         record_id: RecordId,
         service_revision: u64,
