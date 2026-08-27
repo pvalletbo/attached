@@ -17,7 +17,10 @@ dispatch-releases = true
 hosting = "github"
 # Build a curl-compatible shell installer.
 installers = ["shell"]
-install-path = "CARGO_HOME"
+# Use the conventional per-user executable directory without a toolchain-specific layout or
+# elevated permissions. The installer adds this directory to PATH when necessary.
+install-path = "~/.local/bin"
+install-success-msg = "Attached is installed. Run attached --help to get started, or attached uninstall to remove it."
 install-updater = false
 # Native runners avoid cross-compilation for all supported platforms.
 targets = [
