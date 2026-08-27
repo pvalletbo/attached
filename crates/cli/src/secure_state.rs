@@ -3,6 +3,7 @@ use std::{
     io::{Read, Write},
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::{Component, Path},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -22,6 +23,17 @@ pub(crate) fn with_exclusive_lock<T>(
     operation: impl FnOnce(&StateDir) -> Result<T>,
 ) -> Result<T> {
     with_locked_inner(StateDir::open(state_dir)?, state_dir, lock_name, operation)
+}
+
+pub(crate) fn with_exclusive_lock_until<T>(
+    state_dir: &Path,
+    lock_name: &str,
+    deadline: Instant,
+    operation: impl FnOnce(&StateDir) -> Result<T>,
+) -> Result<T> {
+    let directory = StateDir::open(state_dir)?;
+    let lock = acquire_lock_until(&directory, state_dir, lock_name, deadline)?;
+    finish_locked_operation(lock, operation(&directory))
 }
 
 pub(crate) fn with_locked_existing<T>(
@@ -44,7 +56,10 @@ fn with_locked_inner<T>(
     operation: impl FnOnce(&StateDir) -> Result<T>,
 ) -> Result<T> {
     let lock = acquire_lock(&directory, state_dir, lock_name)?;
-    let result = operation(&directory);
+    finish_locked_operation(lock, operation(&directory))
+}
+
+fn finish_locked_operation<T>(lock: File, result: Result<T>) -> Result<T> {
     let unlock = FileExt::unlock(&lock).context("failed to unlock state lock");
     match (result, unlock) {
         (Err(error), _) => Err(error),
@@ -54,6 +69,41 @@ fn with_locked_inner<T>(
 }
 
 fn acquire_lock(directory: &StateDir, state_dir: &Path, lock_name: &str) -> Result<File> {
+    let lock = open_validated_lock(directory, lock_name)?;
+    FileExt::lock(&lock).with_context(|| format!("failed to lock state file {lock_name}"))?;
+    verify_locked_path(directory, state_dir, lock_name, &lock)?;
+    Ok(lock)
+}
+
+fn acquire_lock_until(
+    directory: &StateDir,
+    state_dir: &Path,
+    lock_name: &str,
+    deadline: Instant,
+) -> Result<File> {
+    let lock = open_validated_lock(directory, lock_name)?;
+    loop {
+        match FileExt::try_lock(&lock) {
+            Ok(()) => break,
+            Err(fs4::TryLockError::WouldBlock) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                ensure!(
+                    !remaining.is_zero(),
+                    "timed out waiting for state lock {lock_name}"
+                );
+                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+            }
+            Err(fs4::TryLockError::Error(error)) => {
+                return Err(error)
+                    .with_context(|| format!("failed to lock state file {lock_name}"));
+            }
+        }
+    }
+    verify_locked_path(directory, state_dir, lock_name, &lock)?;
+    Ok(lock)
+}
+
+fn open_validated_lock(directory: &StateDir, lock_name: &str) -> Result<File> {
     validate_name(lock_name, "state lock")?;
     let (lock, created) = match openat_file(
         &directory.directory,
@@ -86,10 +136,17 @@ fn acquire_lock(directory: &StateDir, state_dir: &Path, lock_name: &str) -> Resu
             .sync_all()
             .context("failed to sync state directory after creating lock")?;
     }
-    FileExt::lock(&lock).with_context(|| format!("failed to lock state file {lock_name}"))?;
-    validate_private_dir(&directory.directory, state_dir)?;
-    verify_path_identity(&directory.directory, lock_name, &lock)?;
     Ok(lock)
+}
+
+fn verify_locked_path(
+    directory: &StateDir,
+    state_dir: &Path,
+    lock_name: &str,
+    lock: &File,
+) -> Result<()> {
+    validate_private_dir(&directory.directory, state_dir)?;
+    verify_path_identity(&directory.directory, lock_name, lock)
 }
 
 pub fn prepare_private_dir(path: &Path) -> Result<()> {
