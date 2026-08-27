@@ -105,7 +105,7 @@ fn into_operational_scope(
 ) -> Result<ScopedAccountBundle> {
     match (stored, required_scope) {
         (AccountBundle::Owner(_), ApiKeyScope::Publish) => bail!(
-            "account-creator state also contains the download key; export the publish bundle and import it into a separate publish-only state before running `serve`"
+            "account-creator state also contains the download key and cannot be used by `serve`; start `serve` with a publish bundle on a separate serving host"
         ),
         (stored, required_scope) => into_export_scope(stored, required_scope),
     }
@@ -358,7 +358,7 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(error.contains("publish-only state"), "{error}");
+        assert!(error.contains("cannot be used by `serve`"), "{error}");
     }
 
     #[test]
@@ -388,7 +388,7 @@ mod tests {
         let error = load_account(&state, ApiKeyScope::Publish)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("publish-only state"), "{error}");
+        assert!(error.contains("cannot be used by `serve`"), "{error}");
         assert_eq!(
             load_account(&state, ApiKeyScope::Download)
                 .unwrap()

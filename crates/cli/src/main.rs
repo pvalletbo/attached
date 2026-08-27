@@ -10,6 +10,7 @@ mod herdr_version;
 mod identity;
 mod local_sockets;
 mod proxy;
+mod publish_account;
 mod secure_state;
 mod server;
 mod session;

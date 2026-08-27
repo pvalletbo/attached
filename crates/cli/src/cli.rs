@@ -1,19 +1,15 @@
-use std::{
-    io::{BufRead, Read, stdin},
-    path::PathBuf,
-};
+use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail, ensure};
-use attached_session_sync_protocol::{account::ApiKeyScope, limits::MAX_BUNDLE_ENCODED_BYTES};
+use anyhow::{Context, Result, ensure};
+use attached_session_sync_protocol::account::ApiKeyScope;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::{
-    herdr_version, identity, secure_state, server, session,
+    herdr_version, identity, publish_account, secure_state, server, session,
     session_picker::{self, SessionSelection},
     sync,
 };
 
-const MAX_ACCOUNT_BUNDLE_LINE_BYTES: usize = MAX_BUNDLE_ENCODED_BYTES + 2;
 #[derive(Parser)]
 #[command(
     version,
@@ -30,7 +26,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create, export, or import synchronization credentials.
+    /// Create or export synchronization credentials.
     Account {
         #[command(subcommand)]
         command: AccountCommand,
@@ -45,6 +41,12 @@ enum Command {
         /// Stable label shown for this host in synchronized catalogs.
         #[arg(long)]
         host_label: Option<String>,
+
+        /// Publish bundle file used when ATTACHED_PUBLISH_BUNDLE is unset.
+        ///
+        /// On first use without either source, Attached prompts for the bundle with input hidden.
+        #[arg(long, value_name = "FILE")]
+        bundle_file: Option<PathBuf>,
 
         /// Override persistent state location (primarily for testing).
         #[arg(long, hide = true)]
@@ -90,15 +92,6 @@ enum AccountCommand {
         /// to overwrite an existing file.
         #[arg(long, default_value = "account.bundle")]
         output: PathBuf,
-
-        #[arg(long, hide = true)]
-        state_dir: Option<PathBuf>,
-    },
-
-    /// Import a scoped secret bundle from standard input.
-    Import {
-        #[arg(long, required = true)]
-        bundle_stdin: bool,
 
         #[arg(long, hide = true)]
         state_dir: Option<PathBuf>,
@@ -156,17 +149,8 @@ impl Cli {
                             "the account was saved locally, but its download bundle could not be written; export a new download bundle from the saved account",
                         )?;
                         eprintln!(
-                            "Use `attached account export --type publish` to create a publish-only bundle for serving hosts."
+                            "Use `attached account export --type publish` to create a publish-only bundle, then provide it when starting `attached serve` on the serving host."
                         );
-                    }
-                    AccountCommand::Import {
-                        bundle_stdin,
-                        state_dir,
-                    } => {
-                        debug_assert!(bundle_stdin, "clap requires --bundle-stdin");
-                        let state_dir = resolved_state_dir(state_dir)?;
-                        let bundle = read_account_bundle(&mut stdin().lock())?;
-                        sync::account::import(&state_dir, bundle.as_bytes())?;
                     }
                     AccountCommand::Export {
                         key_type,
@@ -184,9 +168,11 @@ impl Cli {
             Command::Serve {
                 herdr_bin,
                 host_label,
+                bundle_file,
                 state_dir,
             } => {
                 let state_dir = resolved_state_dir(state_dir)?;
+                publish_account::ensure_configured(&state_dir, bundle_file.as_deref())?;
                 server::serve(state_dir, herdr_bin, host_label).await?;
                 Ok(0)
             }
@@ -296,30 +282,8 @@ fn write_account_bundle(bundle: &str, output_path: &std::path::Path) -> Result<(
     Ok(())
 }
 
-fn read_account_bundle(reader: &mut impl BufRead) -> Result<String> {
-    let mut line = String::new();
-    let mut limited = reader
-        .by_ref()
-        .take((MAX_ACCOUNT_BUNDLE_LINE_BYTES + 1) as u64);
-    limited
-        .read_line(&mut line)
-        .context("could not read account bundle from standard input")?;
-    let bundle = line.trim();
-    if line.len() > MAX_ACCOUNT_BUNDLE_LINE_BYTES || bundle.len() > MAX_BUNDLE_ENCODED_BYTES {
-        bail!("account bundle is too long (maximum {MAX_BUNDLE_ENCODED_BYTES} bytes)");
-    }
-
-    let bundle = bundle.to_owned();
-    if bundle.is_empty() {
-        bail!("account bundle is empty");
-    }
-    Ok(bundle)
-}
-
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
-
     use clap::{CommandFactory, Parser};
 
     use super::*;
@@ -334,7 +298,6 @@ mod tests {
                 "--service",
                 "https://sync.example",
             ],
-            vec!["attached", "account", "import", "--bundle-stdin"],
             vec!["attached", "account", "export", "--type", "publish"],
             vec![
                 "attached",
@@ -345,7 +308,14 @@ mod tests {
                 "--output",
                 "/tmp/publish.bundle",
             ],
-            vec!["attached", "serve", "--host-label", "office"],
+            vec![
+                "attached",
+                "serve",
+                "--host-label",
+                "office",
+                "--bundle-file",
+                "/run/secrets/attached-publish",
+            ],
             vec!["attached", "attach"],
             vec!["attached", "attach", "office/work"],
         ] {
@@ -355,6 +325,7 @@ mod tests {
         for removed in ["connect", "remote", "session", "admin", "sync"] {
             assert!(Cli::try_parse_from(["attached", removed]).is_err());
         }
+        assert!(Cli::try_parse_from(["attached", "account", "import", "--bundle-stdin"]).is_err());
     }
 
     #[test]
@@ -387,8 +358,6 @@ mod tests {
 
     #[test]
     fn account_bundle_io_uses_safe_default_files() {
-        assert!(Cli::try_parse_from(["attached", "account", "import"]).is_err());
-
         let create = Cli::try_parse_from([
             "attached",
             "account",
@@ -461,21 +430,21 @@ mod tests {
     }
 
     #[test]
-    fn account_bundle_input_is_one_trimmed_bounded_line() {
-        let mut input = Cursor::new(b"  c3ludGhldGlj  \r\nignored\n");
+    fn serve_accepts_a_publish_bundle_file() {
+        let cli = Cli::try_parse_from([
+            "attached",
+            "serve",
+            "--bundle-file",
+            "/run/secrets/attached-publish",
+        ])
+        .unwrap();
+        let Command::Serve { bundle_file, .. } = cli.command else {
+            unreachable!();
+        };
         assert_eq!(
-            read_account_bundle(&mut input).unwrap().as_str(),
-            "c3ludGhldGlj"
+            bundle_file,
+            Some(PathBuf::from("/run/secrets/attached-publish"))
         );
-
-        let maximum = "A".repeat(MAX_BUNDLE_ENCODED_BYTES);
-        let mut exact = Cursor::new(format!("{maximum}\r\n"));
-        assert_eq!(read_account_bundle(&mut exact).unwrap(), maximum);
-
-        let mut oversized = Cursor::new(format!("{}\n", "x".repeat(MAX_BUNDLE_ENCODED_BYTES + 1)));
-        let error = read_account_bundle(&mut oversized).unwrap_err().to_string();
-        assert!(error.contains("too long"), "{error}");
-        assert!(!error.contains(&"x".repeat(32)), "{error}");
     }
 
     #[test]

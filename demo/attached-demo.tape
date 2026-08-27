@@ -6,8 +6,9 @@
 #   - publish.bundle exists in the repository root.
 #   - The host has attached, herdr, fzf, tmux, and pbcopy on PATH.
 #
-# The publish bundle is pasted with terminal echo disabled so the credential is
-# never rendered into the recording. The clipboard is cleared during cleanup.
+# Attached hides terminal input while the publish bundle is pasted, so the
+# credential is never rendered into the recording. The clipboard is cleared
+# during cleanup.
 
 Output demo/attached-demo.mp4
 
@@ -115,23 +116,10 @@ Sleep 300ms
 Wait+Line /consumer[$]/
 Sleep 700ms
 
-# Publisher: import the bundle. stty disables echo only while Attached reads it.
+# Publisher: return to the container. Attached will request the bundle with
+# hidden input when serving begins.
 Ctrl+B
 Right
-Wait+Line /root@.*#/
-Sleep 700ms
-Type "stty -echo; attached account import --bundle-stdin"
-Sleep 300ms
-Enter
-Sleep 500ms
-Paste
-Sleep 500ms
-Enter
-Sleep 500ms
-Wait+Line /root@.*#/
-Type `stty echo; printf '\n'`
-Enter
-Sleep 300ms
 Wait+Line /root@.*#/
 Sleep 700ms
 
@@ -172,6 +160,11 @@ Sleep 700ms
 
 Type `attached serve --host-label "docker-demo-video-$HOSTNAME"`
 Sleep 300ms
+Enter
+Sleep 500ms
+Wait+Screen /Enter the publish bundle/
+Paste
+Sleep 500ms
 Enter
 Sleep 1s
 Wait+Screen /Serving synchronized Herdr sessions as/
