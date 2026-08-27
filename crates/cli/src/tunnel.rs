@@ -40,32 +40,63 @@ const UPGRADE_TIMEOUT: Duration = Duration::from_secs(130);
 const CHILD_EXIT_GRACE: Duration = Duration::from_secs(3);
 const MAX_STREAMS_PER_CONNECTION: usize = 64;
 
+#[derive(Debug)]
+struct RemoteUnavailable(anyhow::Error);
+
+impl std::fmt::Display for RemoteUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
+impl std::error::Error for RemoteUnavailable {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+fn remote_unavailable(error: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(RemoteUnavailable(error))
+}
+
+pub(crate) fn is_remote_unavailable(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RemoteUnavailable>().is_some()
+}
+
 pub async fn request_upgrade(
     endpoint_addr: iroh::EndpointAddr,
     session: &str,
     capability: &CapabilitySecret,
     requested_version: HerdrVersion,
 ) -> Result<HerdrVersion> {
-    timeout(UPGRADE_TIMEOUT, async {
-        let endpoint = Endpoint::bind(presets::N0).await?;
-        let result = async {
-            let connection = endpoint.connect(endpoint_addr, UPGRADE_ALPN).await?;
-            let (mut send, mut receive) = connection.open_bi().await?;
-            write_upgrade_request(&mut send, session, capability, requested_version).await?;
-            match read_upgrade_response(&mut receive).await? {
-                UpgradeResponse::Updated(installed) => Ok(installed),
-                UpgradeResponse::Failed(message) => bail!("{message}"),
-                UpgradeResponse::Busy => {
-                    bail!("remote Herdr update is already in progress; retry later")
-                }
-            }
-        }
-        .await;
-        endpoint.close().await;
-        result
+    let endpoint = Endpoint::bind(presets::N0)
+        .await
+        .context("could not initialize the local upgrade endpoint")?;
+    let result = timeout(UPGRADE_TIMEOUT, async {
+        let connection = endpoint.connect(endpoint_addr, UPGRADE_ALPN).await?;
+        let (mut send, mut receive) = connection.open_bi().await?;
+        write_upgrade_request(&mut send, session, capability, requested_version).await?;
+        read_upgrade_response(&mut receive).await
     })
     .await
-    .context("remote Herdr upgrade request timed out")?
+    .context("remote Herdr upgrade request timed out")
+    .and_then(|result| result);
+    endpoint.close().await;
+    finish_upgrade_response(finish_upgrade_result(result)?)
+}
+
+fn finish_upgrade_result<T>(result: Result<T>) -> Result<T> {
+    result.map_err(remote_unavailable)
+}
+
+fn finish_upgrade_response(response: UpgradeResponse) -> Result<HerdrVersion> {
+    match response {
+        UpgradeResponse::Updated(installed) => Ok(installed),
+        UpgradeResponse::Failed(message) => bail!("{message}"),
+        UpgradeResponse::Busy => {
+            bail!("remote Herdr update is already in progress; retry later")
+        }
+    }
 }
 
 /// Authenticates a synchronized host capability before resolving the requested
@@ -244,7 +275,7 @@ pub async fn connect(
     )
     .await?;
     let result = async {
-        let connection = setup_step(
+        let connection = setup_remote_step(
             async {
                 endpoint
                     .connect(endpoint_addr, TUNNEL_ALPN)
@@ -257,7 +288,7 @@ pub async fn connect(
         )
         .await?;
         info!(connection_id, peer_id = %connection.remote_id(), phase = "connected", "connected to Iroh endpoint");
-        setup_step(
+        setup_remote_step(
             authenticate_client(
                 &connection,
                 &session,
@@ -315,6 +346,33 @@ pub async fn connect(
     .await;
     endpoint.close().await;
     result
+}
+
+async fn setup_remote_step<T, Operation, Shutdown, ShutdownError>(
+    operation: Operation,
+    shutdown: Shutdown,
+    deadline: Duration,
+    description: &'static str,
+) -> Result<T>
+where
+    Operation: Future<Output = Result<T>>,
+    Shutdown: Future<Output = std::result::Result<(), ShutdownError>>,
+    ShutdownError: Into<anyhow::Error>,
+{
+    tokio::select! {
+        result = timeout(deadline, operation) => {
+            match result {
+                Ok(result) => result.map_err(remote_unavailable),
+                Err(error) => Err(remote_unavailable(
+                    anyhow!(error).context(format!("timed out while {description}"))
+                )),
+            }
+        }
+        shutdown_result = shutdown => {
+            shutdown_result.map_err(Into::into)?;
+            bail!("interrupted while {description}")
+        }
+    }
 }
 
 async fn setup_step<T, Operation, Shutdown, ShutdownError>(
@@ -379,7 +437,7 @@ async fn finish_connect_outcome(child: &mut Child, outcome: ConnectOutcome) -> R
             let lost = format!(
                 "Iroh connection was lost ({reason}); run `attach` again to refresh the session"
             );
-            stop_child_after_error(child, anyhow!(lost)).await
+            stop_child_after_error(child, remote_unavailable(anyhow!(lost))).await
         }
         ConnectOutcome::Interrupted(signal) => {
             match signal.context("failed to listen for Ctrl-C") {

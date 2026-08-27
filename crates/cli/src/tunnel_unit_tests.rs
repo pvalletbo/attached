@@ -18,6 +18,31 @@ async fn missing_selected_session_socket_is_reported_without_fallback() {
 }
 
 #[test]
+fn remote_setup_failures_are_classified_for_catalog_pruning() {
+    let error = remote_unavailable(anyhow!("peer is offline"));
+    assert!(is_remote_unavailable(&error));
+    assert!(error.to_string().contains("peer is offline"));
+    assert!(!is_remote_unavailable(&anyhow!("local child failed")));
+}
+
+#[test]
+fn remote_upgrade_errors_are_classified_for_catalog_pruning() {
+    let error = finish_upgrade_result::<()>(Err(anyhow!("upgrade peer offline"))).unwrap_err();
+    assert!(is_remote_unavailable(&error), "{error:#}");
+}
+
+#[test]
+fn reachable_upgrade_rejections_are_not_classified_as_unavailable() {
+    for response in [
+        UpgradeResponse::Busy,
+        UpgradeResponse::Failed("installer rejected update".to_owned()),
+    ] {
+        let error = finish_upgrade_response(response).unwrap_err();
+        assert!(!is_remote_unavailable(&error), "{error:#}");
+    }
+}
+
+#[test]
 fn maps_normal_and_signal_exit_statuses() {
     assert_eq!(exit_code(ExitStatus::from_raw(7 << 8)), 7);
     assert_eq!(exit_code(ExitStatus::from_raw(9)), 137);
@@ -198,6 +223,30 @@ async fn shutdown_signal_error_stops_and_reaps_live_child() {
 }
 
 #[tokio::test]
+async fn connection_loss_is_classified_and_reaps_the_local_child() {
+    let mut child = Command::new("sleep")
+        .arg("60")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+
+    let error = timeout(
+        Duration::from_secs(2),
+        finish_connect_outcome(
+            &mut child,
+            ConnectOutcome::ConnectionLost("peer stopped".to_owned()),
+        ),
+    )
+    .await
+    .expect("supervisor waited for the sleeping child")
+    .unwrap_err();
+
+    assert!(is_remote_unavailable(&error), "{error:#}");
+    assert!(error.to_string().contains("peer stopped"), "{error:#}");
+    assert!(child.try_wait().unwrap().is_some(), "Herdr was not reaped");
+}
+
+#[tokio::test]
 async fn child_wait_error_stops_and_reaps_live_child() {
     let mut child = Command::new("sleep")
         .arg("60")
@@ -248,6 +297,49 @@ async fn interrupted_child_wait_error_stops_and_reaps_live_child() {
         "{error:#}"
     );
     assert!(child.try_wait().unwrap().is_some(), "Herdr was not reaped");
+}
+
+#[tokio::test]
+async fn remote_setup_operation_errors_are_classified() {
+    let error = setup_remote_step(
+        async { Result::<()>::Err(anyhow!("peer offline")) },
+        std::future::pending::<Result<()>>(),
+        Duration::from_secs(1),
+        "connecting",
+    )
+    .await
+    .unwrap_err();
+
+    assert!(is_remote_unavailable(&error), "{error:#}");
+}
+
+#[tokio::test]
+async fn local_setup_cancellation_is_not_classified_as_remote() {
+    let error = setup_remote_step(
+        std::future::pending::<Result<()>>(),
+        async { Result::<()>::Ok(()) },
+        Duration::from_secs(1),
+        "connecting",
+    )
+    .await
+    .unwrap_err();
+
+    assert!(!is_remote_unavailable(&error), "{error:#}");
+}
+
+#[tokio::test]
+async fn remote_setup_timeout_is_classified_as_unavailable() {
+    let error = setup_remote_step(
+        std::future::pending::<Result<()>>(),
+        std::future::pending::<Result<()>>(),
+        Duration::from_millis(10),
+        "connecting",
+    )
+    .await
+    .unwrap_err();
+
+    assert!(is_remote_unavailable(&error), "{error:#}");
+    assert!(error.to_string().contains("timed out"), "{error:#}");
 }
 
 #[tokio::test]
