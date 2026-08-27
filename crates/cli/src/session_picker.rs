@@ -5,11 +5,15 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
+use chrono::{DateTime, Utc};
 use tokio::{io::AsyncWriteExt, process::Command};
+use tracing::debug;
 
 use crate::{session::Session, sync::state_catalog::SyncedSession};
 
 const LOCAL_HOST_LABEL: &str = "(local)";
+const MAX_FUTURE_CLOCK_SKEW_SECONDS: i64 = 30;
+const FRESH_PUBLICATION_SECONDS: i64 = 180;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionSelection {
@@ -21,6 +25,7 @@ pub enum SessionSelection {
 struct PickerCandidate {
     host: String,
     session: String,
+    published_at: Option<DateTime<Utc>>,
     selection: SessionSelection,
 }
 
@@ -39,6 +44,12 @@ pub async fn select(
     );
 
     let (input, header) = render_input(&candidates)?;
+    debug!(
+        candidate_count = candidates.len(),
+        local_count = local_sessions.len(),
+        synchronized_count = synchronized_sessions.len(),
+        "launching interactive session picker"
+    );
     let mut child = Command::new("fzf")
         .arg("--delimiter=\t")
         .arg("--with-nth=2")
@@ -92,11 +103,13 @@ fn picker_candidates(
         .map(|session| PickerCandidate {
             host: LOCAL_HOST_LABEL.to_owned(),
             session: session.name().to_owned(),
+            published_at: None,
             selection: SessionSelection::Local(session.name().to_owned()),
         })
         .chain(synchronized_sessions.iter().map(|session| PickerCandidate {
             host: session.host.clone(),
             session: session.session.clone(),
+            published_at: session.published_at,
             selection: SessionSelection::Synchronized(session.target.clone()),
         }))
         .collect::<Vec<_>>();
@@ -126,6 +139,10 @@ fn selection_identity(selection: &SessionSelection) -> &str {
 }
 
 fn render_input(candidates: &[PickerCandidate]) -> Result<(String, String)> {
+    render_input_at(candidates, Utc::now())
+}
+
+fn render_input_at(candidates: &[PickerCandidate], now: DateTime<Utc>) -> Result<(String, String)> {
     for candidate in candidates {
         ensure!(
             [&candidate.host, &candidate.session]
@@ -146,17 +163,56 @@ fn render_input(candidates: &[PickerCandidate]) -> Result<(String, String)> {
         .max()
         .unwrap_or_default()
         .max("SESSION".len());
-    let header = format!("{:<host_width$}  {:<session_width$}", "HOST", "SESSION");
+    let publish_width = candidates
+        .iter()
+        .map(|candidate| publish_summary(candidate, now).1.chars().count())
+        .max()
+        .unwrap_or_default()
+        .max("LAST PUBLISH".len());
+    let header = format!(
+        "STATUS  {:<host_width$}  {:<session_width$}  {:<publish_width$}",
+        "HOST", "SESSION", "LAST PUBLISH"
+    );
     let mut input = String::new();
     for (index, candidate) in candidates.iter().enumerate() {
+        let (status, published) = publish_summary(candidate, now);
         writeln!(
             input,
-            "{index}\t{:<host_width$}  {:<session_width$}",
-            candidate.host, candidate.session
+            "{index}\t{status}       {:<host_width$}  {:<session_width$}  {:<publish_width$}",
+            candidate.host, candidate.session, published
         )
         .expect("writing session candidates to a String cannot fail");
     }
     Ok((input, header))
+}
+
+fn publish_summary(candidate: &PickerCandidate, now: DateTime<Utc>) -> (&'static str, String) {
+    if matches!(candidate.selection, SessionSelection::Local(_)) {
+        return ("🟢", "local".to_owned());
+    }
+    let Some(published_at) = candidate.published_at else {
+        return ("⚪", "unknown".to_owned());
+    };
+    if published_at - now > chrono::Duration::seconds(MAX_FUTURE_CLOCK_SKEW_SECONDS) {
+        return ("⚪", "clock skew".to_owned());
+    }
+    let age = now - published_at;
+    let age_seconds = age.num_seconds().max(0);
+    let status = if age <= chrono::Duration::seconds(FRESH_PUBLICATION_SECONDS) {
+        "🟢"
+    } else {
+        "🟡"
+    };
+    let age = if age_seconds < 60 {
+        format!("{age_seconds}s ago")
+    } else if age_seconds < 3_600 {
+        format!("{}m ago", age_seconds / 60)
+    } else if age_seconds < 86_400 {
+        format!("{}h ago", age_seconds / 3_600)
+    } else {
+        format!("{}d ago", age_seconds / 86_400)
+    };
+    (status, age)
 }
 
 fn parse_selection(selected: &str, candidates: &[PickerCandidate]) -> Result<SessionSelection> {
@@ -181,6 +237,114 @@ mod tests {
     use super::*;
 
     #[test]
+    fn picker_groups_hosts_and_displays_publish_freshness() {
+        let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let synchronized = [
+            SyncedSession {
+                target: "studio/render".to_owned(),
+                host: "studio".to_owned(),
+                session: "render".to_owned(),
+                published_at: Some(now - chrono::Duration::minutes(4)),
+            },
+            SyncedSession {
+                target: "office/review".to_owned(),
+                host: "office".to_owned(),
+                session: "review".to_owned(),
+                published_at: Some(now - chrono::Duration::seconds(30)),
+            },
+            SyncedSession {
+                target: "office/deep-work".to_owned(),
+                host: "office".to_owned(),
+                session: "deep-work".to_owned(),
+                published_at: Some(now - chrono::Duration::seconds(30)),
+            },
+        ];
+
+        let candidates = picker_candidates(&[], &synchronized);
+        let (input, header) = render_input_at(&candidates, now).unwrap();
+        let rows = input.lines().collect::<Vec<_>>();
+
+        assert!(header.contains("STATUS"));
+        assert!(header.contains("LAST PUBLISH"));
+        assert!(rows[0].contains("office") && rows[0].contains("deep-work"));
+        assert!(rows[1].contains("office") && rows[1].contains("review"));
+        assert!(rows[2].contains("studio") && rows[2].contains("render"));
+        assert!(rows[0].contains("🟢") && rows[0].contains("30s ago"));
+        assert!(rows[2].contains("🟡") && rows[2].contains("4m ago"));
+    }
+
+    #[test]
+    fn publication_just_beyond_future_skew_allowance_is_unknown() {
+        let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let candidate = PickerCandidate {
+            host: "office".to_owned(),
+            session: "future-edge".to_owned(),
+            published_at: Some(
+                now + chrono::Duration::seconds(MAX_FUTURE_CLOCK_SKEW_SECONDS)
+                    + chrono::Duration::nanoseconds(1),
+            ),
+            selection: SessionSelection::Synchronized("office/future-edge".to_owned()),
+        };
+
+        assert_eq!(publish_summary(&candidate, now).0, "⚪");
+    }
+
+    #[test]
+    fn publication_just_beyond_freshness_window_is_old() {
+        let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let candidate = PickerCandidate {
+            host: "office".to_owned(),
+            session: "age-edge".to_owned(),
+            published_at: Some(
+                now - chrono::Duration::seconds(180) - chrono::Duration::nanoseconds(1),
+            ),
+            selection: SessionSelection::Synchronized("office/age-edge".to_owned()),
+        };
+
+        assert_eq!(publish_summary(&candidate, now).0, "🟡");
+    }
+
+    #[test]
+    fn picker_handles_unknown_future_and_freshness_boundary_times() {
+        let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let synchronized = [
+            SyncedSession {
+                target: "alpha/unknown".to_owned(),
+                host: "alpha".to_owned(),
+                session: "unknown".to_owned(),
+                published_at: None,
+            },
+            SyncedSession {
+                target: "beta/future".to_owned(),
+                host: "beta".to_owned(),
+                session: "future".to_owned(),
+                published_at: Some(now + chrono::Duration::minutes(5)),
+            },
+            SyncedSession {
+                target: "gamma/fresh-boundary".to_owned(),
+                host: "gamma".to_owned(),
+                session: "fresh-boundary".to_owned(),
+                published_at: Some(now - chrono::Duration::seconds(180)),
+            },
+            SyncedSession {
+                target: "gamma/stale-boundary".to_owned(),
+                host: "gamma".to_owned(),
+                session: "stale-boundary".to_owned(),
+                published_at: Some(now - chrono::Duration::seconds(181)),
+            },
+        ];
+
+        let candidates = picker_candidates(&[], &synchronized);
+        let (input, _) = render_input_at(&candidates, now).unwrap();
+        let rows = input.lines().collect::<Vec<_>>();
+
+        assert!(rows[0].contains("⚪") && rows[0].contains("unknown"));
+        assert!(rows[1].contains("⚪") && rows[1].contains("clock skew"));
+        assert!(rows[2].contains("🟢") && rows[2].contains("3m ago"));
+        assert!(rows[3].contains("🟡") && rows[3].contains("3m ago"));
+    }
+
+    #[test]
     fn picker_lists_local_sessions_first_and_keeps_selection_kinds_distinct() {
         let local = [Session::new(
             "local-work".to_owned(),
@@ -190,6 +354,7 @@ mod tests {
             target: "office/deep-work".to_owned(),
             host: "office".to_owned(),
             session: "deep-work".to_owned(),
+            published_at: None,
         }];
         let candidates = picker_candidates(&local, &synchronized);
         let (input, header) = render_input(&candidates).unwrap();
