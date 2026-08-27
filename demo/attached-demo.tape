@@ -21,7 +21,7 @@ Require pbcopy
 Set Shell "bash"
 Set Width 1920
 Set Height 1080
-Set FontSize 18
+Set FontSize 24
 Set Framerate 30
 Set TypingSpeed 25ms
 Set WaitTimeout 8m
@@ -33,8 +33,9 @@ Set BorderRadius 10
 
 # Prepare a private tmux server while capture is paused. Recording starts only
 # after both vertical panes exist, so every captured frame has the split layout.
+# Named ANSI colors keep tmux's labels and borders tied to the VHS theme.
 Hide
-Type `test -r publish.bundle || { printf 'publish.bundle is missing\n' >&2; exit 1; }; tmux -L attached-vhs kill-server >/dev/null 2>&1 || true; tmux -L attached-vhs -f /dev/null new-session -d -s attached-demo -c "$PWD" "env BASH_SILENCE_DEPRECATION_WARNING=1 PS1='consumer$ ' bash --noprofile --norc -i"; tmux -L attached-vhs -f /dev/null split-window -h -t attached-demo:0 -c "$PWD" "env BASH_SILENCE_DEPRECATION_WARNING=1 PS1='publisher$ ' bash --noprofile --norc -i"; tmux -L attached-vhs set-option -t attached-demo status off; tmux -L attached-vhs set-window-option -t attached-demo:0 pane-border-status top; tmux -L attached-vhs set-window-option -t attached-demo:0 pane-border-format " #[fg=colour245]#{?pane_active,●,○} #{pane_title} #[default]"; tmux -L attached-vhs set-window-option -t attached-demo:0 pane-active-border-style "fg=colour75"; tmux -L attached-vhs set-window-option -t attached-demo:0 pane-border-style "fg=colour238"; tmux -L attached-vhs set-window-option -t attached-demo:0 allow-rename off; tmux -L attached-vhs select-pane -t attached-demo:0.0 -T CONSUMER; tmux -L attached-vhs select-pane -t attached-demo:0.1 -T PUBLISHER; tmux -L attached-vhs select-pane -t attached-demo:0.1; tmux -L attached-vhs attach-session -t attached-demo`
+Type `test -r publish.bundle || { printf 'publish.bundle is missing\n' >&2; exit 1; }; printf 'onboarding = false\n\n[theme]\nname = "tokyo-night"\n' > /tmp/attached-vhs-herdr.toml; tmux -L attached-vhs kill-server >/dev/null 2>&1 || true; tmux -L attached-vhs -f /dev/null new-session -d -s attached-demo -c "$PWD" "env BASH_SILENCE_DEPRECATION_WARNING=1 HERDR_CONFIG_PATH=/tmp/attached-vhs-herdr.toml PS1='consumer$ ' bash --noprofile --norc -i"; tmux -L attached-vhs -f /dev/null split-window -h -t attached-demo:0 -c "$PWD" "env BASH_SILENCE_DEPRECATION_WARNING=1 PS1='publisher$ ' bash --noprofile --norc -i"; tmux -L attached-vhs set-option -t attached-demo status off; tmux -L attached-vhs set-window-option -t attached-demo:0 pane-border-status top; tmux -L attached-vhs set-window-option -t attached-demo:0 pane-border-format " #[fg=brightblack]#{?pane_active,●,○} #{pane_title} #[default]"; tmux -L attached-vhs set-window-option -t attached-demo:0 pane-active-border-style "fg=blue"; tmux -L attached-vhs set-window-option -t attached-demo:0 pane-border-style "fg=black"; tmux -L attached-vhs set-window-option -t attached-demo:0 allow-rename off; tmux -L attached-vhs select-pane -t attached-demo:0.0 -T CONSUMER; tmux -L attached-vhs select-pane -t attached-demo:0.1 -T PUBLISHER; tmux -L attached-vhs select-pane -t attached-demo:0.1; tmux -L attached-vhs attach-session -t attached-demo`
 Enter
 Wait+Line /publisher[$]/
 Show
@@ -69,7 +70,7 @@ Enter
 Sleep 300ms
 Wait+Line /root@.*#/
 
-Type `mkdir -p "$HOME/.config/herdr" && printf 'onboarding = false\n' > "$HOME/.config/herdr/config.toml"`
+Type `mkdir -p "$HOME/.config/herdr" && printf 'onboarding = false\n\n[theme]\nname = "tokyo-night"\n' > "$HOME/.config/herdr/config.toml"`
 Enter
 Sleep 300ms
 Wait+Line /root@.*#/
@@ -140,7 +141,7 @@ Type "herdr"
 Sleep 300ms
 Enter
 Sleep 1s
-Wait+Screen /agents[ ]+grouped/
+Wait+Screen /(agents[ ]+grouped|tab[ ]+1)/
 Sleep 1s
 
 Type `echo "hello from inside the Docker publisher"`
@@ -191,7 +192,7 @@ Type "video"
 Sleep 2s
 Enter
 Sleep 1s
-Wait+Screen /agents[ ]+grouped/
+Wait+Screen /(agents[ ]+grouped|tab[ ]+1)/
 Sleep 3s
 
 Type `echo "now typing from the consumer"`
@@ -211,6 +212,6 @@ Type "exit"
 Enter
 Sleep 500ms
 Wait+Line /publisher[$]/
-Type `printf '' | pbcopy; tmux -L attached-vhs kill-session -t attached-demo`
+Type `printf '' | pbcopy; rm -f /tmp/attached-vhs-herdr.toml; tmux -L attached-vhs kill-session -t attached-demo`
 Enter
 Sleep 1s
