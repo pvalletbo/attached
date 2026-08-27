@@ -8,6 +8,7 @@ use anyhow::{Context as _, Result, ensure};
 use attached_session_sync_protocol::account::ApiKeyScope;
 use attached_tunnel_protocol::{CapabilitySecret, HerdrVersion};
 use iroh_tickets::endpoint::EndpointTicket;
+use tracing::{debug, warn};
 
 use crate::{herdr_version, tunnel};
 
@@ -130,13 +131,19 @@ pub async fn attach(
             upgrade,
             "remote Herdr upgrade declined; attachment was not started"
         );
-        let installed = tunnel::request_upgrade(
-            endpoint.endpoint_addr().clone(),
-            &attachment.session,
-            &CapabilitySecret::from_bytes(attachment.attach_capability),
-            local_version,
-        )
-        .await?;
+        let installed = finish_remote_operation(
+            state_dir,
+            &account,
+            target,
+            &attachment,
+            tunnel::request_upgrade(
+                endpoint.endpoint_addr().clone(),
+                &attachment.session,
+                &CapabilitySecret::from_bytes(attachment.attach_capability),
+                local_version,
+            )
+            .await,
+        )?;
         ensure!(
             installed == local_version,
             "remote channel installed Herdr {installed}, but local Herdr is {local_version}; attachment was not started"
@@ -147,14 +154,52 @@ pub async fn attach(
         local_version == remote_version,
         "remote Herdr version did not match after update"
     );
-    tunnel::connect(
+    let connection = tunnel::connect(
         endpoint.endpoint_addr().clone(),
-        attachment.session,
+        attachment.session.clone(),
         CapabilitySecret::from_bytes(attachment.attach_capability),
         herdr_bin,
         local_version,
     )
-    .await
+    .await;
+    finish_remote_operation(state_dir, &account, target, &attachment, connection)
+}
+
+fn finish_remote_operation<T>(
+    state_dir: &Path,
+    account: &state::AccountCredentials,
+    target: &str,
+    attachment: &state_catalog::SyncedAttachment,
+    result: Result<T>,
+) -> Result<T> {
+    match result {
+        Err(error) if tunnel::is_remote_unavailable(&error) => {
+            match state_catalog::remove_if_revision(
+                state_dir,
+                account,
+                attachment.record_id,
+                attachment.service_revision,
+            ) {
+                Ok(true) => warn!(
+                    target,
+                    service_revision = attachment.service_revision,
+                    "removed unreachable synchronized session from the local catalog"
+                ),
+                Ok(false) => debug!(
+                    target,
+                    service_revision = attachment.service_revision,
+                    "kept synchronized session because its catalog revision changed"
+                ),
+                Err(prune_error) => {
+                    return Err(error.context(format!(
+                        "remote session failed and its stale catalog entry could not be removed: {prune_error:#}"
+                    )));
+                }
+            }
+            Err(error)
+        }
+        result => result,
+    }
 }
 
 fn parse_target(target: &str) -> Result<(&str, &str)> {

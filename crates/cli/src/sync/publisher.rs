@@ -16,8 +16,10 @@ use sha2::{Digest as _, Sha256};
 use super::{http::SyncHttpClient, state, state::AccountCredentials};
 
 const RECORD_ID_DOMAIN: &[u8] = b"herdr/session-record/v1";
-const SESSION_ACCESS_DESCRIPTOR_LIFETIME: Duration = Duration::from_secs(300);
-const REPUBLISH_INTERVAL: Duration = Duration::from_secs(180);
+// Keep dead hosts visible for at most 90 seconds while giving a healthy publisher
+// two complete retry windows before each descriptor expires.
+const SESSION_ACCESS_DESCRIPTOR_LIFETIME: Duration = Duration::from_secs(90);
+const REPUBLISH_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PublishOutcome {
@@ -159,6 +161,19 @@ fn snapshot_digest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dead_publisher_disappears_within_ninety_seconds() {
+        assert!(
+            SESSION_ACCESS_DESCRIPTOR_LIFETIME <= Duration::from_secs(90),
+            "dead publishers remained discoverable for {:?}",
+            SESSION_ACCESS_DESCRIPTOR_LIFETIME
+        );
+        assert!(
+            REPUBLISH_INTERVAL * 3 <= SESSION_ACCESS_DESCRIPTOR_LIFETIME,
+            "healthy publishers lack two complete refresh opportunities before expiration"
+        );
+    }
 
     #[test]
     fn record_id_is_deterministic_and_bound_to_account_and_endpoint() {

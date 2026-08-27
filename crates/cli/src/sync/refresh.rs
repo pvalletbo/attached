@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, fmt, path::Path};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fmt,
+    path::Path,
+};
 
 use anyhow::{Context as _, Result, ensure};
 use attached_session_sync_protocol::{
@@ -111,6 +115,12 @@ async fn refresh_sessions_with_registry_at(
         .await
         .context("could not refresh the synchronized record index")?;
 
+    let baseline_revisions = catalog
+        .records
+        .iter()
+        .map(|record| (record.record_id, record.service_revision))
+        .collect::<HashSet<_>>();
+    let baseline_pruned_revisions = catalog.pruned_revision_pairs().collect::<HashSet<_>>();
     let mut existing = std::mem::take(&mut catalog.records)
         .into_iter()
         .map(|record| (record.record_id, record))
@@ -193,8 +203,14 @@ async fn refresh_sessions_with_registry_at(
     }
     accepted.sort_by_key(|record| record.record_id);
     catalog.records = accepted;
-    state_catalog::save(state_dir, &account, &catalog)
-        .context("could not save synchronized session catalog")?;
+    state_catalog::save_refresh(
+        state_dir,
+        &account,
+        &baseline_revisions,
+        &baseline_pruned_revisions,
+        &catalog,
+    )
+    .context("could not save synchronized session catalog")?;
 
     let listing =
         state_catalog::sessions_excluding_local_endpoints(state_dir, &account, now, registry_dir)?;
