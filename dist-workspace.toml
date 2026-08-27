@@ -9,6 +9,8 @@ cargo-dist-version = "0.32.0"
 packages = ["attached"]
 # Build only the selected CLI package rather than every workspace member.
 precise-builds = true
+# Reuse dependency build artifacts between releases.
+cache-builds = true
 # Generate the GitHub release workflow and publish to GitHub Releases.
 ci = "github"
 # Release tags created by the cut-release workflow use GITHUB_TOKEN, so launch
@@ -17,7 +19,10 @@ dispatch-releases = true
 hosting = "github"
 # Build a curl-compatible shell installer.
 installers = ["shell"]
-install-path = "CARGO_HOME"
+# Use the conventional per-user executable directory without a toolchain-specific layout or
+# elevated permissions. The installer adds this directory to PATH when necessary.
+install-path = "~/.local/bin"
+install-success-msg = "Attached is installed. Run attached --help to get started, or attached uninstall to remove it."
 install-updater = false
 # Native runners avoid cross-compilation for all supported platforms.
 targets = [
@@ -47,3 +52,4 @@ pkg-config = "*"
 "actions/upload-artifact" = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" # v7.0.1
 "actions/download-artifact" = "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c" # v8.0.1
 "actions/attest" = "1e69f48acb82d1966a394da916b4c1698aa569d6" # v4.2.2
+"swatinem/rust-cache" = "e18b497796c12c097a38f9edb9d0641fb99eee32" # v2

@@ -8,6 +8,7 @@ mod diagnostics;
 mod endpoint_registry;
 mod herdr_version;
 mod identity;
+mod installation;
 mod local_sockets;
 mod proxy;
 mod publish_account;

@@ -5,7 +5,7 @@ use attached_session_sync_protocol::account::ApiKeyScope;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::{
-    herdr_version, identity, publish_account, secure_state, server, session,
+    herdr_version, identity, installation, secure_state, server, session, publish_account
     session_picker::{self, SessionSelection},
     sync,
 };
@@ -75,6 +75,17 @@ enum Command {
         /// Override persistent state location (primarily for testing).
         #[arg(long, hide = true)]
         state_dir: Option<PathBuf>,
+    },
+
+    /// Update Attached to the latest release.
+    #[command(visible_alias = "upgrade")]
+    Update,
+
+    /// Uninstall Attached and permanently delete all managed credentials and local state.
+    Uninstall {
+        /// Skip the confirmation prompt.
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 }
 
@@ -260,6 +271,14 @@ impl Cli {
                     }
                 }
             }
+            Command::Update => {
+                installation::update()?;
+                Ok(0)
+            }
+            Command::Uninstall { yes } => {
+                installation::uninstall(yes)?;
+                Ok(0)
+            }
         }
     }
 }
@@ -318,6 +337,10 @@ mod tests {
             ],
             vec!["attached", "attach"],
             vec!["attached", "attach", "office/work"],
+            vec!["attached", "update"],
+            vec!["attached", "upgrade"],
+            vec!["attached", "uninstall"],
+            vec!["attached", "uninstall", "--yes"],
         ] {
             assert!(Cli::try_parse_from(args).is_ok());
         }
@@ -419,11 +442,11 @@ mod tests {
     }
 
     #[test]
-    fn help_lists_only_account_serve_and_attach() {
+    fn help_lists_the_simplified_and_lifecycle_commands() {
         let help = Cli::command().render_long_help().to_string();
-        assert!(help.contains("account"));
-        assert!(help.contains("serve"));
-        assert!(help.contains("attach"));
+        for command in ["account", "serve", "attach", "update", "uninstall"] {
+            assert!(help.contains(command), "{help}");
+        }
         for removed in ["connect", "remote", "session", "admin", "sync"] {
             assert!(!help.contains(&format!("  {removed}  ")), "{help}");
         }
