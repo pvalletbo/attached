@@ -1,0 +1,202 @@
+name: Cut release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Semantic version component to increment
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions: {}
+
+concurrency:
+  group: cut-release-${{ github.event.repository.default_branch }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Bump and tag release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      current: ${{ steps.version.outputs.current }}
+      next: ${{ steps.version.outputs.next }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Require the default branch
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          SELECTED_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [[ "$SELECTED_REF" != "refs/heads/$DEFAULT_BRANCH" ]]; then
+            printf 'Run this workflow from the default branch (%s), not %s.\n' \
+              "$DEFAULT_BRANCH" "$SELECTED_REF" >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.97.1
+
+      - name: Calculate and apply version bump
+        id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          manifest_path = Path("Cargo.toml")
+          manifest_text = manifest_path.read_text(encoding="utf-8")
+          manifest = tomllib.loads(manifest_text)
+          current = str(manifest["workspace"]["package"]["version"])
+
+          match = re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", current)
+          if match is None:
+              raise SystemExit(f"workspace version must be stable SemVer; got {current!r}")
+
+          major, minor, patch = map(int, match.groups())
+          bump = os.environ["BUMP"]
+          if bump == "patch":
+              patch += 1
+          elif bump == "minor":
+              minor += 1
+              patch = 0
+          elif bump == "major":
+              major += 1
+              minor = 0
+              patch = 0
+          else:
+              raise SystemExit(f"unsupported version bump: {bump!r}")
+
+          next_version = f"{major}.{minor}.{patch}"
+          old_line = f'version = "{current}"'
+          new_line = f'version = "{next_version}"'
+          section_match = re.search(
+              r"(?ms)^\[workspace\.package\][ \t]*\n.*?(?=^\[|\Z)", manifest_text
+          )
+          if section_match is None or section_match.group().count(old_line) != 1:
+              raise SystemExit(f"expected exactly one workspace version line matching {old_line!r}")
+          updated_section = section_match.group().replace(old_line, new_line, 1)
+          updated_manifest = (
+              manifest_text[: section_match.start()]
+              + updated_section
+              + manifest_text[section_match.end() :]
+          )
+          manifest_path.write_text(updated_manifest, encoding="utf-8")
+
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              print(f"current={current}", file=output)
+              print(f"next={next_version}", file=output)
+              print(f"tag=v{next_version}", file=output)
+          PY
+
+      - name: Refresh and validate Cargo.lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo update --workspace
+          cargo metadata --format-version 1 --locked > /dev/null
+
+      - name: Validate release changes
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          git diff --exit-code --quiet -- Cargo.toml && {
+            printf 'Cargo.toml was not updated.\n' >&2
+            exit 1
+          }
+          git diff --exit-code --quiet -- Cargo.lock && {
+            printf 'Cargo.lock was not updated.\n' >&2
+            exit 1
+          }
+
+          unexpected=$(git diff --name-only -- \
+            . ':(exclude)Cargo.toml' ':(exclude)Cargo.lock')
+          if [[ -n "$unexpected" ]]; then
+            printf 'Unexpected files changed:\n%s\n' "$unexpected" >&2
+            exit 1
+          fi
+          if git show-ref --verify --quiet "refs/tags/$TAG"; then
+            printf 'Tag already exists: %s\n' "$TAG" >&2
+            exit 1
+          fi
+
+          git diff -- Cargo.toml Cargo.lock
+
+      - name: Commit and push release tag
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          NEXT_VERSION: ${{ steps.version.outputs.next }}
+          TAG: ${{ steps.version.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore(release): bump attached version to $NEXT_VERSION"
+          git tag --annotate "$TAG" --message "Release $TAG"
+          git push --atomic origin \
+            "HEAD:refs/heads/$DEFAULT_BRANCH" \
+            "refs/tags/$TAG"
+
+  publish:
+    name: Start release artifacts
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Start release artifact workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh workflow run release.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$TAG" \
+            --field "tag=$TAG"
+
+      - name: Summarize release
+        if: ${{ always() }}
+        env:
+          CURRENT_VERSION: ${{ needs.prepare.outputs.current }}
+          NEXT_VERSION: ${{ needs.prepare.outputs.next }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        shell: bash
+        run: |
+          {
+            printf '## Release prepared\n\n'
+            printf -- '- Version: `%s` → `%s`\n' "$CURRENT_VERSION" "$NEXT_VERSION"
+            printf -- '- Tag: `%s`\n' "$TAG"
+            printf -- '- Artifacts: [Release workflow runs](%s/actions/workflows/release.yml)\n' \
+              "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          } >> "$GITHUB_STEP_SUMMARY"
