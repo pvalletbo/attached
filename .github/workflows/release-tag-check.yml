@@ -11,10 +11,11 @@ jobs:
     name: Require a stable vX.Y.Z tag
     runs-on: ubuntu-22.04
     steps:
-      - name: Validate release ref
+      - name: Validate release tag
         shell: bash
         env:
           RELEASE_REF: ${{ github.ref }}
+          RELEASE_TAG: ${{ github.event.inputs.tag }}
         run: |
           set -euo pipefail
 
@@ -23,7 +24,18 @@ jobs:
             exit 0
           fi
 
-          if [[ ! "$RELEASE_REF" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            printf 'release tags must match vX.Y.Z; got %s\n' "$RELEASE_REF" >&2
+          # The dispatch workflow receives the release tag as an input. Keep the
+          # ref fallback so this check also remains valid for tag-push workflows.
+          release_tag=$RELEASE_TAG
+          if [[ -z "$release_tag" && "$RELEASE_REF" == refs/tags/* ]]; then
+            release_tag=${RELEASE_REF#refs/tags/}
+          fi
+
+          if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            printf 'release tags must match vX.Y.Z; got %s\n' "$release_tag" >&2
+            exit 1
+          fi
+          if [[ "$RELEASE_REF" == refs/tags/* && "$RELEASE_REF" != "refs/tags/$release_tag" ]]; then
+            printf 'release tag %s does not match ref %s\n' "$release_tag" "$RELEASE_REF" >&2
             exit 1
           fi

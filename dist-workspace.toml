@@ -11,6 +11,9 @@ packages = ["attached"]
 precise-builds = true
 # Generate the GitHub release workflow and publish to GitHub Releases.
 ci = "github"
+# Release tags created by the cut-release workflow use GITHUB_TOKEN, so launch
+# cargo-dist through an explicit workflow dispatch instead of a tag-push event.
+dispatch-releases = true
 hosting = "github"
 # Build a curl-compatible shell installer.
 installers = ["shell"]
