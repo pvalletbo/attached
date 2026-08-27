@@ -14,6 +14,8 @@ jobs:
       - name: Validate release tag
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ github.sha }}
           RELEASE_REF: ${{ github.ref }}
           RELEASE_TAG: ${{ github.event.inputs.tag }}
         run: |
@@ -37,5 +39,14 @@ jobs:
           fi
           if [[ "$RELEASE_REF" == refs/tags/* && "$RELEASE_REF" != "refs/tags/$release_tag" ]]; then
             printf 'release tag %s does not match ref %s\n' "$release_tag" "$RELEASE_REF" >&2
+            exit 1
+          fi
+
+          tag_commit=$(gh api \
+            "repos/$GITHUB_REPOSITORY/commits/$release_tag" \
+            --jq '.sha')
+          if [[ "$tag_commit" != "$RELEASE_COMMIT" ]]; then
+            printf 'release tag %s points to %s, but the workflow is building %s\n' \
+              "$release_tag" "$tag_commit" "$RELEASE_COMMIT" >&2
             exit 1
           fi

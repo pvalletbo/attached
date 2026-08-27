@@ -175,14 +175,16 @@ jobs:
     steps:
       - name: Start release artifact workflow
         env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.prepare.outputs.tag }}
         shell: bash
         run: |
           set -euo pipefail
+          # Use the stable default-branch cache scope across release runs.
           gh workflow run release.yml \
             --repo "$GITHUB_REPOSITORY" \
-            --ref "$TAG" \
+            --ref "$DEFAULT_BRANCH" \
             --field "tag=$TAG"
 
       - name: Summarize release
