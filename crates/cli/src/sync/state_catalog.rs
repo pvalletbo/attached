@@ -26,6 +26,7 @@ pub struct SyncedSession {
     pub target: String,
     pub host: String,
     pub session: String,
+    pub published_at: Option<DateTime<Utc>>,
 }
 
 pub(super) struct SessionListing {
@@ -57,6 +58,8 @@ pub(super) struct CatalogRecord {
     pub(super) record_id: RecordId,
     pub(super) service_revision: u64,
     host_label: String,
+    #[serde(default, with = "chrono::serde::ts_seconds_option")]
+    published_at: Option<DateTime<Utc>>,
     #[serde(with = "chrono::serde::ts_seconds")]
     expires_at: DateTime<Utc>,
     endpoint_ticket: String,
@@ -91,6 +94,7 @@ impl CatalogRecord {
             record_id,
             service_revision,
             host_label: descriptor.host_label().to_owned(),
+            published_at: Some(descriptor.issued_at()),
             expires_at: descriptor.expires_at(),
             endpoint_ticket: descriptor.endpoint_ticket().to_owned(),
             endpoint_identity: descriptor.endpoint_identity(),
@@ -159,6 +163,7 @@ fn sessions_with_filter(
                 target: format!("{target_host}/{session}"),
                 host: record.host_label.clone(),
                 session: session.clone(),
+                published_at: record.published_at,
             })
         })
         .collect::<Vec<_>>();
@@ -242,6 +247,14 @@ fn validate(catalog: &Catalog, account: &AccountCredentials) -> Result<()> {
             "invalid session access descriptor expiration"
         );
         ensure!(
+            record.published_at.is_none_or(|published_at| {
+                published_at.timestamp() >= 0
+                    && published_at.timestamp_subsec_nanos() == 0
+                    && published_at <= record.expires_at
+            }),
+            "invalid session access descriptor publication time"
+        );
+        ensure!(
             !record.endpoint_ticket.is_empty()
                 && record.endpoint_ticket.len() <= MAX_ENDPOINT_TICKET_BYTES
                 && record.endpoint_ticket.is_ascii(),
@@ -291,6 +304,7 @@ mod tests {
             record_id: RecordId::from_bytes([identity_byte; 16]),
             service_revision: 1,
             host_label: host.to_owned(),
+            published_at: Some(timestamp(1_700_000_000)),
             expires_at: timestamp(1_800_000_000),
             endpoint_ticket,
             endpoint_identity: *secret.public().as_bytes(),
@@ -328,6 +342,29 @@ mod tests {
             "locally served session was listed twice"
         );
         assert!(!listed.registry_unavailable);
+    }
+
+    #[test]
+    fn legacy_catalog_without_publication_time_remains_readable() {
+        let root = crate::test_support::canonical_tempdir();
+        let state_dir = root.path().join("state");
+        super::super::state::test_support::create_account(&state_dir, "https://sync.example")
+            .unwrap();
+        let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
+        let mut catalog = Catalog::empty(&account);
+        catalog.records.push(record(0x25, "legacy", "work"));
+        save(&state_dir, &account, &catalog).unwrap();
+        let catalog_path = state_dir.join(CATALOG_FILE);
+        let encoded = std::fs::read(&catalog_path).unwrap();
+        let mut encoded: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        encoded["records"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("published_at");
+        std::fs::write(&catalog_path, serde_json::to_vec(&encoded).unwrap()).unwrap();
+
+        let legacy = load(&state_dir, &account).unwrap();
+        assert_eq!(legacy.records[0].published_at, None);
     }
 
     #[test]
