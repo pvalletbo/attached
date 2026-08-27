@@ -5,7 +5,7 @@ use attached_session_sync_protocol::account::ApiKeyScope;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::{
-    herdr_version, identity, installation, secure_state, server, session, publish_account
+    herdr_version, identity, installation, publish_account, secure_state, server, session,
     session_picker::{self, SessionSelection},
     sync,
 };
