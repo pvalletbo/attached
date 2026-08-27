@@ -7,11 +7,14 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
-use tracing::Level;
+use tracing::{
+    Event, Level, Subscriber,
+    field::{Field, Visit},
+};
 use tracing_subscriber::{
     filter::{LevelFilter, Targets},
     fmt::format::FmtSpan,
-    layer::SubscriberExt,
+    layer::{Context, Layer, SubscriberExt},
     util::SubscriberInitExt,
 };
 
@@ -22,6 +25,58 @@ static TERMINAL_OUTPUT: Mutex<DeferredOutput> = Mutex::new(DeferredOutput::new()
 const MAX_DEFERRED_BYTES: usize = 256 * 1024;
 const TRUNCATED_NOTICE: &[u8] =
     b"Warning: additional tunnel diagnostics were omitted while Herdr owned the terminal.\n";
+const IROH_NET_REPORT_TARGET: &str = "iroh::net_report::report";
+const EXPECTED_QAD_MAPPING_WARNINGS: [&str; 2] = [
+    "IPv4 address detected by QAD varies by destination",
+    "IPv6 address detected by QAD varies by destination",
+];
+
+/// Iroh records destination-dependent QAD mappings so it can adapt to hard NATs.
+/// They are expected network characteristics, not actionable connection failures.
+#[derive(Clone, Copy)]
+struct SuppressExpectedQadMappingWarnings;
+
+impl<S> Layer<S> for SuppressExpectedQadMappingWarnings
+where
+    S: Subscriber,
+{
+    fn event_enabled(&self, event: &Event<'_>, _ctx: Context<'_, S>) -> bool {
+        !is_expected_qad_mapping_warning(event)
+    }
+}
+
+fn is_expected_qad_mapping_warning(event: &Event<'_>) -> bool {
+    let metadata = event.metadata();
+    if metadata.target() != IROH_NET_REPORT_TARGET || metadata.level() != &Level::WARN {
+        return false;
+    }
+
+    let mut visitor = MessageVisitor::default();
+    event.record(&mut visitor);
+    visitor
+        .message
+        .as_deref()
+        .is_some_and(|message| EXPECTED_QAD_MAPPING_WARNINGS.contains(&message))
+}
+
+#[derive(Default)]
+struct MessageVisitor {
+    message: Option<String>,
+}
+
+impl Visit for MessageVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.message = Some(format!("{value:?}"));
+        }
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "message" {
+            self.message = Some(value.to_owned());
+        }
+    }
+}
 
 struct DeferredOutput {
     guards: usize,
@@ -150,6 +205,7 @@ pub fn init(verbosity: u8) -> Result<()> {
         .compact();
     tracing_subscriber::registry()
         .with(filter)
+        .with(SuppressExpectedQadMappingWarnings)
         .with(formatter)
         .try_init()
         .map_err(|error| anyhow!("failed to initialize diagnostics: {error}"))
@@ -319,6 +375,57 @@ mod tests {
         assert_eq!(output.bytes, b"deferred warning\n");
         output.guards = 0;
         assert_eq!(output.take(), b"deferred warning\n");
+    }
+
+    #[test]
+    fn expected_qad_mapping_warnings_are_suppressed_selectively() {
+        let capture = Capture::default();
+        let filter = Targets::new().with_default(LevelFilter::WARN);
+        let subscriber = tracing_subscriber::registry()
+            .with(filter)
+            .with(SuppressExpectedQadMappingWarnings)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(capture.clone())
+                    .without_time()
+                    .with_target(false)
+                    .with_ansi(false),
+            );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(
+                target: IROH_NET_REPORT_TARGET,
+                marker = "suppressed-ipv4",
+                "IPv4 address detected by QAD varies by destination"
+            );
+            tracing::warn!(
+                target: IROH_NET_REPORT_TARGET,
+                marker = "suppressed-ipv6",
+                "IPv6 address detected by QAD varies by destination"
+            );
+            tracing::warn!(
+                target: IROH_NET_REPORT_TARGET,
+                marker = "retained-iroh-warning",
+                "received IPv6 address from IPv4 QAD"
+            );
+            tracing::warn!(
+                target: "dependency",
+                marker = "retained-other-target",
+                "IPv4 address detected by QAD varies by destination"
+            );
+            tracing::error!(
+                target: IROH_NET_REPORT_TARGET,
+                marker = "retained-error",
+                "IPv4 address detected by QAD varies by destination"
+            );
+        });
+
+        let log = capture.contents();
+        assert!(!log.contains("suppressed-ipv4"), "{log}");
+        assert!(!log.contains("suppressed-ipv6"), "{log}");
+        assert!(log.contains("retained-iroh-warning"), "{log}");
+        assert!(log.contains("retained-other-target"), "{log}");
+        assert!(log.contains("retained-error"), "{log}");
     }
 
     #[test]
