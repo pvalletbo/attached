@@ -37,6 +37,12 @@ pub enum RefreshWarning {
     EndpointRegistryUnavailable,
 }
 
+impl RefreshWarning {
+    pub(crate) fn is_verbose_only(&self) -> bool {
+        matches!(self, Self::RecordDiscarded { .. })
+    }
+}
+
 impl fmt::Display for RefreshWarning {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
