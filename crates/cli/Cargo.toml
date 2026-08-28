@@ -27,6 +27,7 @@ attached-tunnel-protocol.workspace = true
 iroh.workspace = true
 iroh-tickets.workspace = true
 reqwest.workspace = true
+rpassword.workspace = true
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
