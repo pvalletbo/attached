@@ -16,6 +16,7 @@ use crate::limits::{
 };
 
 const API_TOKEN_HASH_DOMAIN: &[u8] = b"herdr/session-sync/api-token/v1\0";
+const LEGACY_CONSUMER_IDENTITY_DOMAIN: &[u8] = b"herdr/session-sync/legacy-consumer-identity/v1\0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AccountError {
@@ -163,6 +164,52 @@ macro_rules! identifier {
     };
 }
 identifier!(RecordId);
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub struct AuthorizedConsumerIdentity([u8; 32]);
+
+impl AuthorizedConsumerIdentity {
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for AuthorizedConsumerIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AuthorizedConsumerIdentity")
+    }
+}
+
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct ConsumerIdentitySecret([u8; 32]);
+
+impl ConsumerIdentitySecret {
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    pub fn authorized_identity(&self) -> AuthorizedConsumerIdentity {
+        AuthorizedConsumerIdentity::from_bytes(
+            ed25519_dalek::SigningKey::from_bytes(&self.0)
+                .verifying_key()
+                .to_bytes(),
+        )
+    }
+}
+
+impl fmt::Debug for ConsumerIdentitySecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ConsumerIdentitySecret([REDACTED])")
+    }
+}
 
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct ApiToken([u8; 32]);
@@ -413,6 +460,8 @@ pub struct ScopedAccountBundle {
     api_key_scope: ApiKeyScope,
     api_token: ApiToken,
     account_root_key: AccountRootKey,
+    authorized_consumer_identity: Option<AuthorizedConsumerIdentity>,
+    consumer_identity_secret: Option<ConsumerIdentitySecret>,
 }
 
 pub struct OwnerAccountBundle {
@@ -421,6 +470,7 @@ pub struct OwnerAccountBundle {
     publish_api_token: ApiToken,
     download_api_token: ApiToken,
     account_root_key: AccountRootKey,
+    consumer_identity_secret: ConsumerIdentitySecret,
 }
 
 #[derive(Deserialize, Serialize, Zeroize, ZeroizeOnDrop)]
@@ -435,6 +485,11 @@ enum AccountBundleWire {
         api_key_scope: u8,
         api_token: String,
         account_root_key: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[zeroize(skip)]
+        authorized_consumer_identity: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        consumer_identity_secret: Option<String>,
     },
     Owner {
         #[zeroize(skip)]
@@ -444,7 +499,20 @@ enum AccountBundleWire {
         publish_api_token: String,
         download_api_token: String,
         account_root_key: String,
+        #[serde(
+            default,
+            deserialize_with = "deserialize_present_optional",
+            skip_serializing_if = "Option::is_none"
+        )]
+        consumer_identity_secret: Option<Option<String>>,
     },
+}
+
+fn deserialize_present_optional<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 impl fmt::Debug for AccountBundle {
@@ -484,8 +552,12 @@ impl ScopedAccountBundle {
         api_key_scope: ApiKeyScope,
         api_token: ApiToken,
         account_root_key: AccountRootKey,
+        authorized_consumer_identity: Option<AuthorizedConsumerIdentity>,
     ) -> Result<Self, AccountError> {
-        if !account_id.is_uuid_v7() {
+        if !account_id.is_uuid_v7()
+            || matches!(api_key_scope, ApiKeyScope::Publish)
+                != authorized_consumer_identity.is_some()
+        {
             return Err(AccountError::InvalidBundle);
         }
         Ok(Self {
@@ -494,11 +566,42 @@ impl ScopedAccountBundle {
             api_key_scope,
             api_token,
             account_root_key,
+            authorized_consumer_identity,
+            consumer_identity_secret: None,
+        })
+    }
+
+    pub fn from_download_parts(
+        service_origin: ServiceOrigin,
+        account_id: AccountId,
+        api_token: ApiToken,
+        account_root_key: AccountRootKey,
+        consumer_identity_secret: ConsumerIdentitySecret,
+    ) -> Result<Self, AccountError> {
+        if !account_id.is_uuid_v7() {
+            return Err(AccountError::InvalidBundle);
+        }
+        Ok(Self {
+            service_origin,
+            account_id,
+            api_key_scope: ApiKeyScope::Download,
+            api_token,
+            account_root_key,
+            authorized_consumer_identity: None,
+            consumer_identity_secret: Some(consumer_identity_secret),
         })
     }
 
     pub const fn api_key_scope(&self) -> ApiKeyScope {
         self.api_key_scope
+    }
+
+    pub const fn authorized_consumer_identity(&self) -> Option<AuthorizedConsumerIdentity> {
+        self.authorized_consumer_identity
+    }
+
+    pub fn consumer_identity_secret(&self) -> Option<&ConsumerIdentitySecret> {
+        self.consumer_identity_secret.as_ref()
     }
 
     pub fn consume<R>(
@@ -521,6 +624,7 @@ impl OwnerAccountBundle {
         publish_api_token: ApiToken,
         download_api_token: ApiToken,
         account_root_key: AccountRootKey,
+        consumer_identity_secret: ConsumerIdentitySecret,
     ) -> Result<Self, AccountError> {
         if !account_id.is_uuid_v7()
             || publish_api_token.service_hash() == download_api_token.service_hash()
@@ -533,6 +637,7 @@ impl OwnerAccountBundle {
             publish_api_token,
             download_api_token,
             account_root_key,
+            consumer_identity_secret,
         })
     }
 
@@ -547,6 +652,10 @@ impl OwnerAccountBundle {
             api_key_scope: scope,
             api_token: ApiToken::from_bytes(api_token.0),
             account_root_key: AccountRootKey::from_bytes(self.account_root_key.0),
+            authorized_consumer_identity: matches!(scope, ApiKeyScope::Publish)
+                .then(|| self.consumer_identity_secret.authorized_identity()),
+            consumer_identity_secret: matches!(scope, ApiKeyScope::Download)
+                .then(|| ConsumerIdentitySecret::from_bytes(self.consumer_identity_secret.0)),
         }
     }
 
@@ -557,6 +666,7 @@ impl OwnerAccountBundle {
             publish_api_token,
             download_api_token,
             account_root_key,
+            consumer_identity_secret,
         } = self;
         let api_token = match scope {
             ApiKeyScope::Publish => publish_api_token,
@@ -568,6 +678,10 @@ impl OwnerAccountBundle {
             api_key_scope: scope,
             api_token,
             account_root_key,
+            authorized_consumer_identity: matches!(scope, ApiKeyScope::Publish)
+                .then(|| consumer_identity_secret.authorized_identity()),
+            consumer_identity_secret: matches!(scope, ApiKeyScope::Download)
+                .then_some(consumer_identity_secret),
         }
     }
 }
@@ -581,6 +695,13 @@ impl AccountBundle {
                 api_key_scope: bundle.api_key_scope as u8,
                 api_token: bundle.api_token.encode(),
                 account_root_key: encode_base64(&bundle.account_root_key.0),
+                authorized_consumer_identity: bundle
+                    .authorized_consumer_identity
+                    .map(|identity| encode_base64(identity.as_bytes())),
+                consumer_identity_secret: bundle
+                    .consumer_identity_secret
+                    .as_ref()
+                    .map(|secret| encode_base64(secret.as_bytes())),
             },
             Self::Owner(bundle) => AccountBundleWire::Owner {
                 service_origin: bundle.service_origin.as_str().to_owned(),
@@ -588,6 +709,9 @@ impl AccountBundle {
                 publish_api_token: bundle.publish_api_token.encode(),
                 download_api_token: bundle.download_api_token.encode(),
                 account_root_key: encode_base64(&bundle.account_root_key.0),
+                consumer_identity_secret: Some(Some(encode_base64(
+                    bundle.consumer_identity_secret.as_bytes(),
+                ))),
             },
         };
         let payload = Zeroizing::new(
@@ -611,6 +735,20 @@ impl AccountBundle {
         decoded.truncate(decoded_len);
         let wire: AccountBundleWire =
             serde_json::from_slice(decoded.as_slice()).map_err(|_| AccountError::InvalidBundle)?;
+        let legacy_owner = matches!(
+            &wire,
+            AccountBundleWire::Owner {
+                consumer_identity_secret: None,
+                ..
+            }
+        );
+        if legacy_owner {
+            let historical_canonical =
+                Zeroizing::new(serde_json::to_vec(&wire).map_err(|_| AccountError::InvalidBundle)?);
+            if historical_canonical.as_slice() != decoded.as_slice() {
+                return Err(AccountError::InvalidBundle);
+            }
+        }
         let bundle = match &wire {
             AccountBundleWire::Scoped {
                 service_origin,
@@ -618,29 +756,70 @@ impl AccountBundle {
                 api_key_scope,
                 api_token,
                 account_root_key,
-            } => Self::Scoped(ScopedAccountBundle::from_parts(
-                ServiceOrigin::parse(service_origin).map_err(|_| AccountError::InvalidBundle)?,
-                AccountId::parse(account_id).map_err(|_| AccountError::InvalidBundle)?,
-                ApiKeyScope::try_from(*api_key_scope)?,
-                ApiToken::from_bytes(decode_bundle_secret(api_token)?),
-                AccountRootKey::from_bytes(decode_bundle_secret(account_root_key)?),
-            )?),
+                authorized_consumer_identity,
+                consumer_identity_secret,
+            } => {
+                let origin = ServiceOrigin::parse(service_origin)
+                    .map_err(|_| AccountError::InvalidBundle)?;
+                let account_id =
+                    AccountId::parse(account_id).map_err(|_| AccountError::InvalidBundle)?;
+                let token = ApiToken::from_bytes(decode_bundle_secret(api_token)?);
+                let root = AccountRootKey::from_bytes(decode_bundle_secret(account_root_key)?);
+                match ApiKeyScope::try_from(*api_key_scope)? {
+                    ApiKeyScope::Publish => Self::Scoped(ScopedAccountBundle::from_parts(
+                        origin,
+                        account_id,
+                        ApiKeyScope::Publish,
+                        token,
+                        root,
+                        authorized_consumer_identity
+                            .as_deref()
+                            .map(decode_bundle_secret)
+                            .transpose()?
+                            .map(AuthorizedConsumerIdentity::from_bytes),
+                    )?),
+                    ApiKeyScope::Download => {
+                        Self::Scoped(ScopedAccountBundle::from_download_parts(
+                            origin,
+                            account_id,
+                            token,
+                            root,
+                            ConsumerIdentitySecret::from_bytes(decode_bundle_secret(
+                                consumer_identity_secret
+                                    .as_deref()
+                                    .ok_or(AccountError::InvalidBundle)?,
+                            )?),
+                        )?)
+                    }
+                }
+            }
             AccountBundleWire::Owner {
                 service_origin,
                 account_id,
                 publish_api_token,
                 download_api_token,
                 account_root_key,
-            } => Self::Owner(OwnerAccountBundle::from_parts(
-                ServiceOrigin::parse(service_origin).map_err(|_| AccountError::InvalidBundle)?,
-                AccountId::parse(account_id).map_err(|_| AccountError::InvalidBundle)?,
-                ApiToken::from_bytes(decode_bundle_secret(publish_api_token)?),
-                ApiToken::from_bytes(decode_bundle_secret(download_api_token)?),
-                AccountRootKey::from_bytes(decode_bundle_secret(account_root_key)?),
-            )?),
+                consumer_identity_secret,
+            } => {
+                let root = decode_bundle_secret(account_root_key)?;
+                let secret = match consumer_identity_secret {
+                    Some(Some(secret)) => decode_bundle_secret(secret)?,
+                    Some(None) => return Err(AccountError::InvalidBundle),
+                    None => domain_hash(LEGACY_CONSUMER_IDENTITY_DOMAIN, &[&root]),
+                };
+                Self::Owner(OwnerAccountBundle::from_parts(
+                    ServiceOrigin::parse(service_origin)
+                        .map_err(|_| AccountError::InvalidBundle)?,
+                    AccountId::parse(account_id).map_err(|_| AccountError::InvalidBundle)?,
+                    ApiToken::from_bytes(decode_bundle_secret(publish_api_token)?),
+                    ApiToken::from_bytes(decode_bundle_secret(download_api_token)?),
+                    AccountRootKey::from_bytes(root),
+                    ConsumerIdentitySecret::from_bytes(secret),
+                )?)
+            }
         };
         let canonical = Zeroizing::new(bundle.encode());
-        if canonical.as_bytes() != input {
+        if !legacy_owner && canonical.as_bytes() != input {
             return Err(AccountError::InvalidBundle);
         }
         Ok(bundle)

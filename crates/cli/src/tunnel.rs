@@ -63,13 +63,22 @@ pub(crate) fn is_remote_unavailable(error: &anyhow::Error) -> bool {
     error.downcast_ref::<RemoteUnavailable>().is_some()
 }
 
+async fn bind_client_endpoint(local_identity: &iroh::SecretKey) -> Result<Endpoint> {
+    Endpoint::builder(presets::N0)
+        .secret_key(local_identity.clone())
+        .bind()
+        .await
+        .context("could not bind persistent local Iroh identity")
+}
+
 pub async fn request_upgrade(
     endpoint_addr: iroh::EndpointAddr,
+    local_identity: &iroh::SecretKey,
     session: &str,
     capability: &CapabilitySecret,
     requested_version: HerdrVersion,
 ) -> Result<HerdrVersion> {
-    let endpoint = Endpoint::bind(presets::N0)
+    let endpoint = bind_client_endpoint(local_identity)
         .await
         .context("could not initialize the local upgrade endpoint")?;
     let result = timeout(UPGRADE_TIMEOUT, async {
@@ -244,6 +253,7 @@ async fn connect_session_tui_socket(session: &Session) -> Result<UnixStream> {
 
 pub async fn connect(
     endpoint_addr: iroh::EndpointAddr,
+    local_identity: &iroh::SecretKey,
     session: String,
     capability: CapabilitySecret,
     herdr_bin: PathBuf,
@@ -265,7 +275,7 @@ pub async fn connect(
     tokio::pin!(ctrl_c);
     let endpoint = setup_step(
         async {
-            Endpoint::bind(presets::N0)
+            bind_client_endpoint(local_identity)
                 .await
                 .context("failed to bind local Iroh endpoint")
         },

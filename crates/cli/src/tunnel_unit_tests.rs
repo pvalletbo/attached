@@ -1,6 +1,21 @@
 use super::*;
 
 #[tokio::test]
+async fn client_endpoint_uses_the_persistent_identity() {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let identity = iroh::SecretKey::generate();
+        let expected = identity.public();
+
+        let endpoint = bind_client_endpoint(&identity).await.unwrap();
+
+        assert_eq!(endpoint.id(), expected);
+        endpoint.close().await;
+    })
+    .await
+    .expect("persistent client endpoint bind timed out");
+}
+
+#[tokio::test]
 async fn missing_selected_session_socket_is_reported_without_fallback() {
     let root = tempfile::tempdir().unwrap();
     let other_tui = root.path().join("other.sock");

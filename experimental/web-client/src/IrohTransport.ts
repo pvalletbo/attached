@@ -11,6 +11,7 @@ interface BrowserIrohModule {
       endpointTicket: string,
       session: string,
       capability: Uint8Array,
+      consumerIdentitySecret: Uint8Array,
     ): Promise<BrowserTunnelBinding>;
     cancel(): void;
     free(): void;
@@ -21,6 +22,7 @@ export interface IrohConnectionTarget {
   endpointTicket: string;
   session: string;
   capability: Uint8Array;
+  consumerIdentitySecret: Uint8Array;
 }
 
 export type BrowserIrohLoader = () => Promise<BrowserIrohModule>;
@@ -54,12 +56,14 @@ export class IrohTransport {
         target.endpointTicket,
         target.session,
         target.capability,
+        target.consumerIdentitySecret,
       );
       return new IrohTransport(tunnel);
     } catch {
       throw new Error("unable to connect to the Herdr tunnel");
     } finally {
       target.capability.fill(0);
+      target.consumerIdentitySecret.fill(0);
       signal?.removeEventListener("abort", cancel);
       connector?.free();
     }
