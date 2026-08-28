@@ -12,14 +12,22 @@ use attached_session_sync_protocol::{
 use chrono::{DateTime, Utc};
 use iroh_tickets::endpoint::EndpointTicket;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
-use crate::secure_state::{with_exclusive_lock, with_locked_existing};
+use crate::{
+    local_encryption::{
+        MasterKeyStore, Purpose, active_store, has_envelope_shape, is_envelope, open, seal,
+        stored_limit, with_master_key, with_master_key_store,
+    },
+    secure_state::{StateDir, with_exclusive_lock, with_locked_existing},
+};
 
 use super::state::AccountCredentials;
 
 const CATALOG_FILE: &str = "sync-catalog.json";
 const CATALOG_LOCK: &str = "sync-catalog.lock";
 const MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
+const MAX_STORED_CATALOG_BYTES: usize = stored_limit(MAX_CATALOG_BYTES);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SyncedSession {
@@ -131,15 +139,9 @@ impl CatalogRecord {
 }
 
 pub(super) fn load(state_dir: &Path, account: &AccountCredentials) -> Result<Catalog> {
-    let encoded = with_locked_existing(state_dir, CATALOG_LOCK, |directory| {
-        directory.read_optional_bounded(CATALOG_FILE, MAX_CATALOG_BYTES)
-    })?;
-    let Some(encoded) = encoded else {
-        return Ok(Catalog::empty(account));
-    };
-    let catalog: Catalog = serde_json::from_slice(&encoded).context("invalid sync catalog")?;
-    validate(&catalog, account)?;
-    Ok(catalog)
+    with_locked_existing(state_dir, CATALOG_LOCK, |directory| {
+        Ok(read_catalog(directory, account, true)?.unwrap_or_else(|| Catalog::empty(account)))
+    })
 }
 
 #[cfg(test)]
@@ -150,27 +152,18 @@ pub(super) fn save(
 ) -> Result<()> {
     validate(catalog, account)?;
     with_exclusive_lock(state_dir, CATALOG_LOCK, |directory| {
-        let current = directory.read_optional_bounded(CATALOG_FILE, MAX_CATALOG_BYTES)?;
-        let current_generation = current
-            .as_deref()
-            .and_then(|encoded| serde_json::from_slice::<Catalog>(encoded).ok())
-            .map_or(0, |catalog| catalog.generation);
+        let current = read_catalog(directory, account, false)?;
+        let current_generation = current.as_ref().map_or(0, |catalog| catalog.generation);
         let mut next = catalog.clone();
         next.generation = current_generation
             .checked_add(1)
             .context("sync catalog generation exhausted")?;
-        let encoded = serde_json::to_vec(&next).context("could not encode sync catalog")?;
+        let encoded = encode_catalog(&next)?;
         ensure!(
             encoded.len() <= MAX_CATALOG_BYTES,
             "sync catalog exceeds local limit"
         );
-        if current.is_some() {
-            directory.atomic_replace(CATALOG_FILE, &encoded)
-        } else if directory.create_noclobber(CATALOG_FILE, &encoded)? {
-            Ok(())
-        } else {
-            anyhow::bail!("sync catalog was concurrently installed")
-        }
+        write_catalog(directory, &encoded, current.is_some())
     })
 }
 
@@ -183,11 +176,15 @@ pub(super) fn save_refresh(
 ) -> Result<()> {
     validate(refreshed, account)?;
     with_exclusive_lock(state_dir, CATALOG_LOCK, |directory| {
-        let current = directory
-            .read_optional_bounded(CATALOG_FILE, MAX_CATALOG_BYTES)?
-            .and_then(|encoded| serde_json::from_slice::<Catalog>(&encoded).ok())
-            .filter(|catalog| validate(catalog, account).is_ok())
-            .unwrap_or_else(|| Catalog::empty(account));
+        let (current, existed) = match read_catalog(directory, account, false) {
+            Ok(current) => {
+                let existed = current.is_some();
+                (current, existed)
+            }
+            Err(_) if has_corrupt_legacy_catalog(directory)? => (None, true),
+            Err(error) => return Err(error),
+        };
+        let current = current.unwrap_or_else(|| Catalog::empty(account));
         let current_generation = current.generation;
         let mut current_records = current
             .records
@@ -270,21 +267,12 @@ pub(super) fn save_refresh(
             .checked_add(1)
             .context("sync catalog generation exhausted")?;
         validate(&reconciled, account)?;
-        let encoded = serde_json::to_vec(&reconciled).context("could not encode sync catalog")?;
+        let encoded = encode_catalog(&reconciled)?;
         ensure!(
             encoded.len() <= MAX_CATALOG_BYTES,
             "sync catalog exceeds local limit"
         );
-        if directory
-            .read_optional_bounded(CATALOG_FILE, MAX_CATALOG_BYTES)?
-            .is_some()
-        {
-            directory.atomic_replace(CATALOG_FILE, &encoded)
-        } else if directory.create_noclobber(CATALOG_FILE, &encoded)? {
-            Ok(())
-        } else {
-            anyhow::bail!("sync catalog was concurrently installed")
-        }
+        write_catalog(directory, &encoded, existed)
     })
 }
 
@@ -295,13 +283,9 @@ pub(super) fn remove_if_revision(
     service_revision: u64,
 ) -> Result<bool> {
     with_exclusive_lock(state_dir, CATALOG_LOCK, |directory| {
-        let Some(encoded) = directory.read_optional_bounded(CATALOG_FILE, MAX_CATALOG_BYTES)?
-        else {
+        let Some(mut catalog) = read_catalog(directory, account, true)? else {
             return Ok(false);
         };
-        let mut catalog: Catalog =
-            serde_json::from_slice(&encoded).context("invalid sync catalog")?;
-        validate(&catalog, account)?;
         let previous_len = catalog.records.len();
         catalog.records.retain(|record| {
             record.record_id != record_id || record.service_revision != service_revision
@@ -328,14 +312,85 @@ pub(super) fn remove_if_revision(
             .checked_add(1)
             .context("sync catalog generation exhausted")?;
         validate(&catalog, account)?;
-        let encoded = serde_json::to_vec(&catalog).context("could not encode sync catalog")?;
+        let encoded = encode_catalog(&catalog)?;
         ensure!(
             encoded.len() <= MAX_CATALOG_BYTES,
             "sync catalog exceeds local limit"
         );
-        directory.atomic_replace(CATALOG_FILE, &encoded)?;
+        write_catalog(directory, &encoded, true)?;
         Ok(true)
     })
+}
+
+fn has_corrupt_legacy_catalog(directory: &StateDir) -> Result<bool> {
+    let Some(stored) =
+        directory.read_secret_optional_bounded(CATALOG_FILE, MAX_STORED_CATALOG_BYTES)?
+    else {
+        return Ok(false);
+    };
+    Ok(!has_envelope_shape(&stored) && serde_json::from_slice::<Catalog>(&stored).is_err())
+}
+
+fn read_catalog(
+    directory: &StateDir,
+    account: &AccountCredentials,
+    migrate_legacy: bool,
+) -> Result<Option<Catalog>> {
+    read_catalog_with_store(directory, account, migrate_legacy, active_store())
+}
+
+fn read_catalog_with_store(
+    directory: &StateDir,
+    account: &AccountCredentials,
+    migrate_legacy: bool,
+    store: &dyn MasterKeyStore,
+) -> Result<Option<Catalog>> {
+    let Some(stored) =
+        directory.read_secret_optional_bounded(CATALOG_FILE, MAX_STORED_CATALOG_BYTES)?
+    else {
+        return Ok(None);
+    };
+    let legacy = !is_envelope(&stored);
+    let plaintext = if !legacy {
+        with_master_key_store(directory, store, false, |key| {
+            open(key, Purpose::SyncCatalog, &stored, MAX_CATALOG_BYTES)
+        })?
+    } else {
+        stored
+    };
+    let catalog: Catalog = serde_json::from_slice(&plaintext).context("invalid sync catalog")?;
+    validate(&catalog, account)?;
+    if migrate_legacy && legacy {
+        with_master_key_store(directory, store, true, |key| {
+            let encrypted = seal(key, Purpose::SyncCatalog, &plaintext, MAX_CATALOG_BYTES)?;
+            directory.atomic_replace(CATALOG_FILE, &encrypted)
+        })?;
+        tracing::info!(
+            event = "local_secret_migrated",
+            purpose = Purpose::SyncCatalog.name(),
+            "migrated legacy local secret to encrypted storage"
+        );
+    }
+    Ok(Some(catalog))
+}
+
+fn write_catalog(directory: &StateDir, plaintext: &[u8], replace: bool) -> Result<()> {
+    with_master_key(directory, true, |key| {
+        let encrypted = seal(key, Purpose::SyncCatalog, plaintext, MAX_CATALOG_BYTES)?;
+        if replace {
+            directory.atomic_replace(CATALOG_FILE, &encrypted)
+        } else if directory.create_noclobber(CATALOG_FILE, &encrypted)? {
+            Ok(())
+        } else {
+            anyhow::bail!("sync catalog was concurrently installed")
+        }
+    })
+}
+
+fn encode_catalog(catalog: &Catalog) -> Result<Zeroizing<Vec<u8>>> {
+    let mut encoded = Zeroizing::new(Vec::new());
+    serde_json::to_writer(&mut *encoded, catalog).context("could not encode sync catalog")?;
+    Ok(encoded)
 }
 
 fn sessions_with_filter(
@@ -488,8 +543,21 @@ fn validate(catalog: &Catalog, account: &AccountCredentials) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
     use super::*;
     use attached_session_sync_protocol::account::ApiKeyScope;
+
+    struct FixedStore(Option<[u8; 32]>);
+
+    impl crate::local_encryption::MasterKeyStore for FixedStore {
+        fn load(&self) -> Result<Option<Zeroizing<[u8; 32]>>> {
+            Ok(self.0.map(Zeroizing::new))
+        }
+        fn store(&self, _: &[u8; 32]) -> Result<()> {
+            unreachable!()
+        }
+    }
 
     const ENDPOINT: &str = "endpointacxfr74igmsbvsbnn73wcecg5vt3kbzncqwfrdiampuufwnhkublmaqacbuhi5dqhixs6zdfojyc43lffyxqcad7aaaadaai";
 
@@ -521,6 +589,53 @@ mod tests {
     }
 
     #[test]
+    fn catalog_serialization_uses_a_pre_zeroizing_output_buffer() {
+        fn assert_zeroizing(_: &Zeroizing<Vec<u8>>) {}
+        let root = crate::test_support::canonical_tempdir();
+        let state_dir = root.path().join("state");
+        super::super::state::test_support::create_account(&state_dir, "https://sync.example")
+            .unwrap();
+        let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
+
+        let encoded = encode_catalog(&Catalog::empty(&account)).unwrap();
+
+        assert_zeroizing(&encoded);
+        assert!(serde_json::from_slice::<Catalog>(&encoded).is_ok());
+    }
+
+    #[test]
+    fn missing_and_wrong_catalog_keys_leave_ciphertext_byte_exact() {
+        let root = crate::test_support::canonical_tempdir();
+        let state_dir = root.path().join("state");
+        super::super::state::test_support::create_account(&state_dir, "https://sync.example")
+            .unwrap();
+        let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
+        let plaintext = encode_catalog(&Catalog::empty(&account)).unwrap();
+        let envelope = seal(
+            &[0x44; 32],
+            Purpose::SyncCatalog,
+            &plaintext,
+            MAX_CATALOG_BYTES,
+        )
+        .unwrap();
+        std::fs::write(state_dir.join(CATALOG_FILE), &envelope).unwrap();
+        std::fs::set_permissions(
+            state_dir.join(CATALOG_FILE),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let directory = StateDir::open(&state_dir).unwrap();
+
+        for store in [FixedStore(None), FixedStore(Some([0x45; 32]))] {
+            assert!(read_catalog_with_store(&directory, &account, true, &store).is_err());
+            assert_eq!(
+                std::fs::read(state_dir.join(CATALOG_FILE)).unwrap(),
+                envelope.as_slice()
+            );
+        }
+    }
+
+    #[test]
     fn failed_attachment_removes_only_the_selected_catalog_revision() {
         let root = crate::test_support::canonical_tempdir();
         let state_dir = root.path().join("state");
@@ -532,6 +647,9 @@ mod tests {
         let record_id = selected.record_id;
         catalog.records.push(selected);
         save(&state_dir, &account, &catalog).unwrap();
+        let stored = std::fs::read(state_dir.join(CATALOG_FILE)).unwrap();
+        assert!(crate::local_encryption::is_envelope(&stored));
+        assert!(!stored.windows(32).any(|bytes| bytes == [7; 32]));
 
         assert!(remove_if_revision(&state_dir, &account, record_id, 1).unwrap());
         assert!(
@@ -545,6 +663,37 @@ mod tests {
             .unwrap()
             .is_none()
         );
+    }
+
+    #[test]
+    fn legacy_plaintext_catalog_migrates_and_preserves_records_and_capabilities() {
+        let root = crate::test_support::canonical_tempdir();
+        let state_dir = root.path().join("state");
+        super::super::state::test_support::create_account(&state_dir, "https://sync.example")
+            .unwrap();
+        let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
+        let mut expected = Catalog::empty(&account);
+        expected.records.push(record(0x59, "office", "work"));
+        let plaintext = serde_json::to_vec(&expected).unwrap();
+        std::fs::write(state_dir.join(CATALOG_FILE), &plaintext).unwrap();
+        std::fs::set_permissions(
+            state_dir.join(CATALOG_FILE),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+
+        let loaded = load(&state_dir, &account).unwrap();
+
+        assert_eq!(loaded.records.len(), 1);
+        assert_eq!(loaded.records[0].record_id, expected.records[0].record_id);
+        assert_eq!(
+            loaded.records[0].attach_capability,
+            expected.records[0].attach_capability
+        );
+        assert_eq!(loaded.records[0].sessions, expected.records[0].sessions);
+        let migrated = std::fs::read(state_dir.join(CATALOG_FILE)).unwrap();
+        assert!(crate::local_encryption::is_envelope(&migrated));
+        assert_ne!(migrated, plaintext);
     }
 
     #[test]
@@ -574,6 +723,95 @@ mod tests {
             .is_some(),
             "a newer publisher revision was removed by an older failed attachment"
         );
+    }
+
+    #[test]
+    fn remove_noop_migrates_a_valid_legacy_catalog() {
+        let root = crate::test_support::canonical_tempdir();
+        let state_dir = root.path().join("state");
+        super::super::state::test_support::create_account(&state_dir, "https://sync.example")
+            .unwrap();
+        let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
+        let catalog = Catalog::empty(&account);
+        let legacy = encode_catalog(&catalog).unwrap();
+        std::fs::write(state_dir.join(CATALOG_FILE), &legacy).unwrap();
+        std::fs::set_permissions(
+            state_dir.join(CATALOG_FILE),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+
+        assert!(
+            !remove_if_revision(&state_dir, &account, RecordId::from_bytes([0xee; 16]), 1).unwrap()
+        );
+        assert!(is_envelope(
+            &std::fs::read(state_dir.join(CATALOG_FILE)).unwrap()
+        ));
+    }
+
+    #[test]
+    fn refresh_rejects_magic_corrupted_envelope_without_replacing_it() {
+        let root = crate::test_support::canonical_tempdir();
+        let state_dir = root.path().join("state");
+        super::super::state::test_support::create_account(&state_dir, "https://sync.example")
+            .unwrap();
+        let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
+        let catalog = Catalog::empty(&account);
+        save(&state_dir, &account, &catalog).unwrap();
+        let path = state_dir.join(CATALOG_FILE);
+        let envelope = std::fs::read(&path).unwrap();
+        for offset in 0..8 {
+            let mut corrupted = envelope.clone();
+            corrupted[offset] = if offset == 0 {
+                b'{'
+            } else {
+                corrupted[offset] ^ 1
+            };
+            std::fs::write(&path, &corrupted).unwrap();
+
+            assert!(
+                save_refresh(
+                    &state_dir,
+                    &account,
+                    &HashSet::new(),
+                    &HashSet::new(),
+                    &catalog,
+                )
+                .is_err(),
+                "magic corruption at offset {offset} was accepted"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), corrupted);
+        }
+
+        let mut unsupported_version = envelope.clone();
+        unsupported_version[8] ^= 1;
+        let mut two_magic_bytes = envelope.clone();
+        two_magic_bytes[0] ^= 1;
+        two_magic_bytes[1] ^= 1;
+        let variants = [
+            ("unsupported version", unsupported_version),
+            ("two corrupt magic bytes", two_magic_bytes),
+            ("truncated header", envelope[..8].to_vec()),
+            (
+                "truncated ciphertext",
+                envelope[..envelope.len() - 1].to_vec(),
+            ),
+        ];
+        for (name, corrupted) in variants {
+            std::fs::write(&path, &corrupted).unwrap();
+            assert!(
+                save_refresh(
+                    &state_dir,
+                    &account,
+                    &HashSet::new(),
+                    &HashSet::new(),
+                    &catalog,
+                )
+                .is_err(),
+                "{name} was accepted"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), corrupted, "{name}");
+        }
     }
 
     #[test]
@@ -1020,15 +1258,15 @@ mod tests {
         let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
         let mut catalog = Catalog::empty(&account);
         catalog.records.push(record(0x25, "legacy", "work"));
-        save(&state_dir, &account, &catalog).unwrap();
         let catalog_path = state_dir.join(CATALOG_FILE);
-        let encoded = std::fs::read(&catalog_path).unwrap();
-        let mut encoded: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        let mut encoded: serde_json::Value =
+            serde_json::to_value(&catalog).expect("catalog fixture serializes");
         encoded["records"][0]
             .as_object_mut()
             .unwrap()
             .remove("published_at");
         std::fs::write(&catalog_path, serde_json::to_vec(&encoded).unwrap()).unwrap();
+        std::fs::set_permissions(&catalog_path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
         let legacy = load(&state_dir, &account).unwrap();
         assert_eq!(legacy.records[0].published_at, None);

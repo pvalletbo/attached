@@ -11,11 +11,18 @@ use attached_session_sync_protocol::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::secure_state::{prepare_private_dir, with_exclusive_lock, with_locked_existing};
+use crate::{
+    local_encryption::{
+        MasterKeyStore, Purpose, active_store, is_envelope, open, seal, stored_limit,
+        with_master_key, with_master_key_store,
+    },
+    secure_state::{StateDir, prepare_private_dir, with_exclusive_lock, with_locked_existing},
+};
 
 const ACCOUNT_FILE: &str = "sync-account.bundle";
 const ACCOUNT_LOCK: &str = "sync-account.lock";
 const MAX_ACCOUNT_STATE_BYTES: usize = MAX_BUNDLE_ENCODED_BYTES;
+const MAX_STORED_ACCOUNT_BYTES: usize = stored_limit(MAX_ACCOUNT_STATE_BYTES);
 
 pub struct AccountCredentials {
     service_origin: String,
@@ -116,7 +123,7 @@ pub fn ensure_account_slot_available(state_dir: &Path) -> Result<()> {
     with_exclusive_lock(state_dir, ACCOUNT_LOCK, |directory| {
         ensure!(
             directory
-                .read_optional_bounded(ACCOUNT_FILE, MAX_ACCOUNT_STATE_BYTES)?
+                .read_secret_optional_bounded(ACCOUNT_FILE, MAX_STORED_ACCOUNT_BYTES)?
                 .is_none(),
             "a synchronization account is already configured"
         );
@@ -157,8 +164,16 @@ pub fn import_account(state_dir: &Path, encoded: &[u8]) -> Result<()> {
 }
 
 pub fn export_account(state_dir: &Path, scope: ApiKeyScope) -> Result<String> {
-    let stored =
-        load_stored_account(state_dir)?.context("no synchronization account is configured")?;
+    export_account_with_store(state_dir, scope, active_store())
+}
+
+fn export_account_with_store(
+    state_dir: &Path,
+    scope: ApiKeyScope,
+    store: &dyn MasterKeyStore,
+) -> Result<String> {
+    let stored = load_stored_account_with_store(state_dir, store)?
+        .context("no synchronization account is configured")?;
     Ok(AccountBundle::Scoped(into_export_scope(stored, scope)?).encode())
 }
 
@@ -169,14 +184,31 @@ fn install_account(state_dir: &Path, encoded: &[u8], allow_idempotent: bool) -> 
     prepare_private_dir(state_dir)?;
     with_exclusive_lock(state_dir, ACCOUNT_LOCK, |directory| {
         if let Some(existing) =
-            directory.read_optional_bounded(ACCOUNT_FILE, MAX_ACCOUNT_STATE_BYTES)?
+            directory.read_secret_optional_bounded(ACCOUNT_FILE, MAX_STORED_ACCOUNT_BYTES)?
         {
-            if allow_idempotent && existing == encoded {
+            let legacy = !is_envelope(&existing);
+            let existing = decrypt_account(directory, existing, false)?;
+            if allow_idempotent && existing.as_slice() == encoded {
+                if legacy {
+                    with_master_key(directory, true, |key| {
+                        let encrypted = seal(
+                            key,
+                            Purpose::SyncAccount,
+                            &existing,
+                            MAX_ACCOUNT_STATE_BYTES,
+                        )?;
+                        directory.atomic_replace(ACCOUNT_FILE, &encrypted)
+                    })?;
+                }
                 return Ok(());
             }
             anyhow::bail!("a different synchronization account is already configured");
         }
-        if directory.create_noclobber(ACCOUNT_FILE, encoded)? {
+        let installed = with_master_key(directory, true, |key| {
+            let encrypted = seal(key, Purpose::SyncAccount, encoded, MAX_ACCOUNT_STATE_BYTES)?;
+            directory.create_noclobber(ACCOUNT_FILE, &encrypted)
+        })?;
+        if installed {
             Ok(())
         } else {
             anyhow::bail!("synchronization account was concurrently installed")
@@ -209,15 +241,59 @@ pub fn load_account_optional(
 }
 
 fn load_stored_account(state_dir: &Path) -> Result<Option<AccountBundle>> {
-    let encoded = with_locked_existing(state_dir, ACCOUNT_LOCK, |directory| {
-        directory.read_optional_bounded(ACCOUNT_FILE, MAX_ACCOUNT_STATE_BYTES)
-    })?;
-    encoded
-        .map(|encoded| {
-            AccountBundle::parse(&encoded)
-                .map_err(|_| anyhow::anyhow!("stored synchronization account is invalid"))
-        })
-        .transpose()
+    load_stored_account_with_store(state_dir, active_store())
+}
+
+fn load_stored_account_with_store(
+    state_dir: &Path,
+    store: &dyn MasterKeyStore,
+) -> Result<Option<AccountBundle>> {
+    with_locked_existing(state_dir, ACCOUNT_LOCK, |directory| {
+        let Some(encoded) =
+            directory.read_secret_optional_bounded(ACCOUNT_FILE, MAX_STORED_ACCOUNT_BYTES)?
+        else {
+            return Ok(None);
+        };
+        let encoded = decrypt_account_with_store(directory, store, encoded, true)?;
+        AccountBundle::parse(&encoded)
+            .map(Some)
+            .map_err(|_| anyhow::anyhow!("stored synchronization account is invalid"))
+    })
+}
+
+fn decrypt_account(
+    directory: &StateDir,
+    encoded: Zeroizing<Vec<u8>>,
+    migrate_legacy: bool,
+) -> Result<Zeroizing<Vec<u8>>> {
+    decrypt_account_with_store(directory, active_store(), encoded, migrate_legacy)
+}
+
+fn decrypt_account_with_store(
+    directory: &StateDir,
+    store: &dyn MasterKeyStore,
+    encoded: Zeroizing<Vec<u8>>,
+    migrate_legacy: bool,
+) -> Result<Zeroizing<Vec<u8>>> {
+    if is_envelope(&encoded) {
+        return with_master_key_store(directory, store, false, |key| {
+            open(key, Purpose::SyncAccount, &encoded, MAX_ACCOUNT_STATE_BYTES)
+        });
+    }
+    AccountBundle::parse(&encoded)
+        .map_err(|_| anyhow::anyhow!("stored synchronization account is invalid"))?;
+    if migrate_legacy {
+        with_master_key_store(directory, store, true, |key| {
+            let encrypted = seal(key, Purpose::SyncAccount, &encoded, MAX_ACCOUNT_STATE_BYTES)?;
+            directory.atomic_replace(ACCOUNT_FILE, &encrypted)
+        })?;
+        tracing::info!(
+            event = "local_secret_migrated",
+            purpose = Purpose::SyncAccount.name(),
+            "migrated legacy local secret to encrypted storage"
+        );
+    }
+    Ok(encoded)
 }
 
 const fn scope_name(scope: ApiKeyScope) -> &'static str {
@@ -247,7 +323,43 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
     use super::*;
+
+    struct FixedStore([u8; 32]);
+
+    struct MissingStore;
+
+    impl crate::local_encryption::MasterKeyStore for MissingStore {
+        fn load(&self) -> Result<Option<Zeroizing<[u8; 32]>>> {
+            Ok(None)
+        }
+        fn store(&self, _: &[u8; 32]) -> Result<()> {
+            unreachable!()
+        }
+    }
+
+    struct StoreFailsAfterNone;
+
+    impl crate::local_encryption::MasterKeyStore for StoreFailsAfterNone {
+        fn load(&self) -> Result<Option<Zeroizing<[u8; 32]>>> {
+            Ok(None)
+        }
+        fn store(&self, _: &[u8; 32]) -> Result<()> {
+            anyhow::bail!("synthetic store failure")
+        }
+    }
+
+    impl crate::local_encryption::MasterKeyStore for FixedStore {
+        fn load(&self) -> Result<Option<Zeroizing<[u8; 32]>>> {
+            Ok(Some(Zeroizing::new(self.0)))
+        }
+
+        fn store(&self, _key: &[u8; 32]) -> Result<()> {
+            unreachable!("fixed test key already exists")
+        }
+    }
 
     fn fixture_account_id() -> AccountId {
         AccountId::parse("01890f9e-7b3a-7cc2-98c8-4dc0cbd2bbf2").unwrap()
@@ -368,14 +480,13 @@ mod tests {
         let download_text = install_fixture(&state);
         let stored = std::fs::read(state.join(ACCOUNT_FILE)).unwrap();
         assert!(
-            stored
-                .iter()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            crate::local_encryption::is_envelope(&stored),
+            "account state was not encrypted"
         );
-        assert!(matches!(
-            AccountBundle::parse(&stored).unwrap(),
-            AccountBundle::Owner(_)
-        ));
+        assert!(
+            AccountBundle::parse(&stored).is_err(),
+            "portable account bundle remained plaintext at rest"
+        );
         let publish_text = export_account(&state, ApiKeyScope::Publish).unwrap();
         let exported_download = export_account(&state, ApiKeyScope::Download).unwrap();
         assert_eq!(download_text.as_bytes(), exported_download.as_bytes());
@@ -426,5 +537,135 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("publish-only"), "{error}");
+    }
+
+    #[test]
+    fn idempotent_import_migrates_legacy_plaintext_account() {
+        let root = crate::test_support::canonical_tempdir();
+        let state = root.path().join("state");
+        prepare_private_dir(&state).unwrap();
+        let expected = AccountBundle::Scoped(fixture_owner().scoped(ApiKeyScope::Publish)).encode();
+        std::fs::write(state.join(ACCOUNT_FILE), expected.as_bytes()).unwrap();
+        std::fs::set_permissions(
+            state.join(ACCOUNT_FILE),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+
+        import_account(&state, expected.as_bytes()).unwrap();
+
+        let migrated = std::fs::read(state.join(ACCOUNT_FILE)).unwrap();
+        assert!(crate::local_encryption::is_envelope(&migrated));
+        assert_ne!(migrated, expected.as_bytes());
+        assert_eq!(
+            export_account(&state, ApiKeyScope::Publish).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn different_import_over_legacy_plaintext_leaves_original_bytes_unchanged() {
+        let root = crate::test_support::canonical_tempdir();
+        let state = root.path().join("state");
+        prepare_private_dir(&state).unwrap();
+        let original = AccountBundle::Scoped(fixture_owner().scoped(ApiKeyScope::Publish)).encode();
+        let different =
+            AccountBundle::Scoped(fixture_owner().scoped(ApiKeyScope::Download)).encode();
+        std::fs::write(state.join(ACCOUNT_FILE), original.as_bytes()).unwrap();
+        std::fs::set_permissions(
+            state.join(ACCOUNT_FILE),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+
+        let error = import_account(&state, different.as_bytes())
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("different synchronization account"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(state.join(ACCOUNT_FILE)).unwrap(),
+            original.as_bytes()
+        );
+    }
+
+    #[test]
+    fn legacy_plaintext_account_migrates_and_preserves_exact_export() {
+        let root = crate::test_support::canonical_tempdir();
+        let state = root.path().join("state");
+        prepare_private_dir(&state).unwrap();
+        let expected = AccountBundle::Scoped(fixture_owner().scoped(ApiKeyScope::Publish)).encode();
+        std::fs::write(state.join(ACCOUNT_FILE), expected.as_bytes()).unwrap();
+        std::fs::set_permissions(
+            state.join(ACCOUNT_FILE),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+
+        let exported =
+            export_account_with_store(&state, ApiKeyScope::Publish, &FixedStore([0x44; 32]))
+                .unwrap();
+
+        assert_eq!(exported, expected);
+        let migrated = std::fs::read(state.join(ACCOUNT_FILE)).unwrap();
+        assert!(crate::local_encryption::is_envelope(&migrated));
+        assert_ne!(migrated, expected.as_bytes());
+    }
+
+    #[test]
+    fn missing_and_wrong_account_keys_leave_ciphertext_byte_exact() {
+        let root = crate::test_support::canonical_tempdir();
+        let state = root.path().join("state");
+        prepare_private_dir(&state).unwrap();
+        let plaintext = Zeroizing::new(AccountBundle::Owner(fixture_owner()).encode());
+        let envelope = seal(
+            &[0x44; 32],
+            Purpose::SyncAccount,
+            plaintext.as_bytes(),
+            MAX_ACCOUNT_STATE_BYTES,
+        )
+        .unwrap();
+        std::fs::write(state.join(ACCOUNT_FILE), &envelope).unwrap();
+        std::fs::set_permissions(
+            state.join(ACCOUNT_FILE),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+
+        for store in [
+            &MissingStore as &dyn MasterKeyStore,
+            &FixedStore([0x45; 32]),
+        ] {
+            assert!(export_account_with_store(&state, ApiKeyScope::Publish, store).is_err());
+            assert_eq!(
+                std::fs::read(state.join(ACCOUNT_FILE)).unwrap(),
+                envelope.as_slice()
+            );
+        }
+    }
+
+    #[test]
+    fn store_failure_after_initial_none_leaves_legacy_account_byte_exact() {
+        let root = crate::test_support::canonical_tempdir();
+        let state = root.path().join("state");
+        prepare_private_dir(&state).unwrap();
+        let plaintext = AccountBundle::Owner(fixture_owner()).encode();
+        std::fs::write(state.join(ACCOUNT_FILE), plaintext.as_bytes()).unwrap();
+        std::fs::set_permissions(
+            state.join(ACCOUNT_FILE),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+
+        assert!(
+            export_account_with_store(&state, ApiKeyScope::Publish, &StoreFailsAfterNone).is_err()
+        );
+        assert_eq!(
+            std::fs::read(state.join(ACCOUNT_FILE)).unwrap(),
+            plaintext.as_bytes()
+        );
     }
 }

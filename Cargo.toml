@@ -34,6 +34,7 @@ clap = { version = "4.5", features = ["derive"] }
 fs4 = "=1.1.0"
 futures-util = "=0.3.33"
 getrandom = "=0.4.3"
+keyring = { version = "=4.1.6", default-features = false, features = ["v1"] }
 attached-session-sync-protocol = { path = "crates/session-sync-protocol", default-features = false }
 attached-tunnel-protocol = { path = "crates/tunnel-protocol" }
 hkdf = "=0.13.0"
