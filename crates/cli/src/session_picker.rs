@@ -13,7 +13,6 @@ use crate::{session::Session, sync::state_catalog::SyncedSession};
 
 const LOCAL_HOST_LABEL: &str = "(local)";
 const MAX_FUTURE_CLOCK_SKEW_SECONDS: i64 = 30;
-const FRESH_PUBLICATION_SECONDS: i64 = 180;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionSelection {
@@ -165,20 +164,20 @@ fn render_input_at(candidates: &[PickerCandidate], now: DateTime<Utc>) -> Result
         .max("SESSION".len());
     let publish_width = candidates
         .iter()
-        .map(|candidate| publish_summary(candidate, now).1.chars().count())
+        .map(|candidate| publish_summary(candidate, now).chars().count())
         .max()
         .unwrap_or_default()
         .max("LAST PUBLISH".len());
     let header = format!(
-        "STATUS  {:<host_width$}  {:<session_width$}  {:<publish_width$}",
+        "{:<host_width$}  {:<session_width$}  {:<publish_width$}",
         "HOST", "SESSION", "LAST PUBLISH"
     );
     let mut input = String::new();
     for (index, candidate) in candidates.iter().enumerate() {
-        let (status, published) = publish_summary(candidate, now);
+        let published = publish_summary(candidate, now);
         writeln!(
             input,
-            "{index}\t{status}       {:<host_width$}  {:<session_width$}  {:<publish_width$}",
+            "{index}\t{:<host_width$}  {:<session_width$}  {:<publish_width$}",
             candidate.host, candidate.session, published
         )
         .expect("writing session candidates to a String cannot fail");
@@ -186,24 +185,18 @@ fn render_input_at(candidates: &[PickerCandidate], now: DateTime<Utc>) -> Result
     Ok((input, header))
 }
 
-fn publish_summary(candidate: &PickerCandidate, now: DateTime<Utc>) -> (&'static str, String) {
+fn publish_summary(candidate: &PickerCandidate, now: DateTime<Utc>) -> String {
     if matches!(candidate.selection, SessionSelection::Local(_)) {
-        return ("🟢", "local".to_owned());
+        return "local".to_owned();
     }
     let Some(published_at) = candidate.published_at else {
-        return ("⚪", "unknown".to_owned());
+        return "unknown".to_owned();
     };
     if published_at - now > chrono::Duration::seconds(MAX_FUTURE_CLOCK_SKEW_SECONDS) {
-        return ("⚪", "clock skew".to_owned());
+        return "clock skew".to_owned();
     }
-    let age = now - published_at;
-    let age_seconds = age.num_seconds().max(0);
-    let status = if age <= chrono::Duration::seconds(FRESH_PUBLICATION_SECONDS) {
-        "🟢"
-    } else {
-        "🟡"
-    };
-    let age = if age_seconds < 60 {
+    let age_seconds = (now - published_at).num_seconds().max(0);
+    if age_seconds < 60 {
         format!("{age_seconds}s ago")
     } else if age_seconds < 3_600 {
         format!("{}m ago", age_seconds / 60)
@@ -211,8 +204,7 @@ fn publish_summary(candidate: &PickerCandidate, now: DateTime<Utc>) -> (&'static
         format!("{}h ago", age_seconds / 3_600)
     } else {
         format!("{}d ago", age_seconds / 86_400)
-    };
-    (status, age)
+    }
 }
 
 fn parse_selection(selected: &str, candidates: &[PickerCandidate]) -> Result<SessionSelection> {
@@ -237,7 +229,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn picker_groups_hosts_and_displays_publish_freshness() {
+    fn picker_groups_hosts_and_displays_publish_age() {
         let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         let synchronized = [
             SyncedSession {
@@ -264,17 +256,22 @@ mod tests {
         let (input, header) = render_input_at(&candidates, now).unwrap();
         let rows = input.lines().collect::<Vec<_>>();
 
-        assert!(header.contains("STATUS"));
+        assert!(!header.contains("STATUS"));
         assert!(header.contains("LAST PUBLISH"));
+        assert!(
+            ["🟢", "🟡", "⚪"]
+                .iter()
+                .all(|status| !input.contains(status))
+        );
         assert!(rows[0].contains("office") && rows[0].contains("deep-work"));
         assert!(rows[1].contains("office") && rows[1].contains("review"));
         assert!(rows[2].contains("studio") && rows[2].contains("render"));
-        assert!(rows[0].contains("🟢") && rows[0].contains("30s ago"));
-        assert!(rows[2].contains("🟡") && rows[2].contains("4m ago"));
+        assert!(rows[0].contains("30s ago"));
+        assert!(rows[2].contains("4m ago"));
     }
 
     #[test]
-    fn publication_just_beyond_future_skew_allowance_is_unknown() {
+    fn publication_just_beyond_future_skew_allowance_reports_clock_skew() {
         let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         let candidate = PickerCandidate {
             host: "office".to_owned(),
@@ -286,26 +283,11 @@ mod tests {
             selection: SessionSelection::Synchronized("office/future-edge".to_owned()),
         };
 
-        assert_eq!(publish_summary(&candidate, now).0, "⚪");
+        assert_eq!(publish_summary(&candidate, now), "clock skew");
     }
 
     #[test]
-    fn publication_just_beyond_freshness_window_is_old() {
-        let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-        let candidate = PickerCandidate {
-            host: "office".to_owned(),
-            session: "age-edge".to_owned(),
-            published_at: Some(
-                now - chrono::Duration::seconds(180) - chrono::Duration::nanoseconds(1),
-            ),
-            selection: SessionSelection::Synchronized("office/age-edge".to_owned()),
-        };
-
-        assert_eq!(publish_summary(&candidate, now).0, "🟡");
-    }
-
-    #[test]
-    fn picker_handles_unknown_future_and_freshness_boundary_times() {
+    fn picker_handles_unknown_future_and_publish_times() {
         let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         let synchronized = [
             SyncedSession {
@@ -338,10 +320,10 @@ mod tests {
         let (input, _) = render_input_at(&candidates, now).unwrap();
         let rows = input.lines().collect::<Vec<_>>();
 
-        assert!(rows[0].contains("⚪") && rows[0].contains("unknown"));
-        assert!(rows[1].contains("⚪") && rows[1].contains("clock skew"));
-        assert!(rows[2].contains("🟢") && rows[2].contains("3m ago"));
-        assert!(rows[3].contains("🟡") && rows[3].contains("3m ago"));
+        assert!(rows[0].contains("unknown"));
+        assert!(rows[1].contains("clock skew"));
+        assert!(rows[2].contains("3m ago"));
+        assert!(rows[3].contains("3m ago"));
     }
 
     #[test]
