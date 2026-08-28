@@ -262,7 +262,10 @@ mod tests {
     use attached_session_sync_protocol::{
         account::RecordId,
         api::{Envelope, LiveRecordIndex, LiveRecordIndexEntry},
-        canonical::{HerdrVersion as SessionAccessVersion, SessionAccessDescriptor},
+        canonical::{
+            AttachedVersion as SessionAccessAttachedVersion, HerdrVersion as SessionAccessVersion,
+            SessionAccessDescriptor,
+        },
         crypto::seal_session_access_descriptor,
     };
     use attached_tunnel_protocol::CapabilitySecret;
@@ -433,6 +436,7 @@ mod tests {
                     expires_at,
                     endpoint_ticket,
                     CapabilitySecret::from_bytes([byte; 32]),
+                    SessionAccessAttachedVersion::new(0, 2, 0),
                     version,
                     vec![session.to_owned()],
                 )
@@ -504,6 +508,12 @@ mod tests {
                 refreshed
                     .sessions
                     .iter()
+                    .all(|session| session.attached_version == Some([0, 2, 0]))
+            );
+            assert!(
+                refreshed
+                    .sessions
+                    .iter()
                     .any(|session| session.target == "aging-host/soonexpired")
             );
 
@@ -555,12 +565,10 @@ mod tests {
                 ("minor-host", "minor", [3, 1, 9]),
                 ("major-host", "major", [2, 9, 9]),
             ] {
-                assert!(
-                    refreshed
-                        .sessions
-                        .iter()
-                        .any(|candidate| candidate.target == format!("{host}/{session}"))
-                );
+                assert!(refreshed.sessions.iter().any(|candidate| {
+                    candidate.target == format!("{host}/{session}")
+                        && candidate.herdr_version == expected
+                }));
                 let persisted = state_catalog::attachment(&state_dir, &account, host, session, now)
                     .unwrap()
                     .expect("persisted attachment remains selectable");

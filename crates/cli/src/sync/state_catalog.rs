@@ -26,6 +26,8 @@ pub struct SyncedSession {
     pub target: String,
     pub host: String,
     pub session: String,
+    pub attached_version: Option<[u16; 3]>,
+    pub herdr_version: [u16; 3],
     pub published_at: Option<DateTime<Utc>>,
 }
 
@@ -78,6 +80,8 @@ pub(super) struct CatalogRecord {
     endpoint_ticket: String,
     endpoint_identity: [u8; 32],
     attach_capability: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attached_version: Option<[u16; 3]>,
     herdr_version: [u16; 3],
     sessions: Vec<String>,
 }
@@ -120,6 +124,9 @@ impl CatalogRecord {
             endpoint_ticket: descriptor.endpoint_ticket().to_owned(),
             endpoint_identity: descriptor.endpoint_identity(),
             attach_capability: descriptor.attach_capability_bytes(),
+            attached_version: descriptor
+                .attached_version()
+                .map(|version| [version.major, version.minor, version.patch]),
             herdr_version: [
                 descriptor.herdr_version().major,
                 descriptor.herdr_version().minor,
@@ -355,6 +362,8 @@ fn sessions_with_filter(
                 target: format!("{target_host}/{session}"),
                 host: record.host_label.clone(),
                 session: session.clone(),
+                attached_version: record.attached_version,
+                herdr_version: record.herdr_version,
                 published_at: record.published_at,
             })
         })
@@ -515,6 +524,7 @@ mod tests {
             endpoint_ticket,
             endpoint_identity: *secret.public().as_bytes(),
             attach_capability: [7; 32],
+            attached_version: Some([0, 2, 0]),
             herdr_version: [1, 2, 3],
             sessions: vec![session.to_owned()],
         }
@@ -1032,6 +1042,48 @@ mod tests {
 
         let legacy = load(&state_dir, &account).unwrap();
         assert_eq!(legacy.records[0].published_at, None);
+    }
+
+    #[test]
+    fn synchronized_session_listing_retains_remote_versions_and_reads_legacy_catalogs() {
+        let root = crate::test_support::canonical_tempdir();
+        let state_dir = root.path().join("state");
+        let registry_dir = root.path().join("registry-user/live-endpoints");
+        super::super::state::test_support::create_account(&state_dir, "https://sync.example")
+            .unwrap();
+        let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
+        let mut catalog = Catalog::empty(&account);
+        catalog.records.push(record(0x26, "versioned", "work"));
+        save(&state_dir, &account, &catalog).unwrap();
+
+        let listed = sessions_excluding_local_endpoints(
+            &state_dir,
+            &account,
+            timestamp(1_700_000_000),
+            &registry_dir,
+        )
+        .unwrap();
+        assert_eq!(listed.sessions[0].attached_version, Some([0, 2, 0]));
+        assert_eq!(listed.sessions[0].herdr_version, [1, 2, 3]);
+
+        let catalog_path = state_dir.join(CATALOG_FILE);
+        let encoded = std::fs::read(&catalog_path).unwrap();
+        let mut encoded: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        encoded["records"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("attached_version");
+        std::fs::write(&catalog_path, serde_json::to_vec(&encoded).unwrap()).unwrap();
+
+        let legacy = sessions_excluding_local_endpoints(
+            &state_dir,
+            &account,
+            timestamp(1_700_000_000),
+            &registry_dir,
+        )
+        .unwrap();
+        assert_eq!(legacy.sessions[0].attached_version, None);
+        assert_eq!(legacy.sessions[0].herdr_version, [1, 2, 3]);
     }
 
     #[test]

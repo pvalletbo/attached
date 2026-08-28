@@ -1,5 +1,5 @@
 use std::{
-    io::{BufRead, Read, stdin},
+    io::{BufRead, Read, Write as _, stdin, stdout},
     path::PathBuf,
 };
 
@@ -51,6 +51,12 @@ enum Command {
         state_dir: Option<PathBuf>,
     },
 
+    /// Inspect synchronized remote Herdr sessions.
+    Sessions {
+        #[command(subcommand)]
+        command: SessionsCommand,
+    },
+
     /// Select and attach to a local or synchronized Herdr session.
     Attach {
         /// Synchronized `HOST/SESSION`; omit to choose local or synchronized with fzf.
@@ -88,6 +94,20 @@ enum Command {
 }
 
 const DEFAULT_SERVICE_ORIGIN: &str = "https://herdr.attached.sh";
+
+#[derive(Subcommand)]
+enum SessionsCommand {
+    /// Refresh and list synchronized remote sessions.
+    List {
+        /// Path to the local Herdr executable used for compatibility checks.
+        #[arg(long, default_value = "herdr")]
+        herdr_bin: PathBuf,
+
+        /// Override persistent state location (primarily for testing).
+        #[arg(long, hide = true)]
+        state_dir: Option<PathBuf>,
+    },
+}
 
 #[derive(Subcommand)]
 enum AccountCommand {
@@ -201,6 +221,31 @@ impl Cli {
                 server::serve(state_dir, herdr_bin, host_label).await?;
                 Ok(0)
             }
+            Command::Sessions { command } => match command {
+                SessionsCommand::List {
+                    herdr_bin,
+                    state_dir,
+                } => {
+                    let state_dir = resolved_state_dir(state_dir)?;
+                    sync::state::load_account(&state_dir, ApiKeyScope::Download)
+                        .context("`sessions list` requires a download account bundle")?;
+                    let local_version = herdr_version::query(&herdr_bin).context(
+                        "could not determine the local Herdr version; catalog refresh was not started",
+                    )?;
+                    let refreshed = sync::refresh::refresh_sessions(&state_dir, local_version)
+                        .await
+                        .context("could not refresh synchronized sessions")?;
+                    for warning in refresh_warnings_to_display(&refreshed.warnings, self.verbose) {
+                        eprintln!("Warning: {warning}");
+                    }
+                    let rendered = session_picker::render_synchronized_list(&refreshed.sessions)?;
+                    stdout()
+                        .lock()
+                        .write_all(rendered.as_bytes())
+                        .context("could not write synchronized session list")?;
+                    Ok(0)
+                }
+            },
             Command::Attach {
                 target,
                 herdr_bin,
@@ -375,6 +420,7 @@ mod tests {
                 "/tmp/publish.bundle",
             ],
             vec!["attached", "serve", "--host-label", "office"],
+            vec!["attached", "sessions", "list"],
             vec!["attached", "attach"],
             vec!["attached", "attach", "office/work"],
             vec!["attached", "update"],
@@ -485,7 +531,14 @@ mod tests {
     #[test]
     fn help_lists_the_simplified_and_lifecycle_commands() {
         let help = Cli::command().render_long_help().to_string();
-        for command in ["account", "serve", "attach", "update", "uninstall"] {
+        for command in [
+            "account",
+            "serve",
+            "sessions",
+            "attach",
+            "update",
+            "uninstall",
+        ] {
             assert!(help.contains(command), "{help}");
         }
         for removed in ["connect", "remote", "session", "admin", "sync"] {

@@ -1,6 +1,6 @@
 use attached_session_sync_protocol::{
-    Envelope, HerdrVersion, SessionAccessDescriptor, SessionAccessError, VerificationContext,
-    decode_session_access_descriptor, encode_session_access_descriptor,
+    AttachedVersion, Envelope, HerdrVersion, SessionAccessDescriptor, SessionAccessError,
+    VerificationContext, decode_session_access_descriptor, encode_session_access_descriptor,
     seal_session_access_descriptor,
 };
 use attached_session_sync_protocol::{
@@ -49,6 +49,7 @@ fn fixture_with(
         timestamp(expires_at),
         endpoint_ticket,
         CapabilitySecret::from_bytes([6; 32]),
+        AttachedVersion::new(0, 2, 0),
         version,
         sessions,
     )
@@ -154,6 +155,7 @@ fn constructor_enforces_host_clock_endpoint_and_session_boundaries() {
                 timestamp(70),
                 ENDPOINT.into(),
                 CapabilitySecret::from_bytes([6; 32]),
+                AttachedVersion::new(0, 2, 0),
                 HerdrVersion::new(1, 2, 3),
                 vec![],
             )
@@ -169,6 +171,7 @@ fn constructor_enforces_host_clock_endpoint_and_session_boundaries() {
                 timestamp(10 + lifetime),
                 ENDPOINT.into(),
                 CapabilitySecret::from_bytes([6; 32]),
+                AttachedVersion::new(0, 2, 0),
                 HerdrVersion::new(1, 2, 3),
                 vec![],
             )
@@ -192,6 +195,7 @@ fn constructor_enforces_host_clock_endpoint_and_session_boundaries() {
                 expires,
                 ENDPOINT.into(),
                 CapabilitySecret::from_bytes([6; 32]),
+                AttachedVersion::new(0, 2, 0),
                 HerdrVersion::new(1, 2, 3),
                 vec![],
             )
@@ -212,6 +216,7 @@ fn constructor_enforces_host_clock_endpoint_and_session_boundaries() {
                 timestamp(70),
                 endpoint,
                 CapabilitySecret::from_bytes([6; 32]),
+                AttachedVersion::new(0, 2, 0),
                 HerdrVersion::new(1, 2, 3),
                 vec![],
             )
@@ -229,6 +234,7 @@ fn constructor_enforces_host_clock_endpoint_and_session_boundaries() {
             timestamp(70),
             ENDPOINT.into(),
             CapabilitySecret::from_bytes([6; 32]),
+            AttachedVersion::new(0, 2, 0),
             HerdrVersion::new(1, 2, 3),
             maximum.clone(),
         )
@@ -251,6 +257,7 @@ fn constructor_enforces_host_clock_endpoint_and_session_boundaries() {
                 timestamp(70),
                 ENDPOINT.into(),
                 CapabilitySecret::from_bytes([6; 32]),
+                AttachedVersion::new(0, 2, 0),
                 HerdrVersion::new(1, 2, 3),
                 sessions,
             )
@@ -287,6 +294,17 @@ fn decoded_fields_revalidate_types_widths_utf8_and_numeric_ranges() {
         Some(SessionAccessError::InvalidField)
     );
 
+    let attached_version = position(&canonical, &[0x08, 0x83, 0x00, 0x02, 0x00]);
+    let mut oversized_attached_version = canonical.clone();
+    oversized_attached_version.splice(
+        attached_version + 2..attached_version + 3,
+        [0x1a, 0x00, 0x01, 0x00, 0x00],
+    );
+    assert_eq!(
+        decode_session_access_descriptor(&oversized_attached_version).err(),
+        Some(SessionAccessError::InvalidField)
+    );
+
     let session = position(&canonical, b"alpha");
     let mut invalid_session = canonical;
     invalid_session[session] = b'/';
@@ -313,6 +331,7 @@ fn aggregate_session_access_descriptor_limit_is_enforced_after_semantic_validati
         timestamp(70),
         ENDPOINT.into(),
         CapabilitySecret::from_bytes([6; 32]),
+        AttachedVersion::new(0, 2, 0),
         HerdrVersion::new(1, 2, 3),
         sessions,
     )

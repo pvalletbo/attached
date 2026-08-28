@@ -10,8 +10,8 @@ pub mod limits;
 
 #[cfg(feature = "session-access")]
 pub use canonical::{
-    HerdrVersion, SessionAccessDescriptor, SessionAccessError, decode_session_access_descriptor,
-    encode_session_access_descriptor,
+    AttachedVersion, HerdrVersion, SessionAccessDescriptor, SessionAccessError,
+    decode_session_access_descriptor, encode_session_access_descriptor,
 };
 #[cfg(feature = "session-access")]
 pub use crypto::{
