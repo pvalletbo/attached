@@ -12,11 +12,13 @@ use rustix::{
     fs::{AtFlags, Mode, OFlags},
     process::geteuid,
 };
+use zeroize::Zeroizing;
 
 /// Runs a state mutation while holding an owner-only inter-process lock.
 ///
-/// Durable file creation and replacement remain in `StateDir`; callers receive
-/// ordinary contextual errors rather than a separate recovery taxonomy.
+/// Durable file creation and replacement remain in `StateDir`. Once an
+/// operation succeeds, an unlock failure is diagnostic only: reporting an
+/// ordinary failure could cause callers to retry an already committed mutation.
 pub(crate) fn with_exclusive_lock<T>(
     state_dir: &Path,
     lock_name: &str,
@@ -63,7 +65,10 @@ fn finish_locked_operation<T>(lock: File, result: Result<T>) -> Result<T> {
     let unlock = FileExt::unlock(&lock).context("failed to unlock state lock");
     match (result, unlock) {
         (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
+        (Ok(value), Err(error)) => {
+            tracing::warn!(error = %error, "state mutation committed but explicit unlock failed");
+            Ok(value)
+        }
         (Ok(value), Ok(())) => Ok(value),
     }
 }
@@ -265,6 +270,7 @@ impl StateDir {
         verify_path_identity(&self.directory, name, file)
     }
 
+    #[cfg(test)]
     pub(crate) fn read_optional_bounded(
         &self,
         name: &str,
@@ -287,14 +293,46 @@ impl StateDir {
         Ok(Some(bytes))
     }
 
+    #[cfg(test)]
     pub(crate) fn read_bounded(&self, name: &str, limit: usize) -> Result<Vec<u8>> {
         self.read_optional_bounded(name, limit)?
             .with_context(|| format!("state file {name} is missing"))
     }
 
+    pub(crate) fn read_secret_optional_bounded(
+        &self,
+        name: &str,
+        limit: usize,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        validate_name(name, "state file")?;
+        let file = match openat_file(
+            &self.directory,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to open state file {name}"));
+            }
+        };
+        read_secret_bounded_file(file, name, limit).map(Some)
+    }
+
+    pub(crate) fn read_secret_bounded(
+        &self,
+        name: &str,
+        limit: usize,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        self.read_secret_optional_bounded(name, limit)?
+            .with_context(|| format!("state file {name} is missing"))
+    }
+
     /// Replaces one validated state file through a synced temporary file and
-    /// atomic rename. A post-rename directory-sync error is returned directly;
-    /// callers do not receive a separate recovery contract.
+    /// atomic rename. After rename, failures are diagnostic only because the
+    /// new bytes are already visible and an ordinary error would invite an
+    /// unsafe retry of an already committed mutation.
     pub(crate) fn atomic_replace(&self, name: &str, bytes: &[u8]) -> Result<()> {
         validate_name(name, "state file")?;
         validate_existing(&self.directory, name)?;
@@ -318,9 +356,10 @@ impl StateDir {
             let _ = unlinkat(&self.directory, &temporary_name);
             return Err(error).context("could not durably replace state file");
         }
-        self.directory
-            .sync_all()
-            .context("could not sync state directory after replacing state file")
+        if let Err(error) = self.directory.sync_all() {
+            tracing::warn!(%error, name, "state file was replaced but directory sync failed");
+        }
+        Ok(())
     }
 
     /// Creates one owner-only file without replacing a concurrently installed
@@ -357,9 +396,9 @@ impl StateDir {
             let _ = unlinkat(&self.directory, name);
             return Err(error).context("could not durably create state file");
         }
-        self.directory
-            .sync_all()
-            .context("could not sync state directory after creating state file")?;
+        if let Err(error) = self.directory.sync_all() {
+            tracing::warn!(%error, name, "state file was created but directory sync failed");
+        }
         Ok(true)
     }
 }
@@ -459,6 +498,7 @@ fn openat_directory(parent: &File, name: &[u8]) -> std::io::Result<File> {
     .map_err(std::io::Error::from)
 }
 
+#[cfg(test)]
 fn read_bounded_file(file: File, name: &str, limit: usize) -> Result<Vec<u8>> {
     validate_file(&file, name, 0o600)?;
     ensure!(
@@ -468,8 +508,31 @@ fn read_bounded_file(file: File, name: &str, limit: usize) -> Result<Vec<u8>> {
     read_bounded_contents(file, name, limit)
 }
 
+#[cfg(test)]
 fn read_bounded_contents(mut file: File, name: &str, limit: usize) -> Result<Vec<u8>> {
     let mut bytes = Vec::with_capacity(limit.min(8192));
+    Read::by_ref(&mut file)
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read state file {name}"))?;
+    ensure!(
+        bytes.len() <= limit,
+        "state file {name} exceeds {limit} bytes"
+    );
+    Ok(bytes)
+}
+
+fn read_secret_bounded_file(
+    mut file: File,
+    name: &str,
+    limit: usize,
+) -> Result<Zeroizing<Vec<u8>>> {
+    validate_file(&file, name, 0o600)?;
+    ensure!(
+        file.metadata()?.len() <= limit as u64,
+        "state file {name} exceeds {limit} bytes"
+    );
+    let mut bytes = Zeroizing::new(Vec::with_capacity(limit.min(8192)));
     Read::by_ref(&mut file)
         .take(limit as u64 + 1)
         .read_to_end(&mut bytes)
@@ -598,6 +661,9 @@ fn verify_path_identity(directory: &File, name: &str, file: &File) -> Result<()>
 mod tests {
     use std::{fs, os::unix::fs::PermissionsExt, sync::mpsc, thread, time::Duration};
 
+    #[cfg(not(target_os = "linux"))]
+    use std::os::fd::OwnedFd;
+
     use super::*;
 
     thread_local! {
@@ -638,6 +704,30 @@ mod tests {
         operation();
         DIRECTORY_SYNC_TRACE
             .with(|trace| trace.borrow_mut().take().expect("sync capture was armed"))
+    }
+
+    #[test]
+    fn successful_mutation_is_not_reported_as_failed_when_unlock_fails() {
+        #[cfg(target_os = "linux")]
+        let invalid = {
+            let root = crate::test_support::canonical_tempdir();
+            let path = root.path().join("lock");
+            fs::write(&path, b"").unwrap();
+            rustix::fs::open(&path, OFlags::PATH | OFlags::CLOEXEC, Mode::empty())
+                .map(File::from)
+                .unwrap()
+        };
+        #[cfg(not(target_os = "linux"))]
+        let invalid = {
+            let (reader, _writer) = std::io::pipe().unwrap();
+            File::from(OwnedFd::from(reader))
+        };
+        assert!(
+            FileExt::unlock(&invalid).is_err(),
+            "fixture must reject file unlocking"
+        );
+
+        assert_eq!(finish_locked_operation(invalid, Ok(7)).unwrap(), 7);
     }
 
     #[test]
@@ -743,6 +833,24 @@ mod tests {
 
         let result = read_bounded_contents(file, "data", 4);
         assert!(result.unwrap_err().to_string().contains("exceeds 4 bytes"));
+    }
+
+    #[test]
+    fn secret_bounded_reads_return_zeroizing_storage_from_the_boundary() {
+        fn assert_zeroizing(_: &zeroize::Zeroizing<Vec<u8>>) {}
+        let root = crate::test_support::canonical_tempdir();
+        let state = root.path().join("state");
+        prepare_private_dir(&state).unwrap();
+        fs::write(state.join("secret"), b"synthetic-secret").unwrap();
+        fs::set_permissions(state.join("secret"), fs::Permissions::from_mode(0o600)).unwrap();
+
+        let bytes = StateDir::open(&state)
+            .unwrap()
+            .read_secret_bounded("secret", 64)
+            .unwrap();
+
+        assert_zeroizing(&bytes);
+        assert_eq!(bytes.as_slice(), b"synthetic-secret");
     }
 
     #[test]
