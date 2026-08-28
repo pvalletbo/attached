@@ -21,6 +21,7 @@ use iroh_tickets::endpoint::EndpointTicket;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use wasm_bindgen::prelude::*;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Maximum opaque Herdr payload returned to JavaScript by one receive call.
 const MAX_RECEIVE_CHUNK: usize = 64 * 1024;
@@ -99,6 +100,7 @@ impl Tunnel {
 
 async fn connect_tunnel_controlled(
     endpoint_addr: EndpointAddr,
+    consumer_identity_secret: Zeroizing<[u8; 32]>,
     session: String,
     capability: CapabilitySecret,
     cancellation: CancellationToken,
@@ -106,7 +108,7 @@ async fn connect_tunnel_controlled(
     connect_with_controls(
         CONNECTION_TIMEOUT,
         cancellation,
-        connect_tunnel_inner(endpoint_addr, session, capability),
+        connect_tunnel_inner(endpoint_addr, consumer_identity_secret, session, capability),
     )
     .await
 }
@@ -129,13 +131,11 @@ where
 
 async fn connect_tunnel_inner(
     endpoint_addr: EndpointAddr,
+    consumer_identity_secret: Zeroizing<[u8; 32]>,
     session: String,
     capability: CapabilitySecret,
 ) -> Result<Tunnel, String> {
-    let endpoint = Endpoint::builder(presets::N0)
-        .bind()
-        .await
-        .map_err(|error| error.to_string())?;
+    let endpoint = bind_client_endpoint(&consumer_identity_secret).await?;
     let connection = endpoint
         .connect(endpoint_addr, TUNNEL_ALPN)
         .await
@@ -171,21 +171,43 @@ async fn connect_tunnel_inner(
     })
 }
 
+async fn bind_client_endpoint(consumer_identity_secret: &[u8; 32]) -> Result<Endpoint, String> {
+    Endpoint::builder(presets::N0)
+        .secret_key(iroh::SecretKey::from_bytes(consumer_identity_secret))
+        .bind()
+        .await
+        .map_err(|_| "unable to bind the provisioned consumer identity".to_owned())
+}
+
+type ParsedTarget = (EndpointAddr, Zeroizing<[u8; 32]>, String, CapabilitySecret);
+
 fn parse_target(
     endpoint_ticket: &str,
     session: String,
-    capability: Vec<u8>,
-) -> Result<(EndpointAddr, String, CapabilitySecret), String> {
-    let capability: [u8; 32] = capability
-        .as_slice()
-        .try_into()
-        .map_err(|_| "invalid tunnel capability".to_owned())?;
+    capability_source: &mut Zeroizing<Vec<u8>>,
+    mut consumer_identity_secret: Zeroizing<Vec<u8>>,
+) -> Result<ParsedTarget, String> {
+    let capability: Result<[u8; 32], _> = capability_source.as_slice().try_into();
+    capability_source.zeroize();
+    let capability = CapabilitySecret::from_bytes(
+        capability.map_err(|_| "invalid tunnel capability".to_owned())?,
+    );
     let endpoint = EndpointTicket::from_str(endpoint_ticket).map_err(|error| error.to_string())?;
+    let consumer_identity_secret = parse_consumer_identity(&mut consumer_identity_secret)?;
     Ok((
         endpoint.endpoint_addr().clone(),
+        consumer_identity_secret,
         session,
-        CapabilitySecret::from_bytes(capability),
+        capability,
     ))
+}
+
+fn parse_consumer_identity(input: &mut Vec<u8>) -> Result<Zeroizing<[u8; 32]>, String> {
+    let parsed: Result<[u8; 32], _> = input.as_slice().try_into();
+    input.zeroize();
+    parsed
+        .map(Zeroizing::new)
+        .map_err(|_| "invalid consumer identity".to_owned())
 }
 
 /// JavaScript-facing owner of an authenticated browser Iroh tunnel.
@@ -221,12 +243,20 @@ impl BrowserConnector {
         endpoint_ticket: String,
         session: String,
         capability: Vec<u8>,
+        consumer_identity_secret: Vec<u8>,
     ) -> Result<BrowserTunnel, JsValue> {
-        let (endpoint_addr, session, capability) =
-            parse_target(&endpoint_ticket, session, capability)
-                .map_err(|_| JsValue::from_str(&sanitize_error("connect")))?;
+        let mut capability = Zeroizing::new(capability);
+        let consumer_identity_secret = Zeroizing::new(consumer_identity_secret);
+        let (endpoint_addr, consumer_identity_secret, session, capability) = parse_target(
+            &endpoint_ticket,
+            session,
+            &mut capability,
+            consumer_identity_secret,
+        )
+        .map_err(|_| JsValue::from_str(&sanitize_error("connect")))?;
         let tunnel = connect_tunnel_controlled(
             endpoint_addr,
+            consumer_identity_secret,
             session,
             capability,
             self.cancellation.clone(),

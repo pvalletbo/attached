@@ -1,7 +1,9 @@
 use std::path::Path;
 
 use anyhow::{Context as _, Result, ensure};
-use attached_session_sync_protocol::account::{AccountBundle, ApiKeyScope, ServiceOrigin};
+use attached_session_sync_protocol::account::{
+    AccountBundle, ApiKeyScope, ConsumerIdentitySecret, ServiceOrigin,
+};
 
 use super::{http::SyncHttpClient, state};
 
@@ -9,10 +11,17 @@ pub async fn create(state_dir: &Path, service_origin: &str) -> Result<String> {
     let service_origin = ServiceOrigin::parse(service_origin)
         .map_err(|_| anyhow::anyhow!("invalid sync service origin"))?;
     state::ensure_account_slot_available(state_dir)?;
+    let consumer_identity = iroh::SecretKey::generate();
     let response = SyncHttpClient::new()?
         .create_account(&service_origin)
         .await?;
-    state::install_created_account(state_dir, service_origin, response).context(
+    state::install_created_account(
+        state_dir,
+        service_origin,
+        response,
+        ConsumerIdentitySecret::from_bytes(consumer_identity.to_bytes()),
+    )
+    .context(
         "the service created the account, but its credentials could not be saved locally; create another account",
     )
 }

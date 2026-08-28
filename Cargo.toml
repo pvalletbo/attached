@@ -12,7 +12,7 @@ default-members = ["crates/cli"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.3"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT"
@@ -30,6 +30,7 @@ base64 = "=0.22.1"
 bincode = { version = "2", features = ["serde"] }
 chacha20poly1305 = { version = "=0.11.0", default-features = false, features = ["alloc", "getrandom", "zeroize"] }
 chrono = { version = "=0.4.45", default-features = false, features = ["serde", "std"] }
+ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["zeroize"] }
 clap = { version = "4.5", features = ["derive"] }
 fs4 = "=1.1.0"
 futures-util = "=0.3.33"

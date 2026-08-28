@@ -230,7 +230,7 @@ impl Cli {
                     let refreshed = sync::refresh::refresh_sessions(&state_dir, local_version)
                         .await
                         .context("could not refresh synchronized sessions")?;
-                    for warning in refreshed.warnings {
+                    for warning in refresh_warnings_to_display(&refreshed.warnings, self.verbose) {
                         eprintln!("Warning: {warning}");
                     }
                     refreshed.sessions
@@ -283,6 +283,15 @@ impl Cli {
     }
 }
 
+fn refresh_warnings_to_display(
+    warnings: &[sync::refresh::RefreshWarning],
+    verbosity: u8,
+) -> impl Iterator<Item = &sync::refresh::RefreshWarning> {
+    warnings
+        .iter()
+        .filter(move |warning| verbosity > 0 || !warning.is_verbose_only())
+}
+
 fn resolved_state_dir(state_dir: Option<PathBuf>) -> Result<PathBuf> {
     let path = state_dir.map_or_else(identity::default_state_dir, Ok)?;
     secure_state::prepare_private_dir(&path)?;
@@ -303,6 +312,7 @@ fn write_account_bundle(bundle: &str, output_path: &std::path::Path) -> Result<(
 
 #[cfg(test)]
 mod tests {
+    use attached_session_sync_protocol::account::RecordId;
     use clap::{CommandFactory, Parser};
 
     use super::*;
@@ -467,6 +477,41 @@ mod tests {
         assert_eq!(
             bundle_file,
             Some(PathBuf::from("/run/secrets/attached-publish"))
+        );
+    }
+
+    #[test]
+    fn discarded_refresh_warnings_require_verbose_output() {
+        let discarded_record = RecordId::from_bytes([0x42; 16]);
+        let warnings = vec![
+            sync::refresh::RefreshWarning::CatalogRebuilt(anyhow::anyhow!("invalid catalog")),
+            sync::refresh::RefreshWarning::RecordDiscarded {
+                record_id: discarded_record,
+                error: anyhow::anyhow!("session access descriptor expired"),
+            },
+            sync::refresh::RefreshWarning::EndpointRegistryUnavailable,
+        ];
+
+        let standard = refresh_warnings_to_display(&warnings, 0)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(standard.len(), 2, "{standard:?}");
+        assert!(
+            standard
+                .iter()
+                .all(|warning| !warning.contains(&discarded_record.to_string())),
+            "{standard:?}"
+        );
+
+        let verbose = refresh_warnings_to_display(&warnings, 1)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(verbose.len(), 3, "{verbose:?}");
+        assert!(
+            verbose.iter().any(|warning| {
+                warning.contains(&discarded_record.to_string()) && warning.contains("expired")
+            }),
+            "{verbose:?}"
         );
     }
 

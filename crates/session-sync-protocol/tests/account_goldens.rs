@@ -1,12 +1,190 @@
 use attached_session_sync_protocol::account::{
-    AccountBundle, AccountId, AccountRootKey, ApiKeyScope, ApiToken, OwnerAccountBundle, RecordId,
-    ScopedAccountBundle, ServiceOrigin,
+    AccountBundle, AccountId, AccountRootKey, ApiKeyScope, ApiToken, AuthorizedConsumerIdentity,
+    ConsumerIdentitySecret, OwnerAccountBundle, RecordId, ScopedAccountBundle, ServiceOrigin,
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use zeroize::Zeroize;
 
 const BEARER: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
 const ACCOUNT_ID: &str = "01890f9e-7b3a-7cc2-98c8-4dc0cbd2bbf2";
+
+#[test]
+fn consumer_identity_secret_is_redacted_zeroizable_and_derives_public_identity() {
+    let mut secret = ConsumerIdentitySecret::from_bytes([0x5a; 32]);
+    let public = secret.authorized_identity();
+
+    assert_eq!(format!("{secret:?}"), "ConsumerIdentitySecret([REDACTED])");
+    assert_ne!(public.as_bytes(), secret.as_bytes());
+    secret.zeroize();
+    assert_eq!(secret.as_bytes(), &[0; 32]);
+}
+
+#[test]
+fn owner_scopes_private_identity_only_to_owner_and_download_bundles() {
+    let secret = ConsumerIdentitySecret::from_bytes([0x5a; 32]);
+    let expected_public = secret.authorized_identity();
+    let owner = OwnerAccountBundle::from_parts(
+        ServiceOrigin::parse("https://sync.example").unwrap(),
+        AccountId::parse(ACCOUNT_ID).unwrap(),
+        ApiToken::from_bytes([1; 32]),
+        ApiToken::from_bytes([2; 32]),
+        AccountRootKey::from_bytes([3; 32]),
+        secret,
+    )
+    .unwrap();
+
+    let owner_encoded = AccountBundle::Owner(owner).encode();
+    let owner_json: serde_json::Value =
+        serde_json::from_slice(&decoded_bundle(&owner_encoded)).unwrap();
+    assert!(owner_json.get("consumer_identity_secret").is_some());
+    assert!(owner_json.get("authorized_consumer_identity").is_none());
+
+    let owner = match AccountBundle::parse(owner_encoded.as_bytes()).unwrap() {
+        AccountBundle::Owner(owner) => owner,
+        AccountBundle::Scoped(_) => panic!("expected owner bundle"),
+    };
+    let publish = AccountBundle::Scoped(owner.scoped(ApiKeyScope::Publish)).encode();
+    let download = AccountBundle::Scoped(owner.scoped(ApiKeyScope::Download)).encode();
+    let publish_json: serde_json::Value =
+        serde_json::from_slice(&decoded_bundle(&publish)).unwrap();
+    let download_json: serde_json::Value =
+        serde_json::from_slice(&decoded_bundle(&download)).unwrap();
+    assert_eq!(
+        publish_json["authorized_consumer_identity"],
+        URL_SAFE_NO_PAD.encode(expected_public.as_bytes())
+    );
+    assert!(publish_json.get("consumer_identity_secret").is_none());
+    assert!(download_json.get("authorized_consumer_identity").is_none());
+    assert_eq!(
+        download_json["consumer_identity_secret"],
+        URL_SAFE_NO_PAD.encode([0x5a; 32])
+    );
+}
+
+#[test]
+fn legacy_owner_accepts_only_byte_exact_historical_canonical_encoding() {
+    let publish = URL_SAFE_NO_PAD.encode([1; 32]);
+    let download = URL_SAFE_NO_PAD.encode([2; 32]);
+    let root = URL_SAFE_NO_PAD.encode([3; 32]);
+    let canonical = format!(
+        r#"{{"bundle_type":"owner","service_origin":"https://sync.example","account_id":"{ACCOUNT_ID}","publish_api_token":"{publish}","download_api_token":"{download}","account_root_key":"{root}"}}"#
+    );
+    assert!(
+        AccountBundle::parse(URL_SAFE_NO_PAD.encode(&canonical).as_bytes()).is_ok(),
+        "byte-exact historical owner encoding must remain accepted"
+    );
+
+    let noncanonical = [
+        format!(
+            r#"{{"service_origin":"https://sync.example","bundle_type":"owner","account_id":"{ACCOUNT_ID}","publish_api_token":"{publish}","download_api_token":"{download}","account_root_key":"{root}"}}"#
+        ),
+        format!(
+            r#"{{ "bundle_type":"owner","service_origin":"https://sync.example","account_id":"{ACCOUNT_ID}","publish_api_token":"{publish}","download_api_token":"{download}","account_root_key":"{root}"}}"#
+        ),
+        format!(
+            r#"{{"bundle_type":"owner","service_origin":"https://sync.example","account_id":"{ACCOUNT_ID}","publish_api_token":"{publish}","download_api_token":"{download}","account_root_key":"{root}","consumer_identity_secret":null}}"#
+        ),
+    ];
+    for payload in noncanonical {
+        assert!(
+            AccountBundle::parse(URL_SAFE_NO_PAD.encode(payload).as_bytes()).is_err(),
+            "noncanonical legacy owner encoding was accepted"
+        );
+    }
+}
+
+#[test]
+fn legacy_owner_bundle_migrates_deterministically_but_legacy_scoped_bundles_fail_closed() {
+    let publish = URL_SAFE_NO_PAD.encode([1; 32]);
+    let download = URL_SAFE_NO_PAD.encode([2; 32]);
+    let root = URL_SAFE_NO_PAD.encode([3; 32]);
+    let legacy_owner = URL_SAFE_NO_PAD.encode(format!(
+        r#"{{"bundle_type":"owner","service_origin":"https://sync.example","account_id":"{ACCOUNT_ID}","publish_api_token":"{publish}","download_api_token":"{download}","account_root_key":"{root}"}}"#
+    ));
+    let first = AccountBundle::parse(legacy_owner.as_bytes()).unwrap();
+    let first = AccountBundle::Owner(match first {
+        AccountBundle::Owner(owner) => owner,
+        AccountBundle::Scoped(_) => panic!("expected owner bundle"),
+    })
+    .encode();
+    let second = AccountBundle::parse(legacy_owner.as_bytes()).unwrap();
+    let second = AccountBundle::Owner(match second {
+        AccountBundle::Owner(owner) => owner,
+        AccountBundle::Scoped(_) => panic!("expected owner bundle"),
+    })
+    .encode();
+    assert_eq!(first, second);
+    let migrated: serde_json::Value = serde_json::from_slice(&decoded_bundle(&first)).unwrap();
+    assert!(migrated.get("consumer_identity_secret").is_some());
+
+    for scope in [ApiKeyScope::Publish, ApiKeyScope::Download] {
+        let legacy_scoped = serde_json::json!({
+            "bundle_type": "scoped",
+            "service_origin": "https://sync.example",
+            "account_id": ACCOUNT_ID,
+            "api_key_scope": scope as u8,
+            "api_token": URL_SAFE_NO_PAD.encode([1; 32]),
+            "account_root_key": URL_SAFE_NO_PAD.encode([3; 32]),
+        });
+        assert!(AccountBundle::parse(&encode_json(&legacy_scoped)).is_err());
+    }
+}
+
+#[test]
+fn publish_bundle_carries_the_authorized_consumer_identity() {
+    let identity = AuthorizedConsumerIdentity::from_bytes([0x5a; 32]);
+    let bundle = ScopedAccountBundle::from_parts(
+        ServiceOrigin::parse("https://sync.example").unwrap(),
+        AccountId::parse(ACCOUNT_ID).unwrap(),
+        ApiKeyScope::Publish,
+        ApiToken::from_bytes([1; 32]),
+        AccountRootKey::from_bytes([2; 32]),
+        Some(identity),
+    )
+    .unwrap();
+
+    let encoded = AccountBundle::Scoped(bundle).encode();
+    let payload: serde_json::Value = serde_json::from_slice(&decoded_bundle(&encoded)).unwrap();
+    assert_eq!(
+        payload["authorized_consumer_identity"],
+        URL_SAFE_NO_PAD.encode([0x5a; 32])
+    );
+    let reparsed = parse_scoped(&encoded);
+    assert_eq!(reparsed.authorized_consumer_identity(), Some(identity));
+}
+
+#[test]
+fn publish_bundle_rejects_missing_or_malformed_authorized_identity() {
+    let bundle = ScopedAccountBundle::from_parts(
+        ServiceOrigin::parse("https://sync.example").unwrap(),
+        AccountId::parse(ACCOUNT_ID).unwrap(),
+        ApiKeyScope::Publish,
+        ApiToken::from_bytes([1; 32]),
+        AccountRootKey::from_bytes([2; 32]),
+        Some(AuthorizedConsumerIdentity::from_bytes([3; 32])),
+    )
+    .unwrap();
+    let original: serde_json::Value =
+        serde_json::from_slice(&decoded_bundle(&AccountBundle::Scoped(bundle).encode())).unwrap();
+
+    let mut missing = original.clone();
+    missing
+        .as_object_mut()
+        .unwrap()
+        .remove("authorized_consumer_identity");
+    assert!(AccountBundle::parse(&encode_json(&missing)).is_err());
+
+    for malformed in [serde_json::json!("bad"), serde_json::json!(null)] {
+        assert!(
+            AccountBundle::parse(&encode_json(&with_json_field(
+                &original,
+                "authorized_consumer_identity",
+                malformed,
+            )))
+            .is_err()
+        );
+    }
+}
 
 fn scoped_credentials(
     bundle: ScopedAccountBundle,
@@ -306,10 +484,11 @@ fn tagged_base64_bundle_has_a_stable_bounded_roundtrip() {
     let payload = decoded_bundle(&encoded);
     let expected_root =
         URL_SAFE_NO_PAD.encode(std::array::from_fn::<_, 32, _>(|index| (index + 32) as u8));
+    let expected_identity = URL_SAFE_NO_PAD.encode([64; 32]);
     assert_eq!(
         String::from_utf8(payload.clone()).unwrap(),
         format!(
-            r#"{{"bundle_type":"scoped","service_origin":"https://sync.example:8443","account_id":"{ACCOUNT_ID}","api_key_scope":2,"api_token":"{BEARER}","account_root_key":"{expected_root}"}}"#
+            r#"{{"bundle_type":"scoped","service_origin":"https://sync.example:8443","account_id":"{ACCOUNT_ID}","api_key_scope":2,"api_token":"{BEARER}","account_root_key":"{expected_root}","consumer_identity_secret":"{expected_identity}"}}"#
         )
     );
     assert!(payload.len() <= attached_session_sync_protocol::limits::MAX_BUNDLE_BYTES);
@@ -328,6 +507,7 @@ fn tagged_owner_bundle_roundtrips_both_scopes() {
         ApiToken::from_bytes([1; 32]),
         ApiToken::from_bytes([2; 32]),
         AccountRootKey::from_bytes([3; 32]),
+        ConsumerIdentitySecret::from_bytes([4; 32]),
     )
     .unwrap();
     let encoded = AccountBundle::Owner(owner).encode();
@@ -354,12 +534,12 @@ fn bundle_accepts_the_maximum_canonical_origin() {
     );
     let origin = ServiceOrigin::parse(&format!("https://{dns253}:65535")).unwrap();
     let account_id = AccountId::parse(ACCOUNT_ID).unwrap();
-    let scoped = ScopedAccountBundle::from_parts(
+    let scoped = ScopedAccountBundle::from_download_parts(
         origin.clone(),
         account_id,
-        ApiKeyScope::Download,
         ApiToken::from_bytes([3; 32]),
         AccountRootKey::from_bytes([4; 32]),
+        ConsumerIdentitySecret::from_bytes([6; 32]),
     )
     .unwrap();
     let owner = OwnerAccountBundle::from_parts(
@@ -368,6 +548,7 @@ fn bundle_accepts_the_maximum_canonical_origin() {
         ApiToken::from_bytes([3; 32]),
         ApiToken::from_bytes([4; 32]),
         AccountRootKey::from_bytes([5; 32]),
+        ConsumerIdentitySecret::from_bytes([6; 32]),
     )
     .unwrap();
     for encoded in [
@@ -392,14 +573,15 @@ fn scoped_bundles_contain_only_their_own_api_token() {
         ApiKeyScope::Publish,
         ApiToken::from_bytes([1; 32]),
         AccountRootKey::from_bytes([3; 32]),
+        Some(AuthorizedConsumerIdentity::from_bytes([4; 32])),
     )
     .unwrap();
-    let download = ScopedAccountBundle::from_parts(
+    let download = ScopedAccountBundle::from_download_parts(
         origin,
         account_id,
-        ApiKeyScope::Download,
         ApiToken::from_bytes([2; 32]),
         AccountRootKey::from_bytes([3; 32]),
+        ConsumerIdentitySecret::from_bytes([4; 32]),
     )
     .unwrap();
 
@@ -478,6 +660,7 @@ fn bundle_rejects_non_uuid_v7_account_ids_and_redacts_debug_output() {
             ApiKeyScope::Download,
             ApiToken::from_bytes([3; 32]),
             AccountRootKey::from_bytes([4; 32]),
+            None,
         )
         .is_err()
     );
@@ -491,12 +674,12 @@ fn bundle_rejects_non_uuid_v7_account_ids_and_redacts_debug_output() {
 }
 
 fn fixture_bundle() -> ScopedAccountBundle {
-    ScopedAccountBundle::from_parts(
+    ScopedAccountBundle::from_download_parts(
         ServiceOrigin::parse("https://sync.example:8443").unwrap(),
         AccountId::parse(ACCOUNT_ID).unwrap(),
-        ApiKeyScope::Download,
         ApiToken::from_bytes(std::array::from_fn(|index| index as u8)),
         AccountRootKey::from_bytes(std::array::from_fn(|index| (index + 32) as u8)),
+        ConsumerIdentitySecret::from_bytes([64; 32]),
     )
     .unwrap()
 }

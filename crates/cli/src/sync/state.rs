@@ -3,7 +3,8 @@ use std::{fmt, path::Path};
 use anyhow::{Context as _, Result, bail, ensure};
 use attached_session_sync_protocol::{
     account::{
-        AccountBundle, AccountId, AccountRootKey, ApiKeyScope, ApiToken, OwnerAccountBundle,
+        AccountBundle, AccountId, AccountRootKey, ApiKeyScope, ApiToken,
+        AuthorizedConsumerIdentity, ConsumerIdentitySecret, OwnerAccountBundle,
         ScopedAccountBundle, ServiceOrigin,
     },
     api::CreateAccountResponse,
@@ -23,6 +24,8 @@ pub struct AccountCredentials {
     api_key_scope: ApiKeyScope,
     api_token: [u8; 32],
     account_root_key: [u8; 32],
+    authorized_consumer_identity: Option<AuthorizedConsumerIdentity>,
+    consumer_identity_secret: Option<[u8; 32]>,
 }
 
 impl fmt::Debug for AccountCredentials {
@@ -41,18 +44,25 @@ impl Drop for AccountCredentials {
     fn drop(&mut self) {
         self.api_token.zeroize();
         self.account_root_key.zeroize();
+        self.consumer_identity_secret.zeroize();
     }
 }
 
 impl AccountCredentials {
     fn from_bundle(bundle: ScopedAccountBundle) -> Self {
         let api_key_scope = bundle.api_key_scope();
+        let authorized_consumer_identity = bundle.authorized_consumer_identity();
+        let consumer_identity_secret = bundle
+            .consumer_identity_secret()
+            .map(|secret| *secret.as_bytes());
         bundle.consume(|origin, account_id, api_token, account_root_key| Self {
             service_origin: origin.as_str().to_owned(),
             account_id,
             api_key_scope,
             api_token: *api_token,
             account_root_key: *account_root_key,
+            authorized_consumer_identity,
+            consumer_identity_secret,
         })
     }
 
@@ -70,6 +80,14 @@ impl AccountCredentials {
 
     pub fn account_root_key(&self) -> &[u8; 32] {
         &self.account_root_key
+    }
+
+    pub const fn authorized_consumer_identity(&self) -> Option<AuthorizedConsumerIdentity> {
+        self.authorized_consumer_identity
+    }
+
+    pub const fn consumer_identity_secret(&self) -> Option<&[u8; 32]> {
+        self.consumer_identity_secret.as_ref()
     }
 
     pub fn bearer_value(&self) -> String {
@@ -128,6 +146,7 @@ pub fn install_created_account(
     state_dir: &Path,
     service_origin: ServiceOrigin,
     response: CreateAccountResponse,
+    consumer_identity_secret: ConsumerIdentitySecret,
 ) -> Result<String> {
     let root_key = AccountRootKey::generate().context("could not generate the account root key")?;
     let (account_id, publish_token, download_token) = response.into_parts();
@@ -137,6 +156,7 @@ pub fn install_created_account(
         publish_token,
         download_token,
         root_key,
+        consumer_identity_secret,
     )
     .map_err(|_| anyhow::anyhow!("could not create owner account bundle"))?;
     let download = owner.scoped(ApiKeyScope::Download);
@@ -241,7 +261,12 @@ pub(crate) mod test_support {
             ApiToken::from_bytes([0x42; 32]),
         )
         .expect("synthetic account response is valid");
-        install_created_account(state_dir, service_origin, response)
+        install_created_account(
+            state_dir,
+            service_origin,
+            response,
+            ConsumerIdentitySecret::from_bytes([0x43; 32]),
+        )
     }
 }
 
@@ -267,6 +292,7 @@ mod tests {
             state_dir,
             ServiceOrigin::parse("https://sync.example").unwrap(),
             fixture_response(),
+            ConsumerIdentitySecret::from_bytes([4; 32]),
         )
         .unwrap()
     }
@@ -279,6 +305,8 @@ mod tests {
             api_key_scope: ApiKeyScope::Publish,
             api_token: [2; 32],
             account_root_key: [3; 32],
+            authorized_consumer_identity: Some(AuthorizedConsumerIdentity::from_bytes([4; 32])),
+            consumer_identity_secret: None,
         };
         let debug = format!("{credentials:?}");
         assert!(debug.contains("[REDACTED]"));
@@ -293,6 +321,7 @@ mod tests {
             ApiToken::from_bytes([1; 32]),
             ApiToken::from_bytes([2; 32]),
             AccountRootKey::from_bytes([3; 32]),
+            ConsumerIdentitySecret::from_bytes([4; 32]),
         )
         .unwrap()
     }

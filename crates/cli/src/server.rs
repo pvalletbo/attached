@@ -1,6 +1,7 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
+use attached_session_sync_protocol::account::AuthorizedConsumerIdentity;
 use attached_tunnel_protocol::{
     CapabilitySecret, HerdrVersion, TUNNEL_ALPN, UPGRADE_ALPN, UpgradeResponse,
     read_upgrade_request, write_upgrade_response,
@@ -49,11 +50,14 @@ pub async fn serve(
     herdr_bin: PathBuf,
     host_label: Option<String>,
 ) -> Result<()> {
-    state::load_account(
+    let account = state::load_account(
         &state_dir,
         attached_session_sync_protocol::account::ApiKeyScope::Publish,
     )
     .context("`serve` requires a publish account bundle")?;
+    let authorized_consumer_identity = account
+        .authorized_consumer_identity()
+        .context("publish account bundle has no authorized consumer identity")?;
 
     let key = identity::load_or_create(&state_dir)?;
     let endpoint = Endpoint::builder(presets::N0)
@@ -105,7 +109,14 @@ pub async fn serve(
                 capability.clone(),
                 published_versions,
             ));
-            let result = serve_endpoint(&endpoint, herdr_bin, capability, version).await;
+            let result = serve_endpoint(
+                &endpoint,
+                herdr_bin,
+                capability,
+                version,
+                authorized_consumer_identity,
+            )
+            .await;
 
             publisher.abort();
             let _ = publisher.await;
@@ -317,11 +328,22 @@ async fn shutdown_connections(connections: &mut JoinSet<Result<()>>) {
     while connections.join_next().await.is_some() {}
 }
 
+fn authorize_remote_identity(
+    remote_identity: &[u8; 32],
+    authorized_identity: AuthorizedConsumerIdentity,
+) -> Result<()> {
+    if remote_identity != authorized_identity.as_bytes() {
+        bail!("unauthorized remote identity");
+    }
+    Ok(())
+}
+
 async fn serve_endpoint(
     endpoint: &Endpoint,
     herdr_bin: PathBuf,
     capability: CapabilitySecret,
     version: watch::Sender<HerdrVersion>,
+    authorized_consumer_identity: AuthorizedConsumerIdentity,
 ) -> Result<()> {
     let pending = Arc::new(Semaphore::new(MAX_PENDING_CONNECTIONS));
     let authenticated = Arc::new(Semaphore::new(MAX_AUTHENTICATED_CONNECTIONS));
@@ -354,6 +376,18 @@ async fn serve_endpoint(
                         let connection = timeout(AUTHENTICATION_TIMEOUT, incoming)
                             .await
                             .context("Iroh connection handshake timed out")??;
+                        if let Err(error) = authorize_remote_identity(
+                            connection.remote_id().as_bytes(),
+                            authorized_consumer_identity,
+                        ) {
+                            warn!(
+                                connection_id,
+                                category = "authorization",
+                                authentication_layer = "iroh_remote_identity",
+                                "Iroh connection rejected: unauthorized remote identity"
+                            );
+                            return Err(error);
+                        }
                         if connection.alpn() == UPGRADE_ALPN {
                             return serve_upgrade_connection(
                                 connection,
@@ -407,7 +441,13 @@ async fn serve_endpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use attached_tunnel_protocol::{read_upgrade_response, write_upgrade_request};
+    use attached_session_sync_protocol::account::{
+        AuthorizedConsumerIdentity, ConsumerIdentitySecret,
+    };
+    use attached_tunnel_protocol::{
+        authenticate_server, read_auth_response, read_upgrade_response, write_auth_request,
+        write_upgrade_request,
+    };
     use std::{
         fs,
         os::unix::fs::PermissionsExt,
@@ -426,6 +466,152 @@ mod tests {
         .unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         path
+    }
+
+    #[test]
+    fn unauthorized_remote_identity_is_rejected_before_dispatch() {
+        let expected = AuthorizedConsumerIdentity::from_bytes([0x11; 32]);
+        let mut dispatched = false;
+
+        let result = authorize_remote_identity(&[0x22; 32], expected);
+        if result.is_ok() {
+            dispatched = true;
+        }
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("unauthorized remote identity"), "{error}");
+        assert!(!dispatched);
+    }
+
+    #[tokio::test]
+    async fn live_quic_enforces_identity_before_capability_and_session_authentication() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let consumer_identity_secret = ConsumerIdentitySecret::from_bytes([0x5a; 32]);
+            let authorized_identity = consumer_identity_secret.authorized_identity();
+            let authorized_key = iroh::SecretKey::from_bytes(consumer_identity_secret.as_bytes());
+            assert_eq!(
+                authorized_key.public().as_bytes(),
+                authorized_identity.as_bytes(),
+                "account and Iroh identity derivation must remain byte-exact",
+            );
+            let unauthorized_key = iroh::SecretKey::generate();
+            let capability = CapabilitySecret::from_bytes([0x51; 32]);
+            let wrong_capability = CapabilitySecret::from_bytes([0x52; 32]);
+            let server = Endpoint::builder(presets::N0)
+                .alpns(vec![TUNNEL_ALPN.to_vec()])
+                .bind()
+                .await
+                .unwrap();
+            server.online().await;
+            let server_addr = server.addr();
+            let server_endpoint = server.clone();
+            let server_capability = capability.clone();
+            let capability_attempts = Arc::new(AtomicUsize::new(0));
+            let session_resolutions = Arc::new(AtomicUsize::new(0));
+            let server_attempts = capability_attempts.clone();
+            let server_resolutions = session_resolutions.clone();
+            let (processed, mut events) = tokio::sync::mpsc::unbounded_channel();
+
+            let server_task = tokio::spawn(async move {
+                for _ in 0..3 {
+                    let connection = server_endpoint.accept().await.unwrap().await.unwrap();
+
+                    if authorize_remote_identity(
+                        connection.remote_id().as_bytes(),
+                        authorized_identity,
+                    )
+                    .is_err()
+                    {
+                        connection.close(1_u32.into(), b"unauthorized remote identity");
+                        processed.send("identity_rejected").unwrap();
+                        continue;
+                    }
+
+                    server_attempts.fetch_add(1, Ordering::SeqCst);
+                    let (mut send, mut receive) = connection.accept_bi().await.unwrap();
+                    let resolutions = server_resolutions.clone();
+                    let result = authenticate_server(
+                        &mut receive,
+                        &mut send,
+                        &server_capability,
+                        HerdrVersion::new(0, 7, 5),
+                        move |session| async move {
+                            resolutions.fetch_add(1, Ordering::SeqCst);
+                            anyhow::ensure!(session == "work", "unexpected session");
+                            Ok(())
+                        },
+                        || Ok(()),
+                    )
+                    .await;
+
+                    processed
+                        .send(if result.is_ok() {
+                            "authorized"
+                        } else {
+                            "capability_rejected"
+                        })
+                        .unwrap();
+                    let _ = send.stopped().await;
+                    drop(connection);
+                }
+            });
+
+            let unauthorized = Endpoint::builder(presets::N0)
+                .secret_key(unauthorized_key)
+                .bind()
+                .await
+                .unwrap();
+            let unauthorized_connection = unauthorized
+                .connect(server_addr.clone(), TUNNEL_ALPN)
+                .await
+                .unwrap();
+            assert_eq!(events.recv().await.unwrap(), "identity_rejected");
+            assert_eq!(capability_attempts.load(Ordering::SeqCst), 0);
+            assert_eq!(session_resolutions.load(Ordering::SeqCst), 0);
+            drop(unauthorized_connection);
+
+            async fn authenticate(
+                key: iroh::SecretKey,
+                address: iroh::EndpointAddr,
+                capability: &CapabilitySecret,
+            ) -> (Endpoint, anyhow::Result<()>) {
+                let endpoint = Endpoint::builder(presets::N0)
+                    .secret_key(key)
+                    .bind()
+                    .await
+                    .unwrap();
+                let connection = endpoint.connect(address, TUNNEL_ALPN).await.unwrap();
+
+                let (mut send, mut receive) = connection.open_bi().await.unwrap();
+                let result = async {
+                    write_auth_request(&mut send, "work", capability, None).await?;
+
+                    read_auth_response(&mut receive, None).await
+                }
+                .await;
+                (endpoint, result)
+            }
+
+            let (authorized, result) =
+                authenticate(authorized_key.clone(), server_addr.clone(), &capability).await;
+            result.unwrap();
+            assert_eq!(events.recv().await.unwrap(), "authorized");
+            assert_eq!(capability_attempts.load(Ordering::SeqCst), 1);
+            assert_eq!(session_resolutions.load(Ordering::SeqCst), 1);
+
+            let (wrong, result) =
+                authenticate(authorized_key, server_addr, &wrong_capability).await;
+            assert!(result.is_err());
+            assert_eq!(events.recv().await.unwrap(), "capability_rejected");
+            assert_eq!(capability_attempts.load(Ordering::SeqCst), 2);
+            assert_eq!(session_resolutions.load(Ordering::SeqCst), 1);
+
+            server_task.await.unwrap();
+            server.close().await;
+            drop((unauthorized, authorized, wrong));
+        })
+        .await
+        .expect("live Iroh identity authorization scenario timed out");
     }
 
     #[tokio::test]

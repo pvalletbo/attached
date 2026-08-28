@@ -6,6 +6,8 @@ use attached_tunnel_protocol::{
 };
 use iroh::{Endpoint, endpoint::presets};
 
+const ENDPOINT: &str = "endpointacxfr74igmsbvsbnn73wcecg5vt3kbzncqwfrdiampuufwnhkublmaqacbuhi5dqhixs6zdfojyc43lffyxqcad7aaaadaai";
+
 #[test]
 fn errors_exposed_to_javascript_are_generic() {
     assert_eq!(
@@ -13,6 +15,77 @@ fn errors_exposed_to_javascript_are_generic() {
         "unable to connect to the Herdr tunnel"
     );
     assert_eq!(MAX_RECEIVE_CHUNK, 64 * 1024);
+}
+
+#[test]
+fn capability_source_is_zeroized_when_endpoint_is_malformed() {
+    let mut capability = Zeroizing::new(vec![0x41; 32]);
+    let result = parse_target(
+        "not-an-endpoint-ticket",
+        "default".to_owned(),
+        &mut capability,
+        Zeroizing::new(vec![0x52; 32]),
+    );
+
+    assert!(result.is_err());
+    assert!(capability.is_empty());
+}
+
+#[test]
+fn capability_source_is_zeroized_when_consumer_identity_is_malformed() {
+    let mut capability = Zeroizing::new(vec![0x41; 32]);
+    let result = parse_target(
+        ENDPOINT,
+        "default".to_owned(),
+        &mut capability,
+        Zeroizing::new(vec![0x52; 31]),
+    );
+
+    assert!(result.is_err());
+    assert!(capability.is_empty());
+}
+
+#[test]
+fn capability_source_is_zeroized_after_successful_parse() {
+    let mut capability = Zeroizing::new(vec![0x41; 32]);
+    let (_, _, _, parsed_capability) = parse_target(
+        ENDPOINT,
+        "default".to_owned(),
+        &mut capability,
+        Zeroizing::new(vec![0x52; 32]),
+    )
+    .unwrap();
+
+    assert!(capability.is_empty());
+    assert_eq!(parsed_capability.to_bytes(), [0x41; 32]);
+}
+
+#[test]
+fn browser_identity_input_is_zeroized_after_copy() {
+    fn assert_zeroizing_identity(_: &Zeroizing<[u8; 32]>) {}
+
+    let mut input = vec![0x5a; 32];
+    let parsed = parse_consumer_identity(&mut input).unwrap();
+    assert!(input.is_empty());
+    assert_zeroizing_identity(&parsed);
+    assert_eq!(parsed.as_ref(), &[0x5a; 32]);
+
+    let mut invalid = vec![0x5a; 31];
+    assert!(parse_consumer_identity(&mut invalid).is_err());
+    assert!(invalid.is_empty());
+}
+
+#[tokio::test]
+async fn browser_endpoint_binds_the_provisioned_consumer_identity() {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let secret = [0x5a; 32];
+        let expected = iroh::SecretKey::from_bytes(&secret).public();
+        let endpoint = bind_client_endpoint(&secret).await.unwrap();
+        assert_eq!(endpoint.id(), expected);
+        endpoint.close().await;
+    })
+    .await
+    .expect("browser endpoint bind timed out");
 }
 
 #[tokio::test]
@@ -80,6 +153,7 @@ async fn browser_client_authenticates_before_opening_a_tui_stream() {
 
     let tunnel = connect_tunnel_controlled(
         server.addr(),
+        Zeroizing::new([0x29; 32]),
         "default".to_owned(),
         capability,
         CancellationToken::new(),

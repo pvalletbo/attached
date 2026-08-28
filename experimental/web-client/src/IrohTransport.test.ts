@@ -6,6 +6,7 @@ function target(): IrohConnectionTarget {
     endpointTicket: "endpoint-ticket",
     session: "alpha",
     capability: new Uint8Array(32).fill(7),
+    consumerIdentitySecret: new Uint8Array(32).fill(8),
   };
 }
 
@@ -17,9 +18,16 @@ function fakeBinding() {
   };
   const initialize = vi.fn(async () => undefined);
   const receivedCapabilities: Uint8Array[] = [];
+  const receivedIdentities: Uint8Array[] = [];
   const connect = vi.fn(
-    async (_endpoint: string, _session: string, capability: Uint8Array) => {
+    async (
+      _endpoint: string,
+      _session: string,
+      capability: Uint8Array,
+      identity: Uint8Array,
+    ) => {
       receivedCapabilities.push(capability.slice());
+      receivedIdentities.push(identity.slice());
       return tunnel;
     },
   );
@@ -35,6 +43,7 @@ function fakeBinding() {
     initialize,
     connect,
     receivedCapabilities,
+    receivedIdentities,
     cancel,
     free,
     load: vi.fn(async () => ({
@@ -60,9 +69,12 @@ describe("browser Iroh transport", () => {
       "endpoint-ticket",
       "alpha",
       expect.any(Uint8Array),
+      expect.any(Uint8Array),
     );
     expect(binding.receivedCapabilities).toEqual([new Uint8Array(32).fill(7)]);
+    expect(binding.receivedIdentities).toEqual([new Uint8Array(32).fill(8)]);
     expect(connection.capability).toEqual(new Uint8Array(32));
+    expect(connection.consumerIdentitySecret).toEqual(new Uint8Array(32));
     expect(binding.tunnel.send).toHaveBeenCalledWith(outgoing);
     expect(binding.tunnel.close).toHaveBeenCalledOnce();
   });
@@ -82,7 +94,12 @@ describe("browser Iroh transport", () => {
 
     await expect(
       IrohTransport.connect(
-        { endpointTicket: "private-endpoint", session: "alpha", capability: secret },
+        {
+          endpointTicket: "private-endpoint",
+          session: "alpha",
+          capability: secret,
+          consumerIdentitySecret: new Uint8Array(32).fill(8),
+        },
         load,
       ),
     ).rejects.toThrow("unable to connect to the Herdr tunnel");
