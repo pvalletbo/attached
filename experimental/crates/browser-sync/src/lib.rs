@@ -18,7 +18,7 @@ use chrono::{DateTime, Utc};
 use iroh_tickets::endpoint::EndpointTicket;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 const BROWSER_HERDR_VERSION: SessionAccessHerdrVersion = SessionAccessHerdrVersion::new(0, 7, 5);
 const PROTOCOL_17_MINIMUM_PATCH: u16 = 4;
@@ -70,6 +70,7 @@ impl std::error::Error for SyncError {}
 struct Credentials {
     api_token: [u8; 32],
     account_root_key: [u8; 32],
+    consumer_identity_secret: Zeroizing<[u8; 32]>,
 }
 
 struct CatalogRecord {
@@ -135,11 +136,13 @@ struct BrowserSession {
 }
 
 /// One selected session's connection parameters, transferred without a secret string.
+#[derive(Zeroize, ZeroizeOnDrop)]
 #[wasm_bindgen]
 pub struct BrowserConnectionTarget {
     endpoint_ticket: String,
     session: String,
     capability: CapabilitySecret,
+    consumer_identity_secret: Zeroizing<[u8; 32]>,
 }
 
 #[wasm_bindgen]
@@ -159,6 +162,13 @@ impl BrowserConnectionTarget {
         let capability = self.capability.to_bytes().to_vec();
         self.capability.zeroize();
         capability
+    }
+
+    /// Moves a copy into JavaScript and clears the Rust-owned Iroh identity.
+    pub fn take_consumer_identity(&mut self) -> Vec<u8> {
+        let secret = self.consumer_identity_secret.to_vec();
+        self.consumer_identity_secret.zeroize();
+        secret
     }
 }
 
@@ -181,6 +191,12 @@ impl SyncClientCore {
         if bundle.api_key_scope() != ApiKeyScope::Download {
             return Err(SyncError::InvalidBundle);
         }
+        let consumer_identity_secret = Zeroizing::new(
+            *bundle
+                .consumer_identity_secret()
+                .ok_or(SyncError::InvalidBundle)?
+                .as_bytes(),
+        );
         Ok(
             bundle.consume(|origin, account_id, api_token, account_root_key| Self {
                 service_origin: origin.as_str().to_owned(),
@@ -188,6 +204,7 @@ impl SyncClientCore {
                 credentials: Credentials {
                     api_token: *api_token,
                     account_root_key: *account_root_key,
+                    consumer_identity_secret,
                 },
                 records: BTreeMap::new(),
                 pending_index: None,
@@ -322,6 +339,7 @@ impl SyncClientCore {
             endpoint_ticket: record.endpoint_ticket.clone(),
             session: session.to_owned(),
             capability: CapabilitySecret::from_bytes(record.attach_capability.to_bytes()),
+            consumer_identity_secret: Zeroizing::new(*self.credentials.consumer_identity_secret),
         })
     }
 }
@@ -449,7 +467,10 @@ impl BrowserSyncClient {
 mod tests {
     use super::*;
     use attached_session_sync_protocol::{
-        account::{AccountRootKey, ScopedAccountBundle, ServiceOrigin},
+        account::{
+            AccountRootKey, AuthorizedConsumerIdentity, ConsumerIdentitySecret,
+            ScopedAccountBundle, ServiceOrigin,
+        },
         api::{Envelope as ApiEnvelope, LiveRecordIndex, LiveRecordIndexEntry},
         canonical::SessionAccessDescriptor,
         crypto::seal_session_access_descriptor,
@@ -468,12 +489,12 @@ mod tests {
 
     fn fixture_bundle() -> String {
         AccountBundle::Scoped(
-            ScopedAccountBundle::from_parts(
+            ScopedAccountBundle::from_download_parts(
                 ServiceOrigin::parse("https://sync.example").unwrap(),
                 AccountId::parse("01890f9e-7b3a-7cc2-98c8-4dc0cbd2bbf2").unwrap(),
-                ApiKeyScope::Download,
                 ApiToken::from_bytes([3; 32]),
                 AccountRootKey::from_bytes([8; 32]),
+                ConsumerIdentitySecret::from_bytes([9; 32]),
             )
             .unwrap(),
         )
@@ -489,6 +510,7 @@ mod tests {
                 ApiKeyScope::Publish,
                 ApiToken::from_bytes([7; 32]),
                 AccountRootKey::from_bytes([8; 32]),
+                Some(AuthorizedConsumerIdentity::from_bytes([9; 32])),
             )
             .unwrap(),
         )
@@ -498,6 +520,13 @@ mod tests {
             SyncClientCore::from_bundle(&bundle),
             Err(SyncError::InvalidBundle)
         ));
+    }
+
+    #[test]
+    fn abandoned_connection_targets_zeroize_private_material_on_drop() {
+        fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+
+        assert_zeroize_on_drop::<BrowserConnectionTarget>();
     }
 
     #[test]
@@ -556,6 +585,8 @@ mod tests {
         assert_eq!(target.session, "alpha");
         assert_eq!(target.take_capability(), [6; 32]);
         assert_eq!(target.capability.to_bytes(), [0; 32]);
+        assert_eq!(target.take_consumer_identity(), [9; 32]);
+        assert_eq!(target.consumer_identity_secret.as_ref(), &[0; 32]);
     }
 
     #[test]

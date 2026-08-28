@@ -15,7 +15,9 @@ const session = {
   expires_at: "1700000300",
 };
 
-function fakeModule(options: { rejectRecord?: boolean } = {}) {
+function fakeModule(
+  options: { rejectRecord?: boolean; rejectConsumerIdentity?: boolean } = {},
+) {
   const constructor = vi.fn();
   const free = vi.fn();
   const beginRefresh = vi.fn(() =>
@@ -30,11 +32,18 @@ function fakeModule(options: { rejectRecord?: boolean } = {}) {
   const abortRefresh = vi.fn();
   const sessions = vi.fn(() => JSON.stringify([session]));
   const freeTarget = vi.fn();
-  const takeCapability = vi.fn(() => new Uint8Array(32).fill(7));
+  const capability = new Uint8Array(32).fill(7);
+  const takeCapability = vi.fn(() => capability);
+  const takeConsumerIdentity = options.rejectConsumerIdentity
+    ? vi.fn(() => {
+        throw new Error("consumer identity extraction failed");
+      })
+    : vi.fn(() => new Uint8Array(32).fill(8));
   const connectionFor = vi.fn(() => ({
     endpoint_ticket: "endpoint-ticket",
     session: "alpha",
     take_capability: takeCapability,
+    take_consumer_identity: takeConsumerIdentity,
     free: freeTarget,
   }));
 
@@ -72,7 +81,9 @@ function fakeModule(options: { rejectRecord?: boolean } = {}) {
     abortRefresh,
     sessions,
     connectionFor,
+    capability,
     takeCapability,
+    takeConsumerIdentity,
     freeTarget,
   };
 }
@@ -130,13 +141,29 @@ describe("browser synchronization client", () => {
       endpointTicket: "endpoint-ticket",
       session: "alpha",
       capability: new Uint8Array(32).fill(7),
+      consumerIdentitySecret: new Uint8Array(32).fill(8),
     });
     expect(wasm.connectionFor).toHaveBeenCalledWith(recordId, "alpha", 1_700_000_100);
     expect(wasm.takeCapability).toHaveBeenCalledOnce();
+    expect(wasm.takeConsumerIdentity).toHaveBeenCalledOnce();
     expect(wasm.freeTarget).toHaveBeenCalledOnce();
     client.close();
     client.close();
     expect(wasm.free).toHaveBeenCalledOnce();
+  });
+
+  it("zeroizes an extracted capability when consumer identity extraction fails", async () => {
+    const wasm = fakeModule({ rejectConsumerIdentity: true });
+    const client = await SyncClient.fromBundle("bundle", wasm.loader);
+
+    expect(() => client.connectionFor(session)).toThrow(
+      "consumer identity extraction failed",
+    );
+
+    expect(wasm.takeCapability).toHaveBeenCalledOnce();
+    expect(wasm.takeConsumerIdentity).toHaveBeenCalledOnce();
+    expect(wasm.capability).toEqual(new Uint8Array(32));
+    expect(wasm.freeTarget).toHaveBeenCalledOnce();
   });
 
   it("keeps refreshing healthy records when one encrypted record is rejected", async () => {

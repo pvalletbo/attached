@@ -7,6 +7,7 @@ interface BrowserConnectionTargetBinding {
   readonly endpoint_ticket: string;
   readonly session: string;
   take_capability(): Uint8Array;
+  take_consumer_identity(): Uint8Array;
   free(): void;
 }
 
@@ -176,15 +177,29 @@ export class SyncClient {
       const endpointTicket = target.endpoint_ticket;
       const sessionName = target.session;
       const capability = target.take_capability();
+      let consumerIdentitySecret: Uint8Array;
+      try {
+        consumerIdentitySecret = target.take_consumer_identity();
+      } catch (error) {
+        capability.fill(0);
+        throw error;
+      }
       if (
         endpointTicket.length === 0 ||
         sessionName.length === 0 ||
-        capability.length !== 32
+        capability.length !== 32 ||
+        consumerIdentitySecret.length !== 32
       ) {
         capability.fill(0);
+        consumerIdentitySecret.fill(0);
         throw new Error("invalid synchronized connection target");
       }
-      return { endpointTicket, session: sessionName, capability };
+      return {
+        endpointTicket,
+        session: sessionName,
+        capability,
+        consumerIdentitySecret,
+      };
     } finally {
       target.free();
     }

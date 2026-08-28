@@ -24,6 +24,7 @@ tokio = { version = "1", features = ["io-util", "macros", "sync"] }
 tokio-util.workspace = true
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true

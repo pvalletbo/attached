@@ -87,6 +87,11 @@ pub async fn attach(
 ) -> Result<i32> {
     let (host, session) = parse_target(target)?;
     let account = state::load_account(state_dir, ApiKeyScope::Download)?;
+    let local_identity = iroh::SecretKey::from_bytes(
+        account
+            .consumer_identity_secret()
+            .context("download account bundle has no consumer Iroh identity")?,
+    );
     let attachment =
         state_catalog::attachment(state_dir, &account, host, session, super::utc_now_seconds())?
             .with_context(|| format!("synchronized session `{target}` is unavailable"))?;
@@ -138,6 +143,7 @@ pub async fn attach(
             &attachment,
             tunnel::request_upgrade(
                 endpoint.endpoint_addr().clone(),
+                &local_identity,
                 &attachment.session,
                 &CapabilitySecret::from_bytes(attachment.attach_capability),
                 local_version,
@@ -156,6 +162,7 @@ pub async fn attach(
     );
     let connection = tunnel::connect(
         endpoint.endpoint_addr().clone(),
+        &local_identity,
         attachment.session.clone(),
         CapabilitySecret::from_bytes(attachment.attach_capability),
         herdr_bin,
