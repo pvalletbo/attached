@@ -472,7 +472,7 @@ mod tests {
             ScopedAccountBundle, ServiceOrigin,
         },
         api::{Envelope as ApiEnvelope, LiveRecordIndex, LiveRecordIndexEntry},
-        canonical::SessionAccessDescriptor,
+        canonical::{AttachedVersion as SessionAccessAttachedVersion, SessionAccessDescriptor},
         crypto::seal_session_access_descriptor,
     };
 
@@ -550,6 +550,7 @@ mod tests {
             timestamp(1_700_000_300),
             ENDPOINT.into(),
             CapabilitySecret::from_bytes([6; 32]),
+            SessionAccessAttachedVersion::new(0, 2, 0),
             SessionAccessHerdrVersion::new(0, 7, 5),
             vec!["alpha".into(), "build".into()],
         )

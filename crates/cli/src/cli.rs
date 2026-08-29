@@ -1,12 +1,15 @@
-use std::path::PathBuf;
+use std::{
+    io::{Write as _, stdout},
+    path::PathBuf,
+};
 
 use anyhow::{Context, Result, ensure};
 use attached_session_sync_protocol::account::ApiKeyScope;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::{
-    herdr_version, identity, installation, publish_account, secure_state, server, session,
-    session_catalog,
+    herdr_version, identity, installation, local_encryption, publish_account, secure_state, server,
+    session, session_catalog,
     session_picker::{self, SessionSelection},
     sync,
 };
@@ -20,6 +23,10 @@ pub struct Cli {
     /// Increase diagnostic verbosity (`-v` for lifecycle, `-vv` for debug details).
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count, global = true)]
     verbose: u8,
+
+    /// Have 1Password generate and store the encryption password instead of prompting for one.
+    #[arg(long, global = true)]
+    use_1password: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -54,6 +61,25 @@ enum Command {
         state_dir: Option<PathBuf>,
     },
 
+    /// Inspect synchronized remote Herdr sessions.
+    #[command(subcommand_negates_reqs = true, args_conflicts_with_subcommands = true)]
+    Sessions {
+        /// Emit a stable machine-readable JSON array.
+        #[arg(long, required = true)]
+        json: bool,
+
+        /// Path to the local Herdr executable used for version compatibility.
+        #[arg(long, default_value = "herdr")]
+        herdr_bin: PathBuf,
+
+        /// Override persistent state location (primarily for testing).
+        #[arg(long, hide = true)]
+        state_dir: Option<PathBuf>,
+
+        #[command(subcommand)]
+        command: Option<SessionsCommand>,
+    },
+
     /// Select and attach to a local or synchronized Herdr session.
     Attach {
         /// Synchronized `HOST/SESSION`; omit to choose local or synchronized with fzf.
@@ -78,21 +104,6 @@ enum Command {
         state_dir: Option<PathBuf>,
     },
 
-    /// List synchronized Herdr sessions for desktop integrations.
-    Sessions {
-        /// Emit a stable machine-readable JSON array.
-        #[arg(long, required = true)]
-        json: bool,
-
-        /// Path to the local Herdr executable used for version compatibility.
-        #[arg(long, default_value = "herdr")]
-        herdr_bin: PathBuf,
-
-        /// Override persistent state location (primarily for testing).
-        #[arg(long, hide = true)]
-        state_dir: Option<PathBuf>,
-    },
-
     /// Update Attached to the latest release.
     #[command(visible_alias = "upgrade")]
     Update,
@@ -106,6 +117,20 @@ enum Command {
 }
 
 const DEFAULT_SERVICE_ORIGIN: &str = "https://herdr.attached.sh";
+
+#[derive(Subcommand)]
+enum SessionsCommand {
+    /// Refresh and list synchronized remote sessions.
+    List {
+        /// Path to the local Herdr executable used for compatibility checks.
+        #[arg(long, default_value = "herdr")]
+        herdr_bin: PathBuf,
+
+        /// Override persistent state location (primarily for testing).
+        #[arg(long, hide = true)]
+        state_dir: Option<PathBuf>,
+    },
+}
 
 #[derive(Subcommand)]
 enum AccountCommand {
@@ -162,6 +187,7 @@ impl Cli {
     }
 
     pub async fn run(self) -> Result<i32> {
+        local_encryption::configure_use_one_password(self.use_1password);
         match self.command {
             Command::Account { command } => {
                 match command {
@@ -203,6 +229,46 @@ impl Cli {
                 server::serve(state_dir, herdr_bin, host_label).await?;
                 Ok(0)
             }
+            Command::Sessions {
+                json,
+                herdr_bin,
+                state_dir,
+                command,
+            } => match command {
+                Some(SessionsCommand::List {
+                    herdr_bin,
+                    state_dir,
+                }) => {
+                    let state_dir = resolved_state_dir(state_dir)?;
+                    sync::state::load_account(&state_dir, ApiKeyScope::Download)
+                        .context("`sessions list` requires a download account bundle")?;
+                    let local_version = herdr_version::query(&herdr_bin).context(
+                        "could not determine the local Herdr version; catalog refresh was not started",
+                    )?;
+                    let refreshed = sync::refresh::refresh_sessions(&state_dir, local_version)
+                        .await
+                        .context("could not refresh synchronized sessions")?;
+                    for warning in refresh_warnings_to_display(&refreshed.warnings, self.verbose) {
+                        eprintln!("Warning: {warning}");
+                    }
+                    let rendered = session_picker::render_synchronized_list(&refreshed.sessions)?;
+                    stdout()
+                        .lock()
+                        .write_all(rendered.as_bytes())
+                        .context("could not write synchronized session list")?;
+                    Ok(0)
+                }
+                None => {
+                    debug_assert!(json, "Clap requires --json when no subcommand is used");
+                    let state_dir = resolved_state_dir(state_dir)?;
+                    let refreshed = session_catalog::refresh(&state_dir, &herdr_bin).await?;
+                    for warning in refresh_warnings_to_display(&refreshed.warnings, self.verbose) {
+                        eprintln!("Warning: {warning}");
+                    }
+                    session_catalog::write_json(stdout().lock(), &refreshed.sessions)?;
+                    Ok(0)
+                }
+            },
             Command::Attach {
                 target,
                 herdr_bin,
@@ -287,21 +353,6 @@ impl Cli {
                     }
                 }
             }
-            Command::Sessions {
-                json,
-                herdr_bin,
-                state_dir,
-            } => {
-                debug_assert!(json, "Clap requires --json");
-                let state_dir = resolved_state_dir(state_dir)?;
-                let refreshed = session_catalog::refresh(&state_dir, &herdr_bin).await?;
-                for warning in refresh_warnings_to_display(&refreshed.warnings, self.verbose) {
-                    eprintln!("Warning: {warning}");
-                }
-                let stdout = std::io::stdout();
-                session_catalog::write_json(stdout.lock(), &refreshed.sessions)?;
-                Ok(0)
-            }
             Command::Update => {
                 installation::update()?;
                 Ok(0)
@@ -368,6 +419,7 @@ mod tests {
                 "--output",
                 "/tmp/publish.bundle",
             ],
+            vec!["attached", "sessions", "list"],
             vec![
                 "attached",
                 "serve",
@@ -391,6 +443,14 @@ mod tests {
             assert!(Cli::try_parse_from(["attached", removed]).is_err());
         }
         assert!(Cli::try_parse_from(["attached", "sessions"]).is_err());
+        assert!(
+            Cli::try_parse_from(["attached", "sessions", "--json", "list"]).is_err(),
+            "machine-readable arguments must not be mixed with the human list subcommand"
+        );
+        assert!(
+            Cli::try_parse_from(["attached", "sessions", "list", "--json"]).is_err(),
+            "human list arguments must not accept the machine-readable flag"
+        );
         assert!(Cli::try_parse_from(["attached", "account", "import", "--bundle-stdin"]).is_err());
     }
 
@@ -490,8 +550,8 @@ mod tests {
         for command in [
             "account",
             "serve",
-            "attach",
             "sessions",
+            "attach",
             "update",
             "uninstall",
         ] {
@@ -518,6 +578,23 @@ mod tests {
             bundle_file,
             Some(PathBuf::from("/run/secrets/attached-publish"))
         );
+    }
+
+    #[test]
+    fn user_password_is_default_and_one_password_is_explicit_and_global() {
+        let default = Cli::try_parse_from(["attached", "attach"]).unwrap();
+        assert!(!default.use_1password);
+
+        let before = Cli::try_parse_from(["attached", "--use-1password", "serve"]).unwrap();
+        assert!(before.use_1password);
+
+        let after = Cli::try_parse_from(["attached", "attach", "--use-1password"]).unwrap();
+        assert!(after.use_1password);
+
+        assert!(Cli::try_parse_from(["attached", "attach", "--local-unsecure-storage"]).is_err());
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--use-1password"), "{help}");
+        assert!(help.contains("generate and store"), "{help}");
     }
 
     #[test]

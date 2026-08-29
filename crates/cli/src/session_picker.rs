@@ -24,6 +24,8 @@ pub enum SessionSelection {
 struct PickerCandidate {
     host: String,
     session: String,
+    attached_version: Option<[u16; 3]>,
+    herdr_version: Option<[u16; 3]>,
     published_at: Option<DateTime<Utc>>,
     selection: SessionSelection,
 }
@@ -102,12 +104,16 @@ fn picker_candidates(
         .map(|session| PickerCandidate {
             host: LOCAL_HOST_LABEL.to_owned(),
             session: session.name().to_owned(),
+            attached_version: None,
+            herdr_version: None,
             published_at: None,
             selection: SessionSelection::Local(session.name().to_owned()),
         })
         .chain(synchronized_sessions.iter().map(|session| PickerCandidate {
             host: session.host.clone(),
             session: session.session.clone(),
+            attached_version: session.attached_version,
+            herdr_version: Some(session.herdr_version),
             published_at: session.published_at,
             selection: SessionSelection::Synchronized(session.target.clone()),
         }))
@@ -141,6 +147,24 @@ fn render_input(candidates: &[PickerCandidate]) -> Result<(String, String)> {
     render_input_at(candidates, Utc::now())
 }
 
+pub fn render_synchronized_list(sessions: &[SyncedSession]) -> Result<String> {
+    render_synchronized_list_at(sessions, Utc::now())
+}
+
+fn render_synchronized_list_at(sessions: &[SyncedSession], now: DateTime<Utc>) -> Result<String> {
+    let candidates = picker_candidates(&[], sessions);
+    let (input, header) = render_input_at(&candidates, now)?;
+    let mut rendered = String::new();
+    writeln!(rendered, "{header}").expect("writing a session list to a String cannot fail");
+    for candidate in input.lines() {
+        let (_, columns) = candidate
+            .split_once('\t')
+            .expect("rendered picker candidates include a hidden index");
+        writeln!(rendered, "{columns}").expect("writing a session list to a String cannot fail");
+    }
+    Ok(rendered)
+}
+
 fn render_input_at(candidates: &[PickerCandidate], now: DateTime<Utc>) -> Result<(String, String)> {
     for candidate in candidates {
         ensure!(
@@ -162,6 +186,18 @@ fn render_input_at(candidates: &[PickerCandidate], now: DateTime<Utc>) -> Result
         .max()
         .unwrap_or_default()
         .max("SESSION".len());
+    let attached_width = candidates
+        .iter()
+        .map(|candidate| attached_version_summary(candidate).chars().count())
+        .max()
+        .unwrap_or_default()
+        .max("ATTACHED".len());
+    let herdr_width = candidates
+        .iter()
+        .map(|candidate| herdr_version_summary(candidate).chars().count())
+        .max()
+        .unwrap_or_default()
+        .max("HERDR".len());
     let publish_width = candidates
         .iter()
         .map(|candidate| publish_summary(candidate, now).chars().count())
@@ -169,20 +205,44 @@ fn render_input_at(candidates: &[PickerCandidate], now: DateTime<Utc>) -> Result
         .unwrap_or_default()
         .max("LAST PUBLISH".len());
     let header = format!(
-        "{:<host_width$}  {:<session_width$}  {:<publish_width$}",
-        "HOST", "SESSION", "LAST PUBLISH"
+        "{:<host_width$}  {:<session_width$}  {:<attached_width$}  {:<herdr_width$}  {:<publish_width$}",
+        "HOST", "SESSION", "ATTACHED", "HERDR", "LAST PUBLISH"
     );
     let mut input = String::new();
     for (index, candidate) in candidates.iter().enumerate() {
+        let attached_version = attached_version_summary(candidate);
+        let herdr_version = herdr_version_summary(candidate);
         let published = publish_summary(candidate, now);
         writeln!(
             input,
-            "{index}\t{:<host_width$}  {:<session_width$}  {:<publish_width$}",
-            candidate.host, candidate.session, published
+            "{index}\t{:<host_width$}  {:<session_width$}  {:<attached_width$}  {:<herdr_width$}  {:<publish_width$}",
+            candidate.host,
+            candidate.session,
+            attached_version,
+            herdr_version,
+            published
         )
         .expect("writing session candidates to a String cannot fail");
     }
     Ok((input, header))
+}
+
+fn attached_version_summary(candidate: &PickerCandidate) -> String {
+    version_summary(candidate, candidate.attached_version)
+}
+
+fn herdr_version_summary(candidate: &PickerCandidate) -> String {
+    version_summary(candidate, candidate.herdr_version)
+}
+
+fn version_summary(candidate: &PickerCandidate, version: Option<[u16; 3]>) -> String {
+    if matches!(candidate.selection, SessionSelection::Local(_)) {
+        return "-".to_owned();
+    }
+    version.map_or_else(
+        || "unknown".to_owned(),
+        |[major, minor, patch]| format!("{major}.{minor}.{patch}"),
+    )
 }
 
 fn publish_summary(candidate: &PickerCandidate, now: DateTime<Utc>) -> String {
@@ -236,18 +296,24 @@ mod tests {
                 target: "studio/render".to_owned(),
                 host: "studio".to_owned(),
                 session: "render".to_owned(),
+                attached_version: Some([0, 2, 0]),
+                herdr_version: [0, 8, 2],
                 published_at: Some(now - chrono::Duration::minutes(4)),
             },
             SyncedSession {
                 target: "office/review".to_owned(),
                 host: "office".to_owned(),
                 session: "review".to_owned(),
+                attached_version: Some([0, 3, 1]),
+                herdr_version: [0, 9, 0],
                 published_at: Some(now - chrono::Duration::seconds(30)),
             },
             SyncedSession {
                 target: "office/deep-work".to_owned(),
                 host: "office".to_owned(),
                 session: "deep-work".to_owned(),
+                attached_version: Some([0, 3, 1]),
+                herdr_version: [0, 9, 0],
                 published_at: Some(now - chrono::Duration::seconds(30)),
             },
         ];
@@ -257,6 +323,8 @@ mod tests {
         let rows = input.lines().collect::<Vec<_>>();
 
         assert!(!header.contains("STATUS"));
+        assert!(header.contains("ATTACHED"));
+        assert!(header.contains("HERDR"));
         assert!(header.contains("LAST PUBLISH"));
         assert!(
             ["🟢", "🟡", "⚪"]
@@ -266,7 +334,11 @@ mod tests {
         assert!(rows[0].contains("office") && rows[0].contains("deep-work"));
         assert!(rows[1].contains("office") && rows[1].contains("review"));
         assert!(rows[2].contains("studio") && rows[2].contains("render"));
+        assert!(rows[0].contains("0.3.1"));
+        assert!(rows[0].contains("0.9.0"));
         assert!(rows[0].contains("30s ago"));
+        assert!(rows[2].contains("0.2.0"));
+        assert!(rows[2].contains("0.8.2"));
         assert!(rows[2].contains("4m ago"));
     }
 
@@ -276,6 +348,8 @@ mod tests {
         let candidate = PickerCandidate {
             host: "office".to_owned(),
             session: "future-edge".to_owned(),
+            attached_version: Some([0, 2, 0]),
+            herdr_version: Some([0, 8, 2]),
             published_at: Some(
                 now + chrono::Duration::seconds(MAX_FUTURE_CLOCK_SKEW_SECONDS)
                     + chrono::Duration::nanoseconds(1),
@@ -294,24 +368,32 @@ mod tests {
                 target: "alpha/unknown".to_owned(),
                 host: "alpha".to_owned(),
                 session: "unknown".to_owned(),
+                attached_version: None,
+                herdr_version: [0, 8, 2],
                 published_at: None,
             },
             SyncedSession {
                 target: "beta/future".to_owned(),
                 host: "beta".to_owned(),
                 session: "future".to_owned(),
+                attached_version: Some([0, 2, 0]),
+                herdr_version: [0, 8, 2],
                 published_at: Some(now + chrono::Duration::minutes(5)),
             },
             SyncedSession {
                 target: "gamma/fresh-boundary".to_owned(),
                 host: "gamma".to_owned(),
                 session: "fresh-boundary".to_owned(),
+                attached_version: Some([0, 2, 0]),
+                herdr_version: [0, 8, 2],
                 published_at: Some(now - chrono::Duration::seconds(180)),
             },
             SyncedSession {
                 target: "gamma/stale-boundary".to_owned(),
                 host: "gamma".to_owned(),
                 session: "stale-boundary".to_owned(),
+                attached_version: Some([0, 2, 0]),
+                herdr_version: [0, 8, 2],
                 published_at: Some(now - chrono::Duration::seconds(181)),
             },
         ];
@@ -327,6 +409,43 @@ mod tests {
     }
 
     #[test]
+    fn synchronized_list_displays_versions_without_picker_indices() {
+        let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let synchronized = [
+            SyncedSession {
+                target: "office/work".to_owned(),
+                host: "office".to_owned(),
+                session: "work".to_owned(),
+                attached_version: Some([0, 3, 1]),
+                herdr_version: [0, 9, 0],
+                published_at: Some(now - chrono::Duration::seconds(20)),
+            },
+            SyncedSession {
+                target: "legacy/build".to_owned(),
+                host: "legacy".to_owned(),
+                session: "build".to_owned(),
+                attached_version: None,
+                herdr_version: [0, 8, 2],
+                published_at: None,
+            },
+        ];
+
+        let rendered = render_synchronized_list_at(&synchronized, now).unwrap();
+        let rows = rendered.lines().collect::<Vec<_>>();
+
+        assert_eq!(rows.len(), 3, "{rendered}");
+        assert!(rows[0].contains("ATTACHED") && rows[0].contains("HERDR"));
+        assert!(rows[1].contains("legacy"));
+        assert!(rows[1].contains("unknown"));
+        assert!(rows[1].contains("0.8.2"));
+        assert!(rows[2].contains("office"));
+        assert!(rows[2].contains("0.3.1"));
+        assert!(rows[2].contains("0.9.0"));
+        assert!(rows[2].contains("20s ago"));
+        assert!(rows.iter().all(|row| !row.contains('\t')), "{rendered}");
+    }
+
+    #[test]
     fn picker_lists_local_sessions_first_and_keeps_selection_kinds_distinct() {
         let local = [Session::new(
             "local-work".to_owned(),
@@ -336,6 +455,8 @@ mod tests {
             target: "office/deep-work".to_owned(),
             host: "office".to_owned(),
             session: "deep-work".to_owned(),
+            attached_version: Some([0, 2, 0]),
+            herdr_version: [0, 8, 2],
             published_at: None,
         }];
         let candidates = picker_candidates(&local, &synchronized);

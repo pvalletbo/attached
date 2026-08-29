@@ -65,10 +65,24 @@ test("installer is idempotent and refuses every destructive or partial write", (
   assert.match(bindings, /SUPER \+ CTRL \+ SHIFT \+ H/);
   assert.match(bindings, /omarchy-shell shell toggle pvalletbo\.attached/);
 
+  const customizedOverlay = path.join(destination, "Overlay.qml");
+  const installedOverlay = fs.readFileSync(customizedOverlay, "utf8");
+  fs.writeFileSync(bindingsPath, bindings.replace("Attached sessions", "Changed locally"));
+  const modifiedBinding = runInstaller(env);
+  assert.notEqual(modifiedBinding.status, 0);
+  assert.match(modifiedBinding.stderr, /locally modified managed shortcut block/);
+  assert.equal(fs.readFileSync(customizedOverlay, "utf8"), installedOverlay);
+  fs.writeFileSync(bindingsPath, bindings);
+
   const checksumPath = path.join(destination, ".attached-plugin-checksums");
   const completeChecksums = fs.readFileSync(checksumPath, "utf8");
-  fs.writeFileSync(checksumPath, completeChecksums.split("\n")[0] + "\n");
-  const customizedOverlay = path.join(destination, "Overlay.qml");
+  const firstChecksum = completeChecksums.split("\n")[0] + "\n";
+  fs.writeFileSync(checksumPath, firstChecksum + firstChecksum);
+  const duplicateProvenance = runInstaller(env);
+  assert.notEqual(duplicateProvenance.status, 0);
+  assert.match(duplicateProvenance.stderr, /invalid plugin provenance/);
+
+  fs.writeFileSync(checksumPath, firstChecksum);
   fs.appendFileSync(customizedOverlay, "// local customization\n");
   const incompleteProvenance = runInstaller(env);
   assert.notEqual(incompleteProvenance.status, 0);
@@ -77,6 +91,14 @@ test("installer is idempotent and refuses every destructive or partial write", (
 
   fs.copyFileSync(path.join(integration, "pvalletbo.attached", "Overlay.qml"), customizedOverlay);
   fs.writeFileSync(checksumPath, completeChecksums);
+  const unexpectedPath = path.join(destination, "Unexpected.qml");
+  fs.writeFileSync(unexpectedPath, "// unmanaged\n");
+  const unexpected = runInstaller(env);
+  assert.notEqual(unexpected.status, 0);
+  assert.match(unexpected.stderr, /unmanaged entry/);
+  assert.match(fs.readFileSync(unexpectedPath, "utf8"), /unmanaged/);
+  fs.unlinkSync(unexpectedPath);
+
   fs.appendFileSync(customizedOverlay, "// another local customization\n");
   const modified = runInstaller(env);
   assert.notEqual(modified.status, 0);

@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 
-use crate::identity;
+use crate::{identity, local_encryption};
 
 const ATTACHED_BINARY: &str = "attached";
 const INSTALLER_URL: &str = "https://install.attached.sh";
@@ -43,7 +43,9 @@ pub fn uninstall(assume_yes: bool) -> Result<()> {
     }
 
     plan.execute()?;
-    eprintln!("Attached was uninstalled. All managed credentials and local state were deleted.");
+    eprintln!(
+        "Attached was uninstalled. Managed local state was deleted; any 1Password-managed encryption password was preserved for other computers and custom state directories."
+    );
     Ok(())
 }
 
@@ -150,6 +152,10 @@ impl UninstallPlan {
     }
 
     fn execute(&self) -> Result<()> {
+        self.execute_with_store(local_encryption::active_store())
+    }
+
+    fn execute_with_store(&self, store: &dyn local_encryption::MasterKeyStore) -> Result<()> {
         validate_executable_path(&self.executable)?;
         for cleanup_path in self
             .data_directories
@@ -166,30 +172,37 @@ impl UninstallPlan {
         }
         ensure_install_directory_is_writable(&self.executable)?;
 
-        for directory in &self.data_directories {
-            remove_path_if_present(directory).with_context(|| {
-                format!(
-                    "could not delete Attached credentials and state from {}",
-                    directory.display()
-                )
-            })?;
-        }
-        for file in &self.installer_files {
-            remove_path_if_present(file).with_context(|| {
-                format!(
-                    "could not delete installer metadata from {}",
-                    file.display()
-                )
-            })?;
-        }
+        local_encryption::with_key_coordination(|| {
+            for directory in &self.data_directories {
+                remove_path_if_present(directory).with_context(|| {
+                    format!(
+                        "could not delete Attached credentials and state from {}",
+                        directory.display()
+                    )
+                })?;
+            }
+            for file in &self.installer_files {
+                remove_path_if_present(file).with_context(|| {
+                    format!(
+                        "could not delete installer metadata from {}",
+                        file.display()
+                    )
+                })?;
+            }
 
-        fs::remove_file(&self.executable).with_context(|| {
-            format!(
-                "credentials and state were deleted, but the Attached executable could not be removed from {}; remove it manually",
-                self.executable.display()
-            )
-        })?;
-        Ok(())
+            // A 1Password-managed password can be shared by custom directories
+            // and other computers that uninstall cannot discover. Preserve it
+            // rather than stranding encrypted state outside the managed paths.
+            let _ = store;
+
+            fs::remove_file(&self.executable).with_context(|| {
+                format!(
+                    "credentials and state were deleted, but the Attached executable could not be removed from {}; remove it manually",
+                    self.executable.display()
+                )
+            })?;
+            Ok(())
+        })
     }
 }
 
@@ -257,12 +270,16 @@ fn confirm_uninstall(
 ) -> Result<bool> {
     writeln!(
         output,
-        "This permanently removes Attached and all managed credentials and local state:"
+        "This permanently removes Attached and its managed local state:"
     )?;
     writeln!(output, "  binary: {}", plan.executable.display())?;
     for directory in &plan.data_directories {
         writeln!(output, "  data:   {}", directory.display())?;
     }
+    writeln!(
+        output,
+        "Any 1Password-managed encryption password is preserved because other computers and custom state directories cannot be discovered."
+    )?;
     writeln!(
         output,
         "Exported account bundle files are not tracked and must be deleted separately."
@@ -289,6 +306,31 @@ mod tests {
     };
 
     use super::*;
+    use zeroize::Zeroizing;
+
+    #[derive(Default)]
+    struct RemovalStore {
+        remove_calls: std::sync::Mutex<usize>,
+        unavailable: bool,
+    }
+
+    impl crate::local_encryption::MasterKeyStore for RemovalStore {
+        fn load_or_create(
+            &self,
+            _directory: &crate::secure_state::StateDir,
+            _create: bool,
+        ) -> Result<Zeroizing<[u8; 32]>> {
+            unreachable!()
+        }
+
+        fn remove(&self) -> Result<()> {
+            *self.remove_calls.lock().unwrap() += 1;
+            if self.unavailable {
+                anyhow::bail!("synthetic backend detail")
+            }
+            Ok(())
+        }
+    }
 
     fn executable(root: &Path) -> PathBuf {
         let bin = root.join("bin");
@@ -410,12 +452,62 @@ mod tests {
             .unwrap(),
             installer_files: vec![fish_configuration.clone()],
         };
-        plan.execute().unwrap();
+        let store = RemovalStore::default();
+        plan.execute_with_store(&store).unwrap();
 
         assert!(!executable.exists());
         assert!(!state.exists());
         assert!(!xdg_state.exists());
         assert!(!fish_configuration.exists());
+        assert_eq!(*store.remove_calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn uninstall_preserves_shared_key_for_undiscoverable_custom_state() {
+        let root = crate::test_support::canonical_tempdir();
+        let executable = executable(root.path());
+        let managed_state = root.path().join("managed-state");
+        fs::create_dir(&managed_state).unwrap();
+        let custom_state = root.path().join("custom-state");
+        fs::create_dir(&custom_state).unwrap();
+        fs::write(custom_state.join("ciphertext"), b"still encrypted").unwrap();
+        let plan = UninstallPlan {
+            executable,
+            data_directories: vec![managed_state],
+            installer_files: Vec::new(),
+        };
+        let store = RemovalStore::default();
+
+        plan.execute_with_store(&store).unwrap();
+
+        assert_eq!(*store.remove_calls.lock().unwrap(), 0);
+        assert_eq!(
+            fs::read(custom_state.join("ciphertext")).unwrap(),
+            b"still encrypted"
+        );
+    }
+
+    #[test]
+    fn uninstall_does_not_touch_the_shared_one_password_item() {
+        let root = crate::test_support::canonical_tempdir();
+        let executable = executable(root.path());
+        let state = root.path().join("state");
+        fs::create_dir(&state).unwrap();
+        fs::write(state.join("ciphertext"), b"encrypted").unwrap();
+        let plan = UninstallPlan {
+            executable: executable.clone(),
+            data_directories: vec![state.clone()],
+            installer_files: Vec::new(),
+        };
+        let store = RemovalStore {
+            unavailable: true,
+            ..RemovalStore::default()
+        };
+
+        plan.execute_with_store(&store).unwrap();
+        assert!(!state.exists());
+        assert!(!executable.exists());
+        assert_eq!(*store.remove_calls.lock().unwrap(), 0);
     }
 
     #[test]
@@ -428,13 +520,12 @@ mod tests {
         let linked_state = root.path().join("linked-state");
         symlink(&external, &linked_state).unwrap();
 
-        UninstallPlan {
+        let plan = UninstallPlan {
             executable: executable.clone(),
             data_directories: vec![linked_state.clone()],
             installer_files: Vec::new(),
-        }
-        .execute()
-        .unwrap();
+        };
+        plan.execute_with_store(&RemovalStore::default()).unwrap();
 
         assert!(!executable.exists());
         assert!(!linked_state.exists());

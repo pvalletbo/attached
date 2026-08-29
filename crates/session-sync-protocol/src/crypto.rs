@@ -214,6 +214,7 @@ fn open_session_access_descriptor_with_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::canonical::AttachedVersion;
     use attached_tunnel_protocol::CapabilitySecret;
 
     const ENDPOINT: &str = "endpointacxfr74igmsbvsbnn73wcecg5vt3kbzncqwfrdiampuufwnhkublmaqacbuhi5dqhixs6zdfojyc43lffyxqcad7aaaadaai";
@@ -229,6 +230,7 @@ mod tests {
             timestamp(1_700_000_300),
             ENDPOINT.into(),
             CapabilitySecret::from_bytes([6; 32]),
+            AttachedVersion::new(0, 2, 0),
             version,
             vec!["alpha".into(), "build".into()],
         )

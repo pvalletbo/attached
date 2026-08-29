@@ -4,7 +4,10 @@ use anyhow::{Context as _, Result, ensure};
 use attached_session_sync_protocol::{
     account::{ApiKeyScope, RecordId},
     api::Envelope as ApiEnvelope,
-    canonical::{HerdrVersion as SessionAccessHerdrVersion, SessionAccessDescriptor},
+    canonical::{
+        AttachedVersion as SessionAccessAttachedVersion, HerdrVersion as SessionAccessHerdrVersion,
+        SessionAccessDescriptor,
+    },
     crypto::seal_session_access_descriptor,
     limits::validate_host_label,
 };
@@ -62,10 +65,12 @@ impl Publisher {
         sessions.dedup();
         let now = super::utc_now_seconds();
         let endpoint_ticket = EndpointTicket::from(endpoint).to_string();
+        let attached_version = current_attached_version()?;
         let input_digest = snapshot_digest(
             host_label,
             &endpoint_ticket,
             attach_capability,
+            attached_version,
             herdr_version,
             &sessions,
         );
@@ -93,6 +98,7 @@ impl Publisher {
             expires_at,
             endpoint_ticket,
             attach_capability.clone(),
+            attached_version,
             descriptor_version,
             sessions,
         )
@@ -117,6 +123,20 @@ impl Publisher {
     }
 }
 
+fn current_attached_version() -> Result<SessionAccessAttachedVersion> {
+    fn component(value: &str, name: &str) -> Result<u16> {
+        value
+            .parse()
+            .with_context(|| format!("Attached {name} version exceeds sync protocol"))
+    }
+
+    Ok(SessionAccessAttachedVersion::new(
+        component(env!("CARGO_PKG_VERSION_MAJOR"), "major")?,
+        component(env!("CARGO_PKG_VERSION_MINOR"), "minor")?,
+        component(env!("CARGO_PKG_VERSION_PATCH"), "patch")?,
+    ))
+}
+
 pub fn default_host_label(endpoint: &EndpointAddr) -> String {
     let id = endpoint.id.to_string();
     format!("host-{}", &id[..id.len().min(12)])
@@ -138,19 +158,23 @@ fn snapshot_digest(
     host_label: &str,
     endpoint_ticket: &str,
     attach_capability: &CapabilitySecret,
-    version: HerdrVersion,
+    attached_version: SessionAccessAttachedVersion,
+    herdr_version: HerdrVersion,
     sessions: &[String],
 ) -> [u8; 32] {
     let mut digest = Sha256::new();
-    digest.update(b"herdr/session-sync/publisher-input/v2\0");
+    digest.update(b"herdr/session-sync/publisher-input/v3\0");
     digest.update((host_label.len() as u32).to_be_bytes());
     digest.update(host_label.as_bytes());
     digest.update((endpoint_ticket.len() as u32).to_be_bytes());
     digest.update(endpoint_ticket.as_bytes());
     digest.update(attach_capability.to_bytes().as_ref());
-    digest.update(version.major().to_be_bytes());
-    digest.update(version.minor().to_be_bytes());
-    digest.update(version.patch().to_be_bytes());
+    digest.update(attached_version.major.to_be_bytes());
+    digest.update(attached_version.minor.to_be_bytes());
+    digest.update(attached_version.patch.to_be_bytes());
+    digest.update(herdr_version.major().to_be_bytes());
+    digest.update(herdr_version.minor().to_be_bytes());
+    digest.update(herdr_version.patch().to_be_bytes());
     for session in sessions {
         digest.update((session.len() as u32).to_be_bytes());
         digest.update(session.as_bytes());
@@ -188,12 +212,61 @@ mod tests {
     fn host_label_changes_affect_publication_memoization() {
         let endpoint = "endpoint-ticket";
         let capability = CapabilitySecret::from_bytes([7; 32]);
-        let version = HerdrVersion::new(1, 2, 3);
+        let attached_version = SessionAccessAttachedVersion::new(0, 2, 0);
+        let herdr_version = HerdrVersion::new(1, 2, 3);
         let sessions = vec!["work".to_owned()];
         assert_ne!(
-            snapshot_digest("office", endpoint, &capability, version, &sessions),
-            snapshot_digest("renamed", endpoint, &capability, version, &sessions)
+            snapshot_digest(
+                "office",
+                endpoint,
+                &capability,
+                attached_version,
+                herdr_version,
+                &sessions,
+            ),
+            snapshot_digest(
+                "renamed",
+                endpoint,
+                &capability,
+                attached_version,
+                herdr_version,
+                &sessions,
+            )
         );
+    }
+
+    #[test]
+    fn attached_version_changes_affect_publication_memoization() {
+        let endpoint = "endpoint-ticket";
+        let capability = CapabilitySecret::from_bytes([7; 32]);
+        let herdr_version = HerdrVersion::new(1, 2, 3);
+        let sessions = vec!["work".to_owned()];
+        assert_ne!(
+            snapshot_digest(
+                "office",
+                endpoint,
+                &capability,
+                SessionAccessAttachedVersion::new(0, 2, 0),
+                herdr_version,
+                &sessions,
+            ),
+            snapshot_digest(
+                "office",
+                endpoint,
+                &capability,
+                SessionAccessAttachedVersion::new(0, 3, 0),
+                herdr_version,
+                &sessions,
+            )
+        );
+    }
+
+    #[test]
+    fn package_version_is_publishable() {
+        let version = current_attached_version().unwrap();
+        assert_eq!(version.major.to_string(), env!("CARGO_PKG_VERSION_MAJOR"));
+        assert_eq!(version.minor.to_string(), env!("CARGO_PKG_VERSION_MINOR"));
+        assert_eq!(version.patch.to_string(), env!("CARGO_PKG_VERSION_PATCH"));
     }
 
     #[test]

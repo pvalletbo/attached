@@ -88,12 +88,16 @@ mod tests {
                 target: "office/deep work".to_owned(),
                 host: "office".to_owned(),
                 session: "deep work".to_owned(),
+                attached_version: Some([0, 3, 1]),
+                herdr_version: [0, 9, 0],
                 published_at: Some(Utc.with_ymd_and_hms(2026, 8, 29, 12, 34, 56).unwrap()),
             },
             SyncedSession {
                 target: "travel/shell".to_owned(),
                 host: "travel".to_owned(),
                 session: "shell".to_owned(),
+                attached_version: None,
+                herdr_version: [0, 8, 2],
                 published_at: None,
             },
         ];

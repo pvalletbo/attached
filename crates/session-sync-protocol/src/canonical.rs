@@ -45,6 +45,22 @@ impl fmt::Display for SessionAccessError {
 impl std::error::Error for SessionAccessError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AttachedVersion {
+    pub major: u16,
+    pub minor: u16,
+    pub patch: u16,
+}
+impl AttachedVersion {
+    pub const fn new(major: u16, minor: u16, patch: u16) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HerdrVersion {
     pub major: u16,
     pub minor: u16,
@@ -66,6 +82,7 @@ pub struct SessionAccessDescriptor {
     expires_at: DateTime<Utc>,
     endpoint_ticket: String,
     attach_capability: CapabilitySecret,
+    attached_version: Option<AttachedVersion>,
     herdr_version: HerdrVersion,
     sessions: Vec<String>,
 }
@@ -84,12 +101,50 @@ impl fmt::Debug for SessionAccessDescriptor {
 }
 
 impl SessionAccessDescriptor {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         host_label: String,
         issued_at: DateTime<Utc>,
         expires_at: DateTime<Utc>,
         endpoint_ticket: String,
         attach_capability: CapabilitySecret,
+        attached_version: AttachedVersion,
+        herdr_version: HerdrVersion,
+        sessions: Vec<String>,
+    ) -> Result<Self, SessionAccessError> {
+        Self::new_with_optional_attached_version(
+            host_label,
+            issued_at,
+            expires_at,
+            endpoint_ticket,
+            attach_capability,
+            Some(attached_version),
+            herdr_version,
+            sessions,
+        )
+    }
+
+    fn from_wire(mut wire: WireSessionAccessDescriptor) -> Result<Self, SessionAccessError> {
+        Self::new_with_optional_attached_version(
+            std::mem::take(&mut wire.host_label),
+            wire.issued_at,
+            wire.expires_at,
+            std::mem::take(&mut wire.endpoint_ticket),
+            CapabilitySecret::from_bytes(wire.attach_capability),
+            wire.attached_version,
+            wire.herdr_version,
+            std::mem::take(&mut wire.sessions),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_optional_attached_version(
+        host_label: String,
+        issued_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+        endpoint_ticket: String,
+        attach_capability: CapabilitySecret,
+        attached_version: Option<AttachedVersion>,
         herdr_version: HerdrVersion,
         sessions: Vec<String>,
     ) -> Result<Self, SessionAccessError> {
@@ -99,23 +154,12 @@ impl SessionAccessDescriptor {
             expires_at,
             endpoint_ticket,
             attach_capability,
+            attached_version,
             herdr_version,
             sessions,
         };
         descriptor.validate()?;
         Ok(descriptor)
-    }
-
-    fn from_wire(mut wire: WireSessionAccessDescriptor) -> Result<Self, SessionAccessError> {
-        Self::new(
-            std::mem::take(&mut wire.host_label),
-            wire.issued_at,
-            wire.expires_at,
-            std::mem::take(&mut wire.endpoint_ticket),
-            CapabilitySecret::from_bytes(wire.attach_capability),
-            wire.herdr_version,
-            std::mem::take(&mut wire.sessions),
-        )
     }
 
     fn validate(&self) -> Result<(), SessionAccessError> {
@@ -183,6 +227,9 @@ impl SessionAccessDescriptor {
     pub const fn attach_capability_bytes(&self) -> [u8; 32] {
         self.attach_capability.to_bytes()
     }
+    pub const fn attached_version(&self) -> Option<AttachedVersion> {
+        self.attached_version
+    }
     pub const fn herdr_version(&self) -> HerdrVersion {
         self.herdr_version
     }
@@ -196,7 +243,15 @@ pub fn encode_session_access_descriptor(
 ) -> Result<Vec<u8>, SessionAccessError> {
     descriptor.validate()?;
     let mut out = Vec::with_capacity(512);
-    put_head(&mut out, 5, 7);
+    put_head(
+        &mut out,
+        5,
+        if descriptor.attached_version.is_some() {
+            8
+        } else {
+            7
+        },
+    );
     put_uint(&mut out, 1);
     put_text(&mut out, &descriptor.host_label);
     put_uint(&mut out, 2);
@@ -218,6 +273,13 @@ pub fn encode_session_access_descriptor(
     for session in &descriptor.sessions {
         put_text(&mut out, session);
     }
+    if let Some(version) = descriptor.attached_version {
+        put_uint(&mut out, 8);
+        put_head(&mut out, 4, 3);
+        put_uint(&mut out, u64::from(version.major));
+        put_uint(&mut out, u64::from(version.minor));
+        put_uint(&mut out, u64::from(version.patch));
+    }
     if out.len() > MAX_CANONICAL_SESSION_ACCESS_DESCRIPTOR_LEN {
         return Err(SessionAccessError::Limit);
     }
@@ -231,7 +293,8 @@ pub fn decode_session_access_descriptor(
         return Err(SessionAccessError::Limit);
     }
     let mut decoder = Decoder::new(input);
-    if decoder.head(5)? != 7 {
+    let field_count = decoder.head(5)?;
+    if !matches!(field_count, 7 | 8) {
         return Err(SessionAccessError::Malformed);
     }
     decoder.key(1)?;
@@ -262,6 +325,18 @@ pub fn decode_session_access_descriptor(
     for _ in 0..session_count {
         sessions.push(decoder.text(1, MAX_SESSION_NAME_LEN)?.to_owned());
     }
+    let attached_version = if field_count == 8 {
+        decoder.key(8)?;
+        if decoder.head(4)? != 3 {
+            return Err(SessionAccessError::Malformed);
+        }
+        let major = u16::try_from(decoder.uint()?).map_err(|_| SessionAccessError::InvalidField)?;
+        let minor = u16::try_from(decoder.uint()?).map_err(|_| SessionAccessError::InvalidField)?;
+        let patch = u16::try_from(decoder.uint()?).map_err(|_| SessionAccessError::InvalidField)?;
+        Some(AttachedVersion::new(major, minor, patch))
+    } else {
+        None
+    };
     if decoder.position != input.len() {
         return Err(SessionAccessError::Malformed);
     }
@@ -271,6 +346,7 @@ pub fn decode_session_access_descriptor(
         expires_at,
         endpoint_ticket,
         attach_capability,
+        attached_version,
         herdr_version: HerdrVersion::new(major, minor, patch),
         sessions,
     })?;
@@ -286,6 +362,7 @@ struct WireSessionAccessDescriptor {
     expires_at: DateTime<Utc>,
     endpoint_ticket: String,
     attach_capability: [u8; 32],
+    attached_version: Option<AttachedVersion>,
     herdr_version: HerdrVersion,
     sessions: Vec<String>,
 }
