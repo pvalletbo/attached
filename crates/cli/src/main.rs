@@ -15,6 +15,7 @@ mod publish_account;
 mod secure_state;
 mod server;
 mod session;
+mod session_catalog;
 mod session_picker;
 mod sync;
 mod tunnel;

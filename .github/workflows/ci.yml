@@ -29,6 +29,12 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      - name: Install Node.js for Omarchy integration tests
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - name: Test the Omarchy integration
+        run: node --test integrations/omarchy/tests/*.test.js integrations/omarchy/pvalletbo.attached/tests/*.test.js
       - name: Install Linux build prerequisites
         run: |
           sudo apt-get update

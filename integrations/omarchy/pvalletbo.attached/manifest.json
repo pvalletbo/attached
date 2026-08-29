@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "id": "pvalletbo.attached",
+  "name": "Attached Sessions",
+  "version": "1.0.0",
+  "author": "Pol Valletbó Montfort",
+  "description": "Search synchronized Attached sessions and open one in a terminal.",
+  "kinds": ["overlay"],
+  "entryPoints": {
+    "overlay": "Overlay.qml"
+  }
+}

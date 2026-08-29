@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::{
     herdr_version, identity, installation, publish_account, secure_state, server, session,
+    session_catalog,
     session_picker::{self, SessionSelection},
     sync,
 };
@@ -71,6 +72,21 @@ enum Command {
         /// guidance to update local Herdr and is never mutated by this option.
         #[arg(long)]
         upgrade_remote: bool,
+
+        /// Override persistent state location (primarily for testing).
+        #[arg(long, hide = true)]
+        state_dir: Option<PathBuf>,
+    },
+
+    /// List synchronized Herdr sessions for desktop integrations.
+    Sessions {
+        /// Emit a stable machine-readable JSON array.
+        #[arg(long, required = true)]
+        json: bool,
+
+        /// Path to the local Herdr executable used for version compatibility.
+        #[arg(long, default_value = "herdr")]
+        herdr_bin: PathBuf,
 
         /// Override persistent state location (primarily for testing).
         #[arg(long, hide = true)]
@@ -271,6 +287,21 @@ impl Cli {
                     }
                 }
             }
+            Command::Sessions {
+                json,
+                herdr_bin,
+                state_dir,
+            } => {
+                debug_assert!(json, "Clap requires --json");
+                let state_dir = resolved_state_dir(state_dir)?;
+                let refreshed = session_catalog::refresh(&state_dir, &herdr_bin).await?;
+                for warning in refresh_warnings_to_display(&refreshed.warnings, self.verbose) {
+                    eprintln!("Warning: {warning}");
+                }
+                let stdout = std::io::stdout();
+                session_catalog::write_json(stdout.lock(), &refreshed.sessions)?;
+                Ok(0)
+            }
             Command::Update => {
                 installation::update()?;
                 Ok(0)
@@ -347,6 +378,7 @@ mod tests {
             ],
             vec!["attached", "attach"],
             vec!["attached", "attach", "office/work"],
+            vec!["attached", "sessions", "--json"],
             vec!["attached", "update"],
             vec!["attached", "upgrade"],
             vec!["attached", "uninstall"],
@@ -358,6 +390,7 @@ mod tests {
         for removed in ["connect", "remote", "session", "admin", "sync"] {
             assert!(Cli::try_parse_from(["attached", removed]).is_err());
         }
+        assert!(Cli::try_parse_from(["attached", "sessions"]).is_err());
         assert!(Cli::try_parse_from(["attached", "account", "import", "--bundle-stdin"]).is_err());
     }
 
@@ -454,7 +487,14 @@ mod tests {
     #[test]
     fn help_lists_the_simplified_and_lifecycle_commands() {
         let help = Cli::command().render_long_help().to_string();
-        for command in ["account", "serve", "attach", "update", "uninstall"] {
+        for command in [
+            "account",
+            "serve",
+            "attach",
+            "sessions",
+            "update",
+            "uninstall",
+        ] {
             assert!(help.contains(command), "{help}");
         }
         for removed in ["connect", "remote", "session", "admin", "sync"] {
