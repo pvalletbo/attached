@@ -18,6 +18,7 @@ dist = true
 
 [dependencies]
 anyhow.workspace = true
+argon2.workspace = true
 chrono = { workspace = true, features = ["clock"] }
 clap.workspace = true
 fs4.workspace = true
@@ -26,7 +27,10 @@ attached-session-sync-protocol = { workspace = true, features = ["session-access
 attached-tunnel-protocol.workspace = true
 iroh.workspace = true
 iroh-tickets.workspace = true
+chacha20poly1305.workspace = true
+getrandom.workspace = true
 reqwest.workspace = true
+rpassword.workspace = true
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
