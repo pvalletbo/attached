@@ -5,7 +5,8 @@ use attached_session_sync_protocol::account::ApiKeyScope;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::{
-    herdr_version, identity, installation, publish_account, secure_state, server, session,
+    herdr_version, identity, installation, local_encryption, publish_account, secure_state, server,
+    session,
     session_picker::{self, SessionSelection},
     sync,
 };
@@ -19,6 +20,10 @@ pub struct Cli {
     /// Increase diagnostic verbosity (`-v` for lifecycle, `-vv` for debug details).
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count, global = true)]
     verbose: u8,
+
+    /// Have 1Password generate and store the encryption password instead of prompting for one.
+    #[arg(long, global = true)]
+    use_1password: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -146,6 +151,7 @@ impl Cli {
     }
 
     pub async fn run(self) -> Result<i32> {
+        local_encryption::configure_use_one_password(self.use_1password);
         match self.command {
             Command::Account { command } => {
                 match command {
@@ -478,6 +484,23 @@ mod tests {
             bundle_file,
             Some(PathBuf::from("/run/secrets/attached-publish"))
         );
+    }
+
+    #[test]
+    fn user_password_is_default_and_one_password_is_explicit_and_global() {
+        let default = Cli::try_parse_from(["attached", "attach"]).unwrap();
+        assert!(!default.use_1password);
+
+        let before = Cli::try_parse_from(["attached", "--use-1password", "serve"]).unwrap();
+        assert!(before.use_1password);
+
+        let after = Cli::try_parse_from(["attached", "attach", "--use-1password"]).unwrap();
+        assert!(after.use_1password);
+
+        assert!(Cli::try_parse_from(["attached", "attach", "--local-unsecure-storage"]).is_err());
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--use-1password"), "{help}");
+        assert!(help.contains("generate and store"), "{help}");
     }
 
     #[test]

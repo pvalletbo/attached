@@ -150,7 +150,7 @@ mod tests {
     }
 
     #[test]
-    fn bundle_file_is_used_when_the_environment_is_absent() {
+    fn bundle_file_is_encrypted_when_the_environment_is_absent() {
         let root = crate::test_support::canonical_tempdir();
         let bundle = fixture_publish_bundle(&root.path().join("owner"));
         let bundle_file = root.path().join("publish.bundle");
@@ -163,6 +163,12 @@ mod tests {
         .unwrap();
 
         assert!(sync::state::load_account(&state, ApiKeyScope::Publish).is_ok());
+        let stored = std::fs::read(state.join("sync-account.bundle")).unwrap();
+        assert!(
+            crate::local_encryption::is_envelope(&stored),
+            "publish account state was not encrypted"
+        );
+        assert_ne!(stored.as_slice(), bundle.as_bytes());
     }
 
     #[test]

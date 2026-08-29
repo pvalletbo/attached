@@ -439,7 +439,7 @@ exit 7
 
     #[test]
     fn starts_headless_default_server_when_no_session_is_active() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::canonical_tempdir();
         let ready = root.path().join("ready");
         let pid_file = root.path().join("pid");
         let stop = root.path().join("stop");
@@ -496,7 +496,7 @@ exit 9
             );
         }
 
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::canonical_tempdir();
         let ready = root.path().join("ready");
         let pid_file = root.path().join("pid");
         let stop = root.path().join("stop");
@@ -793,7 +793,7 @@ exit 9
 
     #[test]
     fn default_session_deadline_bounds_final_discovery_and_reaps_every_process_group() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::canonical_tempdir();
         let first_discovery = root.path().join("first-discovery");
         let discovery_pid = root.path().join("discovery-pid");
         let discovery_child_pid = root.path().join("discovery-child-pid");
