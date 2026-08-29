@@ -35,13 +35,23 @@ jobs:
           node-version: 22
       - name: Test the Omarchy integration
         run: node --test integrations/omarchy/tests/*.test.js integrations/omarchy/pvalletbo.attached/tests/*.test.js
-      - name: Install Linux build prerequisites
+      - name: Install Linux build and QML validation prerequisites
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
             build-essential \
             cmake \
-            pkg-config
+            pkg-config \
+            qt6-declarative-dev-tools
+      - name: Check Omarchy QML syntax
+        run: |
+          log="$RUNNER_TEMP/qmllint.log"
+          if ! /usr/lib/qt6/bin/qmllint \
+            integrations/omarchy/pvalletbo.attached/Overlay.qml \
+            >"$log" 2>&1; then
+            cat "$log"
+            exit 1
+          fi
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:

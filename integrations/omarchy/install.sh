@@ -151,6 +151,50 @@ if [[ $begin_count -eq 1 ]]; then
   fi
 fi
 
+# Snapshot both managed paths before the first write. Any copy, rescan, or
+# enable failure restores their byte-exact pre-install state.
+backup_root=$(mktemp -d "${TMPDIR:-/tmp}/attached-omarchy-install.XXXXXX")
+destination_existed=false
+bindings_existed=false
+if [[ -d "$destination" ]]; then
+  destination_existed=true
+  cp -pR "$destination" "$backup_root/plugin"
+fi
+if [[ -f "$bindings" ]]; then
+  bindings_existed=true
+  cp -p "$bindings" "$backup_root/bindings.lua"
+fi
+transaction_committed=false
+
+finish_install() {
+  status=$?
+  trap - EXIT INT TERM
+  if [[ $transaction_committed != true ]]; then
+    set +e
+    rm -rf -- "$destination"
+    if [[ $destination_existed == true ]]; then
+      install -d -m 0755 "$(dirname -- "$destination")"
+      cp -pR "$backup_root/plugin" "$destination"
+    fi
+
+    rm -rf -- "$bindings"
+    if [[ $bindings_existed == true ]]; then
+      install -d -m 0755 "$(dirname -- "$bindings")"
+      cp -p "$backup_root/bindings.lua" "$bindings"
+    fi
+
+    # Reconcile the running registry with the restored filesystem. Rollback
+    # must preserve the original failure even if the shell is unavailable.
+    omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+    printf 'Installation failed; restored the previous plugin and bindings.\n' >&2
+  fi
+  rm -rf -- "$backup_root"
+  exit "$status"
+}
+trap finish_install EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 install -d -m 0755 "$destination"
 for file in "${plugin_files[@]}"; do
   install -m 0644 "$source_dir/$file" "$destination/$file"
@@ -169,4 +213,6 @@ fi
 
 omarchy-shell shell rescanPlugins
 omarchy plugin enable pvalletbo.attached
+transaction_committed=true
 printf 'Installed Attached picker. Press Super+Ctrl+Shift+H to open it.\n'
+printf 'Attached state is unlocked through 1Password; press Ctrl+O in the picker if needed.\n'

@@ -19,14 +19,18 @@ test("manifest declares a loadable third-party overlay", () => {
 test("overlay supports safe catalog loading, keyboard and pointer activation", () => {
   const qml = fs.readFileSync(path.join(plugin, "Overlay.qml"), "utf8");
   for (const contract of [
-    'command: ["attached", "sessions", "--json"]',
+    'command: ["attached", "--use-1password", "sessions", "--json"]',
+    "stderr: StdioCollector",
     "SessionModel.parseCatalog",
     "SessionModel.filterSessions",
+    "SessionModel.catalogErrorMessage",
     "SessionModel.terminalCommand",
     "Quickshell.execDetached",
+    '["omarchy-launch-1password"]',
     "Qt.Key_Up",
     "Qt.Key_Down",
     "Qt.Key_Return",
+    "Qt.Key_O",
     "onClicked:",
     "anchors.right: parent.right",
     "forceActiveFocus()",

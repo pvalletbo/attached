@@ -83,14 +83,28 @@ function filterSessions(sessions, query) {
   });
 }
 
+function catalogErrorMessage(raw, exitCode) {
+  var detail = String(raw || "").toLocaleLowerCase();
+  if (detail.indexOf("1password") !== -1) {
+    return "Open or unlock 1Password (Ctrl+O), then press Ctrl+R. If it still fails, run `attached --use-1password sessions --json` in a terminal for details.";
+  }
+  if (detail.indexOf("encrypted local secret authentication failed") !== -1) {
+    return "This Attached state could not be unlocked with 1Password. Run `attached --use-1password sessions --json` in a terminal for setup details.";
+  }
+
+  return "Attached could not refresh sessions (exit " + exitCode
+    + "). Run `attached --use-1password sessions --json` in a terminal for details, then press Ctrl+R.";
+}
+
 function terminalCommand(session) {
   if (!session || typeof session.target !== "string" || session.target.length === 0)
     throw new Error("cannot launch a session without a session target");
 
   // Quickshell receives an argv array, not shell text. Keeping the externally
   // supplied target in one element prevents quotes or metacharacters from being
-  // interpreted by a shell.
-  return ["omarchy-launch-terminal", "attached", "attach", session.target];
+  // interpreted by a shell. 1Password provides noninteractive state unlock for
+  // both the background catalog process and the newly launched terminal.
+  return ["omarchy-launch-terminal", "attached", "--use-1password", "attach", session.target];
 }
 
 if (typeof module !== "undefined")
@@ -98,5 +112,6 @@ if (typeof module !== "undefined")
     parseCatalog: parseCatalog,
     fuzzyScore: fuzzyScore,
     filterSessions: filterSessions,
+    catalogErrorMessage: catalogErrorMessage,
     terminalCommand: terminalCommand
   };

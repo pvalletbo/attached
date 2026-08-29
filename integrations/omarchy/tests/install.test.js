@@ -30,7 +30,7 @@ test("installer is idempotent and refuses every destructive or partial write", (
   for (const command of ["omarchy", "omarchy-shell"]) {
     fs.writeFileSync(
       path.join(bin, command),
-      `#!/bin/sh\nprintf '%s\\n' "${command} $*" >> "$ATTACHED_TEST_LOG"\n`,
+      `#!/bin/sh\ninvocation="${command} $*"\nprintf '%s\\n' "$invocation" >> "$ATTACHED_TEST_LOG"\nif [ "$ATTACHED_TEST_FAIL_COMMAND" = "$invocation" ]; then exit 42; fi\n`,
       { mode: 0o755 }
     );
   }
@@ -51,7 +51,22 @@ test("installer is idempotent and refuses every destructive or partial write", (
   assert.equal(fs.existsSync(destination), false, "preflight failure must not install files");
   assert.equal(fs.readFileSync(bindingsPath, "utf8"), partialBindings);
 
-  fs.writeFileSync(bindingsPath, "-- existing user binding\n");
+  const cleanBindings = "-- existing user binding\n";
+  fs.writeFileSync(bindingsPath, cleanBindings);
+  for (const failedCommand of [
+    "omarchy-shell shell rescanPlugins",
+    "omarchy plugin enable pvalletbo.attached"
+  ]) {
+    const failed = runInstaller({
+      ...env,
+      ATTACHED_TEST_FAIL_COMMAND: failedCommand
+    });
+    assert.notEqual(failed.status, 0);
+    assert.match(failed.stderr, /restored the previous plugin and bindings/);
+    assert.equal(fs.existsSync(destination), false, "failed install must remove plugin files");
+    assert.equal(fs.readFileSync(bindingsPath, "utf8"), cleanBindings);
+  }
+
   for (let run = 0; run < 2; run++) {
     const installed = runInstaller(env);
     assert.equal(installed.status, 0, installed.stderr);

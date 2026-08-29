@@ -4,12 +4,39 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const SessionModel = require("../SessionModel.js");
 
-test("terminalCommand preserves the target as one argv element", () => {
+test("terminalCommand uses 1Password and preserves the target as one argv element", () => {
   assert.deepEqual(
     SessionModel.terminalCommand({ target: "travel/shell; touch /tmp/nope" }),
-    ["omarchy-launch-terminal", "attached", "attach", "travel/shell; touch /tmp/nope"]
+    [
+      "omarchy-launch-terminal",
+      "attached",
+      "--use-1password",
+      "attach",
+      "travel/shell; touch /tmp/nope"
+    ]
   );
   assert.throws(() => SessionModel.terminalCommand(null), /session target/);
+});
+
+test("catalog errors give actionable 1Password guidance without echoing stderr", () => {
+  assert.match(
+    SessionModel.catalogErrorMessage(
+      "Error: 1Password is unavailable; unlock or sign in with the op CLI and retry",
+      1
+    ),
+    /Open or unlock 1Password.*Ctrl\+O.*Ctrl\+R/
+  );
+  assert.match(
+    SessionModel.catalogErrorMessage(
+      "Error: encrypted local secret authentication failed",
+      1
+    ),
+    /could not be unlocked with 1Password.*attached --use-1password sessions --json/
+  );
+
+  const generic = SessionModel.catalogErrorMessage("private backend detail", 7);
+  assert.match(generic, /exit 7.*attached --use-1password sessions --json/);
+  assert.doesNotMatch(generic, /private backend detail/);
 });
 
 test("filterSessions performs stable case-insensitive fuzzy ranking", () => {

@@ -19,8 +19,10 @@ Item {
   property bool requestActive: false
   property bool catalogExited: false
   property bool catalogCollected: false
+  property bool catalogErrorCollected: false
   property int catalogExitCode: -1
   property string catalogOutput: ""
+  property string catalogErrorOutput: ""
   property string errorText: ""
   property var sessions: []
   property var filteredSessions: []
@@ -71,22 +73,31 @@ Item {
     root.requestActive = true
     root.catalogExited = false
     root.catalogCollected = false
+    root.catalogErrorCollected = false
     root.catalogExitCode = -1
     root.catalogOutput = ""
+    root.catalogErrorOutput = ""
     root.errorText = ""
     catalogProcess.running = true
     refreshDeadline.restart()
   }
 
+  function openOnePassword() {
+    Quickshell.execDetached(["omarchy-launch-1password"])
+    console.info("attached-picker event=one_password_open_requested")
+  }
+
   function finishCatalogLoad() {
-    if (!root.requestActive || !root.catalogExited || !root.catalogCollected)
+    if (!root.requestActive || !root.catalogExited || !root.catalogCollected
+        || !root.catalogErrorCollected)
       return
 
     root.requestActive = false
     root.loading = false
     refreshDeadline.stop()
     if (root.catalogExitCode !== 0) {
-      root.errorText = "Attached could not refresh sessions (exit " + root.catalogExitCode + "). Press Ctrl+R to retry."
+      root.errorText = SessionModel.catalogErrorMessage(root.catalogErrorOutput, root.catalogExitCode)
+      root.catalogErrorOutput = ""
       console.warn("attached-picker event=catalog_failed exit_code=" + root.catalogExitCode)
       return
     }
@@ -138,12 +149,22 @@ Item {
 
   Process {
     id: catalogProcess
-    command: ["attached", "sessions", "--json"]
+    // Omarchy Shell has no interactive terminal for password prompts. 1Password
+    // unlocks encrypted Attached state without putting secrets in argv or env.
+    command: ["attached", "--use-1password", "sessions", "--json"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
         root.catalogOutput = text
         root.catalogCollected = true
+        root.finishCatalogLoad()
+      }
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.catalogErrorOutput = text
+        root.catalogErrorCollected = true
         root.finishCatalogLoad()
       }
     }
@@ -165,7 +186,7 @@ Item {
         return
       root.requestActive = false
       root.loading = false
-      root.errorText = "Attached took too long to refresh sessions. Press Ctrl+R to retry."
+      root.errorText = "Attached took too long to refresh sessions. Unlock 1Password (Ctrl+O to open it), then press Ctrl+R."
       if (catalogProcess.running)
         catalogProcess.running = false
       console.warn("attached-picker event=catalog_timeout")
@@ -257,6 +278,9 @@ Item {
                 event.accepted = true
               } else if (event.key === Qt.Key_R && (event.modifiers & Qt.ControlModifier)) {
                 root.refreshCatalog()
+                event.accepted = true
+              } else if (event.key === Qt.Key_O && (event.modifiers & Qt.ControlModifier)) {
+                root.openOnePassword()
                 event.accepted = true
               }
             }
