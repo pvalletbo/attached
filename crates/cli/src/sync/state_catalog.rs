@@ -1306,13 +1306,13 @@ mod tests {
         assert_eq!(listed.sessions[0].herdr_version, [1, 2, 3]);
 
         let catalog_path = state_dir.join(CATALOG_FILE);
-        let encoded = std::fs::read(&catalog_path).unwrap();
-        let mut encoded: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
-        encoded["records"][0]
+        let mut legacy: serde_json::Value =
+            serde_json::to_value(&catalog).expect("catalog fixture serializes");
+        legacy["records"][0]
             .as_object_mut()
             .unwrap()
             .remove("attached_version");
-        std::fs::write(&catalog_path, serde_json::to_vec(&encoded).unwrap()).unwrap();
+        std::fs::write(&catalog_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
 
         let legacy = sessions_excluding_local_endpoints(
             &state_dir,

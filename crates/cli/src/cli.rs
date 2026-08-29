@@ -1,8 +1,7 @@
 use std::{
-    io::{BufRead, Read, Write as _, stdin, stdout},
+    io::{Write as _, stdout},
     path::PathBuf,
 };
-use std::path::PathBuf;
 
 use anyhow::{Context, Result, ensure};
 use attached_session_sync_protocol::account::ApiKeyScope;
