@@ -45,8 +45,15 @@ jobs:
             qt6-declarative-dev-tools
       - name: Check Omarchy QML syntax
         run: |
+          qmllint=/usr/lib/qt6/bin/qmllint
+          # Quickshell and Omarchy types only exist on the target desktop. Disable
+          # analyzer categories while retaining qmllint's core syntax parser.
+          args=(--ignore-settings --max-warnings -1)
+          while read -r category; do
+            args+=("$category" disable)
+          done < <("$qmllint" --help-all 2>/dev/null | awk '/^[[:space:]]+--[a-zA-Z.-]+ <level>/ {print $1}')
           log="$RUNNER_TEMP/qmllint.log"
-          if ! /usr/lib/qt6/bin/qmllint \
+          if ! "$qmllint" "${args[@]}" \
             integrations/omarchy/pvalletbo.attached/Overlay.qml \
             >"$log" 2>&1; then
             cat "$log"
