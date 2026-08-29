@@ -1,6 +1,6 @@
 use attached_session_sync_protocol::crypto::open_session_access_descriptor_cursorless;
 use attached_session_sync_protocol::{
-    Envelope, HerdrVersion, SessionAccessDescriptor, VerificationContext,
+    AttachedVersion, Envelope, HerdrVersion, SessionAccessDescriptor, VerificationContext,
     decode_session_access_descriptor, derive_session_access_descriptor_key,
     encode_session_access_descriptor, envelope_aad, seal_session_access_descriptor,
 };
@@ -14,7 +14,8 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 
 const ENDPOINT: &str = "endpointacxfr74igmsbvsbnn73wcecg5vt3kbzncqwfrdiampuufwnhkublmaqacbuhi5dqhixs6zdfojyc43lffyxqcad7aaaadaai";
-const CBOR: &str = "a701666f6666696365021a6553f100031a6553f22c047868656e64706f696e746163786672373469676d73627673626e6e37337763656367357674336b627a6e63717766726469616d70757566776e686b75626c6d617161636275686935647168697873367a64666f6a796334336c666679787163616437616161616461616905582006060606060606060606060606060606060606060606060606060606060606060683010203078265616c706861656275696c64";
+const CBOR: &str = "a801666f6666696365021a6553f100031a6553f22c047868656e64706f696e746163786672373469676d73627673626e6e37337763656367357674336b627a6e63717766726469616d70757566776e686b75626c6d617161636275686935647168697873367a64666f6a796334336c666679787163616437616161616461616905582006060606060606060606060606060606060606060606060606060606060606060683010203078265616c706861656275696c640883040506";
+const LEGACY_CBOR: &str = "a701666f6666696365021a6553f100031a6553f22c047868656e64706f696e746163786672373469676d73627673626e6e37337763656367357674336b627a6e63717766726469616d70757566776e686b75626c6d617161636275686935647168697873367a64666f6a796334336c666679787163616437616161616461616905582006060606060606060606060606060606060606060606060606060606060606060683010203078265616c706861656275696c64";
 const HKDF_KEY: &str = "d2ed6370c91c23ee5ea4aa749e15716bfb2a6c406572cf74ee83d47f778261bd";
 const AAD: &str = "68657264722f73657373696f6e2d73796e632f656e76656c6f70652d6161642f76310001010101010101010101010101010101020202020202020202020202020202020001";
 
@@ -45,6 +46,7 @@ fn fixture() -> SessionAccessDescriptor {
         timestamp(1_700_000_300),
         ENDPOINT.into(),
         CapabilitySecret::from_bytes([6; 32]),
+        AttachedVersion::new(4, 5, 6),
         HerdrVersion::new(1, 2, 3),
         vec!["alpha".into(), "build".into()],
     )
@@ -60,9 +62,24 @@ fn session_access_descriptor_matches_the_frozen_canonical_cbor() {
     assert_eq!(decoded.host_label(), "office");
     assert_eq!(decoded.endpoint_ticket(), ENDPOINT);
     assert_eq!(decoded.attach_capability_bytes(), [6; 32]);
+    assert_eq!(
+        decoded.attached_version(),
+        Some(AttachedVersion::new(4, 5, 6))
+    );
     assert_eq!(decoded.sessions(), ["alpha", "build"]);
     assert_eq!(
         encode_session_access_descriptor(&decoded).expect("re-encode"),
+        expected
+    );
+}
+
+#[test]
+fn legacy_descriptor_without_attached_version_remains_canonical() {
+    let expected = decode_hex(LEGACY_CBOR);
+    let decoded = decode_session_access_descriptor(&expected).expect("decode legacy descriptor");
+    assert_eq!(decoded.attached_version(), None);
+    assert_eq!(
+        encode_session_access_descriptor(&decoded).expect("re-encode legacy descriptor"),
         expected
     );
 }
