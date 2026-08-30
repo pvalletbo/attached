@@ -40,12 +40,6 @@ checksum = "sha256"
 github-attestations = true
 github-attestations-phase = "host"
 
-# Build prerequisites for GNU/Linux targets.
-[dist.dependencies.apt]
-build-essential = "*"
-cmake = "*"
-pkg-config = "*"
-
 # Pin generated workflow actions to reviewed commits.
 [dist.github-action-commits]
 "actions/checkout" = "d23441a48e516b6c34aea4fa41551a30e30af803" # v6.1.0
