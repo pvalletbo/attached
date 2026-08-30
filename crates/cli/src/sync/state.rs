@@ -154,7 +154,7 @@ pub fn install_created_account(
     service_origin: ServiceOrigin,
     response: CreateAccountResponse,
     consumer_identity_secret: ConsumerIdentitySecret,
-) -> Result<String> {
+) -> Result<()> {
     let root_key = AccountRootKey::generate().context("could not generate the account root key")?;
     let (account_id, publish_token, download_token) = response.into_parts();
     let owner = OwnerAccountBundle::from_parts(
@@ -166,11 +166,8 @@ pub fn install_created_account(
         consumer_identity_secret,
     )
     .map_err(|_| anyhow::anyhow!("could not create owner account bundle"))?;
-    let download = owner.scoped(ApiKeyScope::Download);
-    let download_encoded = AccountBundle::Scoped(download).encode();
     let owner_encoded = Zeroizing::new(AccountBundle::Owner(owner).encode());
-    install_account(state_dir, owner_encoded.as_bytes(), false)?;
-    Ok(download_encoded)
+    install_account(state_dir, owner_encoded.as_bytes(), false)
 }
 
 pub fn import_account(state_dir: &Path, encoded: &[u8]) -> Result<()> {
@@ -327,7 +324,7 @@ const fn scope_name(scope: ApiKeyScope) -> &'static str {
 pub(crate) mod test_support {
     use super::*;
 
-    pub(crate) fn create_account(state_dir: &Path, service_origin: &str) -> Result<String> {
+    pub(crate) fn create_account(state_dir: &Path, service_origin: &str) -> Result<()> {
         let service_origin = ServiceOrigin::parse(service_origin)
             .map_err(|_| anyhow::anyhow!("invalid sync service origin"))?;
         let response = CreateAccountResponse::new(
@@ -401,14 +398,14 @@ mod tests {
         .unwrap()
     }
 
-    fn install_fixture(state_dir: &Path) -> String {
+    fn install_fixture(state_dir: &Path) {
         install_created_account(
             state_dir,
             ServiceOrigin::parse("https://sync.example").unwrap(),
             fixture_response(),
             ConsumerIdentitySecret::from_bytes([4; 32]),
         )
-        .unwrap()
+        .unwrap();
     }
 
     #[test]
@@ -505,10 +502,10 @@ mod tests {
     }
 
     #[test]
-    fn issued_account_exports_separate_consistent_scopes() {
+    fn issued_account_is_encrypted_and_exports_separate_scopes_on_demand() {
         let root = crate::test_support::canonical_tempdir();
         let state = root.path().join("state");
-        let download_text = install_fixture(&state);
+        install_fixture(&state);
         let stored = std::fs::read(state.join(ACCOUNT_FILE)).unwrap();
         assert!(
             crate::local_encryption::is_envelope(&stored),
@@ -519,6 +516,7 @@ mod tests {
             "portable account bundle remained plaintext at rest"
         );
         let publish_text = export_account(&state, ApiKeyScope::Publish).unwrap();
+        let download_text = export_account(&state, ApiKeyScope::Download).unwrap();
         let exported_download = export_account(&state, ApiKeyScope::Download).unwrap();
         assert_eq!(download_text.as_bytes(), exported_download.as_bytes());
 

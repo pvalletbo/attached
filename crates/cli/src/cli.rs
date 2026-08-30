@@ -121,16 +121,11 @@ enum SessionsCommand {
 
 #[derive(Subcommand)]
 enum AccountCommand {
-    /// Create an account, then write its download bundle securely.
+    /// Create an account and save it in encrypted local state.
     Create {
         /// Synchronization service used for the new account.
         #[arg(long, default_value = DEFAULT_SERVICE_ORIGIN)]
         service: String,
-
-        /// New owner-only file for the download bundle. Defaults to `account.bundle` and refuses
-        /// to overwrite an existing file.
-        #[arg(long, default_value = "account.bundle")]
-        output: PathBuf,
 
         #[arg(long, hide = true)]
         state_dir: Option<PathBuf>,
@@ -178,18 +173,17 @@ impl Cli {
         match self.command {
             Command::Account { command } => {
                 match command {
-                    AccountCommand::Create {
-                        service,
-                        output,
-                        state_dir,
-                    } => {
+                    AccountCommand::Create { service, state_dir } => {
                         let state_dir = resolved_state_dir(state_dir)?;
-                        let bundle = sync::account::create(&state_dir, &service).await?;
-                        write_account_bundle(&bundle, &output).context(
-                            "the account was saved locally, but its download bundle could not be written; export a new download bundle from the saved account",
-                        )?;
+                        sync::account::create(&state_dir, &service).await?;
+                        eprintln!(
+                            "Account created and saved in encrypted local state; no portable account bundle was written."
+                        );
                         eprintln!(
                             "Use `attached account export --type publish` to create a publish-only bundle, then provide it when starting `attached serve` on the serving host."
+                        );
+                        eprintln!(
+                            "If needed, create a download bundle with `attached account export --type download --output account.bundle`."
                         );
                     }
                     AccountCommand::Export {
@@ -445,22 +439,17 @@ mod tests {
     }
 
     #[test]
-    fn account_bundle_io_uses_safe_default_files() {
-        let create = Cli::try_parse_from([
-            "attached",
-            "account",
-            "create",
-            "--service",
-            "https://sync.example",
-        ])
-        .unwrap();
-        let Command::Account {
-            command: AccountCommand::Create { output, .. },
-        } = create.command
-        else {
-            unreachable!();
-        };
-        assert_eq!(output, PathBuf::from("account.bundle"));
+    fn account_bundles_are_only_written_by_export() {
+        assert!(
+            Cli::try_parse_from([
+                "attached",
+                "account",
+                "create",
+                "--output",
+                "account.bundle",
+            ])
+            .is_err()
+        );
 
         let export =
             Cli::try_parse_from(["attached", "account", "export", "--type", "publish"]).unwrap();
