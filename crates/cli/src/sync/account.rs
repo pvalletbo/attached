@@ -7,7 +7,7 @@ use attached_session_sync_protocol::account::{
 
 use super::{http::SyncHttpClient, state};
 
-pub async fn create(state_dir: &Path, service_origin: &str) -> Result<String> {
+pub async fn create(state_dir: &Path, service_origin: &str) -> Result<()> {
     let service_origin = ServiceOrigin::parse(service_origin)
         .map_err(|_| anyhow::anyhow!("invalid sync service origin"))?;
     state::ensure_account_slot_available(state_dir)?;
