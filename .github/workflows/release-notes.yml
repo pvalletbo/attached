@@ -1,0 +1,34 @@
+name: Add generated release notes
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        description: cargo-dist release plan
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  release-notes:
+    name: Add GitHub-generated release notes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PLAN: ${{ inputs.plan }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Update release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag=$(jq --exit-status --raw-output \
+            '.announcement_tag | strings | select(length > 0)' <<< "$PLAN")
+          scripts/update-release-notes.sh "$tag"

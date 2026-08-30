@@ -35,6 +35,9 @@ targets = [
 pr-run-mode = "plan"
 # Reject anything except stable vX.Y.Z tags before release builds start.
 plan-jobs = ["./release-tag-check"]
+# Add GitHub-generated change notes after cargo-dist publishes the release.
+post-announce-jobs = ["./release-notes"]
+github-custom-job-permissions = { "release-notes" = { contents = "write" } }
 # Generate checksums and attest every artifact before creating the GitHub Release.
 checksum = "sha256"
 github-attestations = true

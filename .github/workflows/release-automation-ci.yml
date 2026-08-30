@@ -1,0 +1,66 @@
+name: Release automation CI
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/cut-release.yml
+      - .github/workflows/release-automation-ci.yml
+      - .github/workflows/release-notes.yml
+      - .github/workflows/release-tag-check.yml
+      - .github/workflows/release.yml
+      - dist-workspace.toml
+      - scripts/**
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/cut-release.yml
+      - .github/workflows/release-automation-ci.yml
+      - .github/workflows/release-notes.yml
+      - .github/workflows/release-tag-check.yml
+      - .github/workflows/release.yml
+      - dist-workspace.toml
+      - scripts/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-automation-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test release automation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Validate shell syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' script; do
+            bash -n "$script"
+          done < <(find scripts -type f -name '*.sh' -print0)
+
+      - name: Run release automation tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/tests/release.sh
+          scripts/tests/update-release-notes.sh
+
+      - name: Install dist
+        shell: bash
+        run: >-
+          curl --proto '=https' --tlsv1.2 -LsSf
+          https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh
+          | sh
+
+      - name: Validate generated release workflow
+        run: dist generate --check

@@ -36,4 +36,5 @@ gh workflow run cut-release.yml \
   --field "bump=$bump"
 
 printf 'Triggered a %s release from %s.\n' "$bump" "$default_branch"
+printf 'Release notes will be generated from merged pull requests after publishing.\n'
 printf 'Follow the run at %s/actions/workflows/cut-release.yml\n' "$repo_url"
