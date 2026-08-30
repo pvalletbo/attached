@@ -10,4 +10,6 @@ Attach to remote Herdr session no matter where they run. No networking setup req
 
 ## Desktop integrations
 
+> **AI contribution notice:** This section was updated with contributions from an AI coding agent at the explicit request of the project maintainer.
+
 - [Omarchy Shell session picker](integrations/omarchy/README.md)

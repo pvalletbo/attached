@@ -6,6 +6,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const plugin = path.resolve(__dirname, "..");
+const integration = path.resolve(plugin, "..");
+const repository = path.resolve(integration, "..", "..");
 
 test("manifest declares a loadable third-party overlay", () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(plugin, "manifest.json"), "utf8"));
@@ -14,6 +16,26 @@ test("manifest declares a loadable third-party overlay", () => {
   assert.deepEqual(manifest.kinds, ["overlay"]);
   assert.equal(manifest.entryPoints.overlay, "Overlay.qml");
   assert.ok(fs.statSync(path.join(plugin, manifest.entryPoints.overlay)).isFile());
+});
+
+test("documentation matches the 1Password integration contract", () => {
+  const readme = fs.readFileSync(path.join(integration, "README.md"), "utf8");
+  for (const contract of [
+    "AI contribution notice",
+    "attached --use-1password sessions --json",
+    "attached --use-1password attach <target>",
+    "Existing password-prompt state is not automatically migrated",
+    "Ctrl+O",
+    "qmlformat",
+    "real Omarchy 4.0.1 Wayland session"
+  ]) {
+    assert.match(readme, new RegExp(contract.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), contract);
+  }
+  assert.doesNotMatch(readme, /It passes `attached attach <target>`/);
+
+  const rootReadme = fs.readFileSync(path.join(repository, "README.md"), "utf8");
+  assert.match(rootReadme, /AI contribution notice/);
+  assert.match(rootReadme, /Omarchy Shell session picker/);
 });
 
 test("overlay supports safe catalog loading, keyboard and pointer activation", () => {
