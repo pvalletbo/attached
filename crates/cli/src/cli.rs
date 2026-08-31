@@ -6,10 +6,11 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use attached_session_sync_protocol::account::ApiKeyScope;
 use clap::{Parser, Subcommand, ValueEnum};
+use zeroize::Zeroizing;
 
 use crate::{
-    herdr_version, identity, installation, local_encryption, publish_account, secure_state, server,
-    session,
+    account_clipboard, herdr_version, identity, installation, local_encryption, publish_account,
+    secure_state, server, session,
     session_picker::{self, SessionSelection},
     sync,
 };
@@ -131,16 +132,15 @@ enum AccountCommand {
         state_dir: Option<PathBuf>,
     },
 
-    /// Export one scoped secret bundle from a locally created account.
+    /// Export one scoped secret bundle to the clipboard temporarily or to an explicit file.
     Export {
         /// API-key scope to export (`publish` is also accepted as `push`).
         #[arg(long = "type", value_enum)]
         key_type: AccountKeyType,
 
-        /// New owner-only file for the exported bundle. Defaults to `publish.bundle` and refuses
-        /// to overwrite an existing file.
-        #[arg(long, default_value = "publish.bundle")]
-        output: PathBuf,
+        /// Write to a new owner-only file instead of the clipboard. Refuses to overwrite a file.
+        #[arg(long, value_name = "FILE")]
+        output: Option<PathBuf>,
 
         #[arg(long, hide = true)]
         state_dir: Option<PathBuf>,
@@ -180,7 +180,7 @@ impl Cli {
                             "Account created and saved in encrypted local state; no portable account bundle was written."
                         );
                         eprintln!(
-                            "Use `attached account export --type publish` to create a publish-only bundle, then provide it when starting `attached serve` on the serving host."
+                            "Use `attached account export --type publish` to copy a publish-only bundle, then paste it into `attached serve` on the serving host."
                         );
                         eprintln!(
                             "If needed, create a download bundle with `attached account export --type download --output account.bundle`."
@@ -193,8 +193,18 @@ impl Cli {
                     } => {
                         let state_dir = resolved_state_dir(state_dir)?;
                         let scope = ApiKeyScope::from(key_type);
-                        let bundle = sync::account::export(&state_dir, scope)?;
-                        write_account_bundle(&bundle, &output)?;
+                        let bundle = Zeroizing::new(sync::account::export(&state_dir, scope)?);
+                        if let Some(output) = output {
+                            write_account_bundle(&bundle, &output)?;
+                        } else {
+                            account_clipboard::copy(&bundle).context(
+                                "could not copy the account bundle to the clipboard; no file was written (retry from a graphical session or pass `--output FILE`)",
+                            )?;
+                            eprintln!(
+                                "Account bundle copied to the clipboard for {} minutes. Paste it into `attached serve`; Attached requested that clipboard managers not save it.",
+                                account_clipboard::RETENTION.as_secs() / 60
+                            );
+                        }
                     }
                 }
                 Ok(0)
@@ -347,7 +357,7 @@ fn resolved_state_dir(state_dir: Option<PathBuf>) -> Result<PathBuf> {
 }
 
 fn write_account_bundle(bundle: &str, output_path: &std::path::Path) -> Result<()> {
-    let mut bytes = Vec::with_capacity(bundle.len() + 1);
+    let mut bytes = Zeroizing::new(Vec::with_capacity(bundle.len() + 1));
     bytes.extend_from_slice(bundle.as_bytes());
     bytes.push(b'\n');
     secure_state::create_secret_output(output_path, &bytes)?;
@@ -439,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn account_bundles_are_only_written_by_export() {
+    fn account_exports_default_to_clipboard_and_require_output_for_files() {
         assert!(
             Cli::try_parse_from([
                 "attached",
@@ -459,7 +469,25 @@ mod tests {
         else {
             unreachable!();
         };
-        assert_eq!(output, PathBuf::from("publish.bundle"));
+        assert_eq!(output, None);
+
+        let file_export = Cli::try_parse_from([
+            "attached",
+            "account",
+            "export",
+            "--type",
+            "download",
+            "--output",
+            "account.bundle",
+        ])
+        .unwrap();
+        let Command::Account {
+            command: AccountCommand::Export { output, .. },
+        } = file_export.command
+        else {
+            unreachable!();
+        };
+        assert_eq!(output, Some(PathBuf::from("account.bundle")));
 
         assert!(
             Cli::try_parse_from([
@@ -511,6 +539,18 @@ mod tests {
         for removed in ["connect", "remote", "session", "admin", "sync"] {
             assert!(!help.contains(&format!("  {removed}  ")), "{help}");
         }
+        assert!(!help.contains(account_clipboard::HELPER_COMMAND), "{help}");
+
+        let mut command = Cli::command();
+        let export_help = command
+            .find_subcommand_mut("account")
+            .unwrap()
+            .find_subcommand_mut("export")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(export_help.contains("clipboard"), "{export_help}");
+        assert!(export_help.contains("--output <FILE>"), "{export_help}");
     }
 
     #[test]
