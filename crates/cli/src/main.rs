@@ -2,6 +2,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
+mod account_clipboard;
 mod bounded_process;
 mod cli;
 mod diagnostics;
@@ -25,8 +26,21 @@ mod test_support;
 
 use cli::Cli;
 
+fn main() -> ExitCode {
+    if account_clipboard::helper_requested() {
+        return match account_clipboard::serve() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("Error: {error:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    async_main()
+}
+
 #[tokio::main]
-async fn main() -> ExitCode {
+async fn async_main() -> ExitCode {
     let cli = Cli::parse();
     let verbosity = cli.verbosity();
     if let Err(error) = diagnostics::init(verbosity) {
