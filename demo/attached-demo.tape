@@ -1,16 +1,19 @@
-# Record a two-pane Attached demo.
+# Record an Attached demo in a single terminal.
 #
 # Assumptions:
 #   - Run this tape from the repository root.
 #   - A Docker-compatible daemon is running.
-#   - publish.bundle exists in the repository root and belongs to the consumer's
-#     configured Attached account.
-#   - The demo account uses `attached-demo-password` for local encryption.
-#   - The host has attached, herdr, fzf, tmux, and pbcopy on PATH.
+#   - The local `ubuntu-herdr` image was built from
+#     `demo/Dockerfile.ubuntu-herdr`.
+#   - Network access is available while installing Attached in the running demo
+#     container.
+#   - The local Attached account is configured.
+#   - Both the local account and the container use `1234` for local encryption.
+#   - The host has attached, herdr, fzf, pbpaste, and pbcopy on PATH.
 #
-# Attached hides the publish bundle and demo-only encryption password while they
-# are entered, so neither value is rendered. The clipboard is cleared during
-# cleanup.
+# The publish bundle is exported to the clipboard and passed to Docker through
+# ATTACHED_PUBLISH_BUNDLE. Password and bundle values are never rendered. The
+# environment variable and clipboard are cleared during cleanup.
 
 Output demo/attached-demo.mp4
 
@@ -18,7 +21,7 @@ Require docker
 Require attached
 Require herdr
 Require fzf
-Require tmux
+Require pbpaste
 Require pbcopy
 
 Set Shell "bash"
@@ -34,94 +37,94 @@ Set WindowBar Colorful
 Set WindowBarSize 40
 Set BorderRadius 10
 
-# Prepare a private tmux server while capture is paused. Recording starts only
-# after both vertical panes exist, so every captured frame has the split layout.
-# Named ANSI colors and Herdr's terminal theme inherit the VHS palette through
-# tmux, so changing `Set Theme` above updates the entire recording.
+# Start from one clean local prompt while capture is paused. Attached itself is
+# deliberately installed later, on screen, inside the running demo container.
+# Cleanup is registered for failed runs.
 Hide
-Type `test -r publish.bundle || { printf 'publish.bundle is missing\n' >&2; exit 1; }; printf 'onboarding = false\n\n[theme]\nname = "terminal"\n' > /tmp/attached-vhs-herdr.toml; tmux -L attached-vhs kill-server >/dev/null 2>&1 || true; tmux -L attached-vhs -f /dev/null new-session -d -s attached-demo -c "$PWD" "env -u HERDR_ENV -u HERDR_TAB_ID -u HERDR_WORKSPACE_ID -u HERDR_PANE_ID -u HERDR_AGENT -u HERDR_SOCKET_PATH -u HERDR_BIN_PATH BASH_SILENCE_DEPRECATION_WARNING=1 HERDR_CONFIG_PATH=/tmp/attached-vhs-herdr.toml PS1='consumer$ ' bash --noprofile --norc -i"; tmux -L attached-vhs -f /dev/null split-window -h -t attached-demo:0 -c "$PWD" "env BASH_SILENCE_DEPRECATION_WARNING=1 PS1='publisher$ ' bash --noprofile --norc -i"; tmux -L attached-vhs set-option -t attached-demo status off; tmux -L attached-vhs set-window-option -t attached-demo:0 pane-border-status top; tmux -L attached-vhs set-window-option -t attached-demo:0 pane-border-format " #[fg=brightblack]#{?pane_active,●,○} #{?#{==:#{pane_index},0},CONSUMER,PUBLISHER} #[default]"; tmux -L attached-vhs set-window-option -t attached-demo:0 pane-active-border-style "fg=magenta"; tmux -L attached-vhs set-window-option -t attached-demo:0 pane-border-style "fg=brightblack"; tmux -L attached-vhs set-window-option -t attached-demo:0 allow-rename off; tmux -L attached-vhs select-pane -t attached-demo:0.1; tmux -L attached-vhs attach-session -t attached-demo`
+Type `docker rm -f attached-demo >/dev/null 2>&1 || true; export PS1='local$ '; trap 'docker stop attached-demo >/dev/null 2>&1 || true; unset ATTACHED_PUBLISH_BUNDLE; printf "" | pbcopy' EXIT; clear`
 Enter
-Wait+Line /publisher[$]/
+Wait+Line /local[$]/
 Show
 Sleep 1s
 
-# Publisher: start a stock Ubuntu container. Package and Herdr setup execute
-# while capture is paused; only Attached's installation is shown to viewers.
-Type `docker run --rm -it --name attached-demo ubuntu:24.04`
+# Export a publish-only bundle. Attached keeps the secret out of the terminal and
+# places it on the clipboard temporarily.
+Type `attached account export --type publish`
 Sleep 300ms
 Enter
 Sleep 500ms
-Hide
-Wait+Line /root@.*#/
-
-Type "apt update"
-Enter
+Wait+Screen /Attached encryption password:/
 Sleep 300ms
-Wait+Line /root@.*#/
-
-Type "apt-get install -y curl ca-certificates xz-utils"
+Type "1234"
 Enter
-Sleep 300ms
-Wait+Line /root@.*#/
+Sleep 1s
+Wait+Screen /Account bundle copied to the clipboard/
+Wait+Line /local[$]/
+Sleep 1s
 
-Type "curl -fsSL https://herdr.dev/install.sh | sh"
-Enter
+# Read the bundle from the clipboard without displaying it, then pass it into
+# one foreground Docker shell.
+Type `export ATTACHED_PUBLISH_BUNDLE="$(pbpaste)"`
 Sleep 300ms
-Wait+Line /root@.*#/
-
-Type `export PATH="/root/.local/bin:$PATH"`
 Enter
-Sleep 300ms
-Wait+Line /root@.*#/
-
-Type `mkdir -p "$HOME/.config/herdr" && printf 'onboarding = false\n\n[theme]\nname = "terminal"\n' > "$HOME/.config/herdr/config.toml"`
-Enter
-Sleep 300ms
-Wait+Line /root@.*#/
-
-Type "clear"
-Enter
-Sleep 300ms
-Wait+Line /root@.*#/
-Show
+Wait+Line /local[$]/
 Sleep 700ms
 
-Type "herdr --version"
+Type `docker run --rm -it --name attached-demo -e ATTACHED_PUBLISH_BUNDLE ubuntu-herdr`
+Sleep 300ms
+Enter
+Sleep 500ms
+Wait+Line /root@.*#/
+Sleep 700ms
+
+# Herdr is already installed in the image, so its version is the first command
+# run in the container.
+Type `herdr --version`
 Sleep 300ms
 Enter
 Sleep 300ms
 Wait+Line /root@.*#/
 Sleep 700ms
 
+# Install Attached in the container.
 Type `curl --proto '=https' --tlsv1.2 -LsSf https://install.attached.sh | sh`
 Sleep 300ms
 Enter
 Sleep 500ms
 Wait+Line /root@.*#/
-Sleep 700ms
+Sleep 1s
 
-# Consumer: place the publisher-scoped bundle on the macOS clipboard without
-# its trailing newline, so the following hidden password prompt gets fresh input.
-Ctrl+B
-Left
-Wait+Line /consumer[$]/
-Sleep 700ms
-Type `tr -d '\r\n' < publish.bundle | pbcopy`
+# Start serving with the publish bundle inherited from Docker. This fresh
+# container creates encrypted local state with the same demo password.
+Type `attached serve --host-label "docker-$HOSTNAME"`
 Sleep 300ms
 Enter
+Sleep 500ms
+Wait+Screen /Create Attached encryption password:/
 Sleep 300ms
-Wait+Line /consumer[$]/
-Sleep 700ms
+Type "1234"
+Enter
+Sleep 500ms
+Wait+Screen /Confirm Attached encryption password:/
+Sleep 300ms
+Type "1234"
+Enter
+Sleep 1s
+Wait+Screen /Serving synchronized Herdr sessions as/
+Sleep 2s
 
-# Publisher: return to the container. Attached will request the bundle with
-# hidden input when serving begins.
-Ctrl+B
-Right
+# Keep Attached running as a background job in the container shell.
+Ctrl+Z
+Sleep 700ms
 Wait+Line /root@.*#/
-Sleep 700ms
+Type "bg"
+Sleep 300ms
+Enter
+Sleep 500ms
+Wait+Line /root@.*#/
+Sleep 1s
 
-# Create Herdr's default session interactively and leave recognizable output in
-# its shell pane. That same pane will later appear on the consumer unchanged.
+# Create Herdr's default session and leave recognizable output in its shell pane.
 Type "herdr"
 Sleep 300ms
 Enter
@@ -129,16 +132,12 @@ Sleep 1s
 Wait+Screen /(agents[ ]+grouped|tab[ ]+1)/
 Sleep 1s
 
-Type `echo "hello from inside the Docker publisher"`
+Type `echo "hello from inside Docker"`
 Sleep 300ms
 Enter
-Sleep 2s
+Sleep 3s
 
-# Herdr is nested inside the recording's outer tmux. The first two Ctrl+B keys
-# make tmux forward one Ctrl+B to Herdr; q then detaches the Herdr client while
-# its default session keeps running in the container.
-Ctrl+B
-Sleep 150ms
+# Detach the Herdr client while its session keeps running in the container.
 Ctrl+B
 Sleep 150ms
 Type "q"
@@ -146,50 +145,23 @@ Sleep 1s
 Wait+Line /root@.*#/
 Sleep 700ms
 
-# Give the publisher pane a distinct prompt so readiness checks cannot match
-# the prompt inside the remote Herdr pane.
-Type "export PS1='publisher# '"
-Sleep 300ms
-Enter
-Sleep 300ms
-Wait+Line /publisher#/
+# Detach from Docker without stopping its shell, Attached server, or Herdr
+# session. Exiting the shell here would stop the container.
+Ctrl+P
+Sleep 150ms
+Ctrl+Q
 Sleep 700ms
-
-Type `attached serve --host-label "docker-$HOSTNAME"`
-Sleep 300ms
-Enter
-Sleep 500ms
-Wait+Screen /Enter the publish bundle/
-Sleep 300ms
-Paste
-Sleep 500ms
-Enter
-Sleep 500ms
-Wait+Screen /Create Attached encryption password:/
-Sleep 300ms
-Type "attached-demo-password"
-Enter
-Sleep 500ms
-Wait+Screen /Confirm Attached encryption password:/
-Sleep 300ms
-Type "attached-demo-password"
-Enter
+Wait+Line /local[$]/
 Sleep 1s
-Wait+Screen /Serving synchronized Herdr sessions as/
-Sleep 2s
 
-# Consumer: discover the synchronized session and select it by typing `docker`.
-Ctrl+B
-Left
-Wait+Line /consumer[$]/
-Sleep 700ms
+# Discover the synchronized Docker session from the local computer.
 Type "attached attach"
 Sleep 300ms
 Enter
 Sleep 500ms
 Wait+Screen /Attached encryption password:/
 Sleep 300ms
-Type "attached-demo-password"
+Type "1234"
 Enter
 Sleep 1s
 Wait+Screen /Herdr session>/
@@ -197,27 +169,22 @@ Sleep 700ms
 Type "docker"
 Sleep 2s
 Enter
-Sleep 1s
-Wait+Screen /(agents[ ]+grouped|tab[ ]+1)/
+Sleep 5s
+Wait+Screen /hello from inside Docker/
 Sleep 3s
 
-Type `echo "now typing from the consumer"`
+Type `echo "now attached from the local computer"`
 Sleep 300ms
 Enter
 Sleep 4s
 
-# Tear down only resources created by this tape. Cleanup is not recorded.
+# Detach and remove only resources created by this tape. Cleanup is not recorded.
 Hide
 Ctrl+B
-Right
-Sleep 300ms
-Ctrl+C
-Sleep 500ms
-Wait+Line /publisher#/
-Type "exit"
-Enter
-Sleep 500ms
-Wait+Line /publisher[$]/
-Type `printf '' | pbcopy; rm -f /tmp/attached-vhs-herdr.toml; tmux -L attached-vhs kill-session -t attached-demo`
+Sleep 150ms
+Type "q"
+Sleep 1s
+Wait+Line /local[$]/
+Type `docker stop attached-demo >/dev/null 2>&1 || true; unset ATTACHED_PUBLISH_BUNDLE; printf '' | pbcopy; trap - EXIT`
 Enter
 Sleep 1s
