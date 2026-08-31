@@ -2,13 +2,15 @@
 #
 # Assumptions:
 #   - Run this tape from the repository root.
-#   - Docker Desktop is running.
-#   - publish.bundle exists in the repository root.
+#   - A Docker-compatible daemon is running.
+#   - publish.bundle exists in the repository root and belongs to the consumer's
+#     configured Attached account.
+#   - The demo account uses `attached-demo-password` for local encryption.
 #   - The host has attached, herdr, fzf, tmux, and pbcopy on PATH.
 #
-# Attached hides terminal input while the publish bundle is pasted, so the
-# credential is never rendered into the recording. The clipboard is cleared
-# during cleanup.
+# Attached hides the publish bundle and demo-only encryption password while they
+# are entered, so neither value is rendered. The clipboard is cleared during
+# cleanup.
 
 Output demo/attached-demo.mp4
 
@@ -22,11 +24,11 @@ Require pbcopy
 Set Shell "bash"
 Set Width 1920
 Set Height 1080
-Set FontSize 24
+Set FontSize 28
 Set Framerate 30
 Set TypingSpeed 25ms
 Set WaitTimeout 8m
-Set Theme "TokyoNightStorm"
+Set Theme "Dracula"
 Set Padding 24
 Set WindowBar Colorful
 Set WindowBarSize 40
@@ -34,9 +36,10 @@ Set BorderRadius 10
 
 # Prepare a private tmux server while capture is paused. Recording starts only
 # after both vertical panes exist, so every captured frame has the split layout.
-# Named ANSI colors keep tmux's labels and borders tied to the VHS theme.
+# Named ANSI colors and Herdr's terminal theme inherit the VHS palette through
+# tmux, so changing `Set Theme` above updates the entire recording.
 Hide
-Type `test -r publish.bundle || { printf 'publish.bundle is missing\n' >&2; exit 1; }; printf 'onboarding = false\n\n[theme]\nname = "tokyo-night"\n' > /tmp/attached-vhs-herdr.toml; tmux -L attached-vhs kill-server >/dev/null 2>&1 || true; tmux -L attached-vhs -f /dev/null new-session -d -s attached-demo -c "$PWD" "env BASH_SILENCE_DEPRECATION_WARNING=1 HERDR_CONFIG_PATH=/tmp/attached-vhs-herdr.toml PS1='consumer$ ' bash --noprofile --norc -i"; tmux -L attached-vhs -f /dev/null split-window -h -t attached-demo:0 -c "$PWD" "env BASH_SILENCE_DEPRECATION_WARNING=1 PS1='publisher$ ' bash --noprofile --norc -i"; tmux -L attached-vhs set-option -t attached-demo status off; tmux -L attached-vhs set-window-option -t attached-demo:0 pane-border-status top; tmux -L attached-vhs set-window-option -t attached-demo:0 pane-border-format " #[fg=brightblack]#{?pane_active,●,○} #{pane_title} #[default]"; tmux -L attached-vhs set-window-option -t attached-demo:0 pane-active-border-style "fg=blue"; tmux -L attached-vhs set-window-option -t attached-demo:0 pane-border-style "fg=black"; tmux -L attached-vhs set-window-option -t attached-demo:0 allow-rename off; tmux -L attached-vhs select-pane -t attached-demo:0.0 -T CONSUMER; tmux -L attached-vhs select-pane -t attached-demo:0.1 -T PUBLISHER; tmux -L attached-vhs select-pane -t attached-demo:0.1; tmux -L attached-vhs attach-session -t attached-demo`
+Type `test -r publish.bundle || { printf 'publish.bundle is missing\n' >&2; exit 1; }; printf 'onboarding = false\n\n[theme]\nname = "terminal"\n' > /tmp/attached-vhs-herdr.toml; tmux -L attached-vhs kill-server >/dev/null 2>&1 || true; tmux -L attached-vhs -f /dev/null new-session -d -s attached-demo -c "$PWD" "env -u HERDR_ENV -u HERDR_TAB_ID -u HERDR_WORKSPACE_ID -u HERDR_PANE_ID -u HERDR_AGENT -u HERDR_SOCKET_PATH -u HERDR_BIN_PATH BASH_SILENCE_DEPRECATION_WARNING=1 HERDR_CONFIG_PATH=/tmp/attached-vhs-herdr.toml PS1='consumer$ ' bash --noprofile --norc -i"; tmux -L attached-vhs -f /dev/null split-window -h -t attached-demo:0 -c "$PWD" "env BASH_SILENCE_DEPRECATION_WARNING=1 PS1='publisher$ ' bash --noprofile --norc -i"; tmux -L attached-vhs set-option -t attached-demo status off; tmux -L attached-vhs set-window-option -t attached-demo:0 pane-border-status top; tmux -L attached-vhs set-window-option -t attached-demo:0 pane-border-format " #[fg=brightblack]#{?pane_active,●,○} #{?#{==:#{pane_index},0},CONSUMER,PUBLISHER} #[default]"; tmux -L attached-vhs set-window-option -t attached-demo:0 pane-active-border-style "fg=magenta"; tmux -L attached-vhs set-window-option -t attached-demo:0 pane-border-style "fg=brightblack"; tmux -L attached-vhs set-window-option -t attached-demo:0 allow-rename off; tmux -L attached-vhs select-pane -t attached-demo:0.1; tmux -L attached-vhs attach-session -t attached-demo`
 Enter
 Wait+Line /publisher[$]/
 Show
@@ -71,7 +74,7 @@ Enter
 Sleep 300ms
 Wait+Line /root@.*#/
 
-Type `mkdir -p "$HOME/.config/herdr" && printf 'onboarding = false\n\n[theme]\nname = "tokyo-night"\n' > "$HOME/.config/herdr/config.toml"`
+Type `mkdir -p "$HOME/.config/herdr" && printf 'onboarding = false\n\n[theme]\nname = "terminal"\n' > "$HOME/.config/herdr/config.toml"`
 Enter
 Sleep 300ms
 Wait+Line /root@.*#/
@@ -97,19 +100,13 @@ Sleep 500ms
 Wait+Line /root@.*#/
 Sleep 700ms
 
-Type "source $HOME/.cargo/env"
-Sleep 300ms
-Enter
-Sleep 300ms
-Wait+Line /root@.*#/
-Sleep 700ms
-
-# Consumer: place the publisher-scoped bundle on the macOS clipboard.
+# Consumer: place the publisher-scoped bundle on the macOS clipboard without
+# its trailing newline, so the following hidden password prompt gets fresh input.
 Ctrl+B
 Left
 Wait+Line /consumer[$]/
 Sleep 700ms
-Type "cat publish.bundle | pbcopy"
+Type `tr -d '\r\n' < publish.bundle | pbcopy`
 Sleep 300ms
 Enter
 Sleep 300ms
@@ -158,19 +155,30 @@ Sleep 300ms
 Wait+Line /publisher#/
 Sleep 700ms
 
-Type `attached serve --host-label "docker-demo-video-$HOSTNAME"`
+Type `attached serve --host-label "docker-$HOSTNAME"`
 Sleep 300ms
 Enter
 Sleep 500ms
 Wait+Screen /Enter the publish bundle/
+Sleep 300ms
 Paste
 Sleep 500ms
+Enter
+Sleep 500ms
+Wait+Screen /Create Attached encryption password:/
+Sleep 300ms
+Type "attached-demo-password"
+Enter
+Sleep 500ms
+Wait+Screen /Confirm Attached encryption password:/
+Sleep 300ms
+Type "attached-demo-password"
 Enter
 Sleep 1s
 Wait+Screen /Serving synchronized Herdr sessions as/
 Sleep 2s
 
-# Consumer: discover the synchronized session and select it by typing `video`.
+# Consumer: discover the synchronized session and select it by typing `docker`.
 Ctrl+B
 Left
 Wait+Line /consumer[$]/
@@ -178,10 +186,15 @@ Sleep 700ms
 Type "attached attach"
 Sleep 300ms
 Enter
+Sleep 500ms
+Wait+Screen /Attached encryption password:/
+Sleep 300ms
+Type "attached-demo-password"
+Enter
 Sleep 1s
 Wait+Screen /Herdr session>/
 Sleep 700ms
-Type "video"
+Type "docker"
 Sleep 2s
 Enter
 Sleep 1s
