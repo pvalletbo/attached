@@ -2,6 +2,7 @@
 /.pnpm-store/
 /.wrangler/
 *.bundle
+/demo/attached-demo.mp4
 .env
 .env.*
 !.env.example

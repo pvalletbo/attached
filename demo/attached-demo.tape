@@ -16,6 +16,7 @@
 # environment variable and clipboard are cleared during cleanup.
 
 Output demo/attached-demo.mp4
+Output demo/attached-demo.gif
 
 Require docker
 Require attached
@@ -28,20 +29,23 @@ Set Shell "bash"
 Set Width 1920
 Set Height 1080
 Set FontSize 28
+Set LineHeight 1.15
 Set Framerate 30
 Set TypingSpeed 25ms
 Set WaitTimeout 8m
-Set Theme "Dracula"
-Set Padding 24
-Set WindowBar Colorful
-Set WindowBarSize 40
-Set BorderRadius 10
+Set Theme "CyberPunk2077"
+Set Padding 28
+Set Margin 42
+Set MarginFill "#16161E"
+Set WindowBar Rings
+Set WindowBarSize 44
+Set BorderRadius 22
 
 # Start from one clean local prompt while capture is paused. Attached itself is
 # deliberately installed later, on screen, inside the running demo container.
 # Cleanup is registered for failed runs.
 Hide
-Type `docker rm -f attached-demo >/dev/null 2>&1 || true; export PS1='local$ '; trap 'docker stop attached-demo >/dev/null 2>&1 || true; unset ATTACHED_PUBLISH_BUNDLE; printf "" | pbcopy' EXIT; clear`
+Type `docker rm -f attached-demo >/dev/null 2>&1 || true; export PS1='\[\e[38;2;122;162;247m\]local\[\e[38;2;187;154;247m\]$\[\e[0m\] '; trap 'docker stop attached-demo >/dev/null 2>&1 || true; unset ATTACHED_PUBLISH_BUNDLE; printf "" | pbcopy' EXIT; clear`
 Enter
 Wait+Line /local[$]/
 Show
@@ -163,21 +167,21 @@ Wait+Screen /Attached encryption password:/
 Sleep 300ms
 Type "1234"
 Enter
-Sleep 1s
-Wait+Screen /Herdr session>/
+Sleep 5s
+#Wait+Screen /Herdr session>/
 Sleep 700ms
 Type "docker"
 Sleep 2s
 Enter
 Sleep 5s
-Wait+Screen /hello from inside Docker/
-Sleep 3s
-
+#Wait+Screen /hello from inside Docker/
+#Sleep 3s
+#
 Type `echo "now attached from the local computer"`
 Sleep 300ms
 Enter
 Sleep 4s
-
+#
 # Detach and remove only resources created by this tape. Cleanup is not recorded.
 Hide
 Ctrl+B
