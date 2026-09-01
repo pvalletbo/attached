@@ -25,14 +25,12 @@ test("catalog and terminal commands honor the provider and preserve targets as a
   assert.deepEqual(SessionModel.catalogCommand("password"), [
     "attached",
     "sessions",
-    "--json",
     "--password-stdin"
   ]);
   assert.deepEqual(SessionModel.catalogCommand("1password"), [
     "attached",
     "--use-1password",
-    "sessions",
-    "--json"
+    "sessions"
   ]);
 
   const session = { target: "travel/shell; touch /tmp/nope" };
@@ -68,7 +66,7 @@ test("catalog errors give provider-specific guidance without echoing stderr", ()
       1,
       "1password"
     ),
-    /could not be unlocked with 1Password.*attached --use-1password sessions --json/
+    /could not be unlocked with 1Password.*attached --use-1password sessions/
   );
 
   const onePasswordGeneric = SessionModel.catalogErrorMessage(
@@ -76,7 +74,7 @@ test("catalog errors give provider-specific guidance without echoing stderr", ()
     7,
     "1password"
   );
-  assert.match(onePasswordGeneric, /exit 7.*attached --use-1password sessions --json/);
+  assert.match(onePasswordGeneric, /exit 7.*attached --use-1password sessions/);
   assert.doesNotMatch(onePasswordGeneric, /private backend detail/);
 
   const passwordFailure = SessionModel.catalogErrorMessage(
@@ -88,7 +86,7 @@ test("catalog errors give provider-specific guidance without echoing stderr", ()
   assert.doesNotMatch(passwordFailure, /ciphertext/);
 
   const passwordGeneric = SessionModel.catalogErrorMessage("private backend detail", 9, "password");
-  assert.match(passwordGeneric, /exit 9.*re-enter.*attached sessions --json/);
+  assert.match(passwordGeneric, /exit 9.*re-enter.*attached sessions/);
   assert.doesNotMatch(passwordGeneric, /private backend detail/);
 });
 

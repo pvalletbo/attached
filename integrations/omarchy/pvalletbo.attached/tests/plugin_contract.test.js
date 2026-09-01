@@ -28,8 +28,8 @@ test("configuration and documentation match both password providers", () => {
     "encryptionPasswordProvider",
     '"password"',
     '"1password"',
-    "attached sessions --json --password-stdin",
-    "attached --use-1password sessions --json",
+    "attached sessions --password-stdin",
+    "attached --use-1password sessions",
     "Ctrl+O",
     "qmlformat",
     "real Omarchy 4.0.1 Wayland session"
