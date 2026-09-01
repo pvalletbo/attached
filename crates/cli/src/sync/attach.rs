@@ -79,6 +79,7 @@ fn ensure_endpoint_not_local(
     }
 }
 
+#[tracing::instrument(name = "attach_synchronized_session", level = "debug", skip_all)]
 pub async fn attach(
     state_dir: &Path,
     target: &str,

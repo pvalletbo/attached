@@ -145,6 +145,7 @@ impl CatalogRecord {
     }
 }
 
+#[tracing::instrument(name = "load_sync_catalog", level = "debug", skip_all)]
 pub(super) fn load(state_dir: &Path, account: &AccountCredentials) -> Result<Catalog> {
     with_locked_existing(state_dir, CATALOG_LOCK, |directory| {
         Ok(read_catalog(directory, account, true)?.unwrap_or_else(|| Catalog::empty(account)))
@@ -174,6 +175,7 @@ pub(super) fn save(
     })
 }
 
+#[tracing::instrument(name = "save_sync_catalog", level = "debug", skip_all)]
 pub(super) fn save_refresh(
     state_dir: &Path,
     account: &AccountCredentials,
@@ -346,6 +348,7 @@ fn read_catalog(
     read_catalog_with_store(directory, account, migrate_legacy, active_store())
 }
 
+#[tracing::instrument(name = "read_sync_catalog", level = "debug", skip_all)]
 fn read_catalog_with_store(
     directory: &StateDir,
     account: &AccountCredentials,
@@ -381,6 +384,7 @@ fn read_catalog_with_store(
     Ok(Some(catalog))
 }
 
+#[tracing::instrument(name = "write_sync_catalog", level = "debug", skip_all)]
 fn write_catalog(directory: &StateDir, plaintext: &[u8], replace: bool) -> Result<()> {
     with_master_key(directory, true, |key| {
         let encrypted = seal(key, Purpose::SyncCatalog, plaintext, MAX_CATALOG_BYTES)?;
@@ -427,6 +431,7 @@ fn sessions_with_filter(
     Ok(sessions)
 }
 
+#[tracing::instrument(name = "list_sync_sessions", level = "debug", skip_all)]
 pub(super) fn sessions_excluding_local_endpoints(
     state_dir: &Path,
     account: &AccountCredentials,
@@ -449,6 +454,7 @@ pub(super) fn sessions_excluding_local_endpoints(
     })
 }
 
+#[tracing::instrument(name = "load_sync_attachment", level = "debug", skip_all)]
 pub fn attachment(
     state_dir: &Path,
     account: &AccountCredentials,
