@@ -61,6 +61,9 @@ test("overlay supports safe catalog loading, keyboard and pointer activation", (
     '["omarchy-launch-1password"]',
     "Qt.Key_Up",
     "Qt.Key_Down",
+    "Qt.Key_P",
+    "Qt.Key_N",
+    "Qt.ControlModifier",
     "Qt.Key_Return",
     "Qt.Key_O",
     "onClicked:",
@@ -84,6 +87,16 @@ test("overlay supports safe catalog loading, keyboard and pointer activation", (
     qml,
     /text: row\.modelData\.host[\s\S]{0,300}font\.pixelSize: Style\.font\.heading/,
     "host must use the largest row font"
+  );
+  assert.match(
+    qml,
+    /Qt\.Key_P[\s\S]{0,120}Qt\.ControlModifier[\s\S]{0,120}root\.moveSelection\(-1\)/,
+    "Ctrl+P must move to the previous filtered session"
+  );
+  assert.match(
+    qml,
+    /Qt\.Key_N[\s\S]{0,120}Qt\.ControlModifier[\s\S]{0,120}root\.moveSelection\(1\)/,
+    "Ctrl+N must move to the next filtered session"
   );
   assert.match(
     qml,
