@@ -4,12 +4,12 @@ Attach to remote Herdr session no matter where they run. No networking setup req
 
 ## Demo
 
-[![Attached terminal demo showing a consumer connected to a Herdr session running in Docker](demo/attached-demo.gif)](demo/attached-demo.mp4)
+![Attached terminal demo showing a consumer connected to a Herdr session running in Docker](demo/attached-demo.gif)
 
-[Watch the full terminal demo (MP4)](demo/attached-demo.mp4) · [View the VHS tape](demo/attached-demo.tape)
+[View the VHS tape](demo/attached-demo.tape)
 
 ## Desktop integrations
 
-> **AI contribution notice:** This section was updated with contributions from an AI coding agent at the explicit request of the project maintainer.
-
 - [Omarchy Shell session picker](integrations/omarchy/README.md)
+
+_**AI contribution notice:** This README was updated with assistance from an AI coding agent._

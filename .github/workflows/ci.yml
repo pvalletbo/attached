@@ -8,6 +8,22 @@ on:
       - synchronize
       - ready_for_review
       - converted_to_draft
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/ci.yml
+      - .cargo/**
+      - Cargo.lock
+      - Cargo.toml
+      - deny.toml
+      - rust-toolchain.toml
+      - crates/cli/**
+      - integrations/omarchy/**
+      - crates/session-sync-protocol/**
+      - crates/session-sync-worker/**
+      - crates/tunnel-protocol/**
+      - "**/Cargo.toml"
   workflow_dispatch:
 
 permissions:
@@ -17,12 +33,76 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Debug symbols slow compilation and inflate caches without helping CI diagnostics.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
 jobs:
+  changes:
+    name: Classify pull request changes
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    outputs:
+      core: ${{ steps.filter.outputs.core }}
+      worker: ${{ steps.filter.outputs.worker }}
+      web: ${{ steps.filter.outputs.web }}
+    steps:
+      - name: Select affected CI jobs
+        id: filter
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          filters: |
+            core:
+              - '.github/workflows/ci.yml'
+              - '.cargo/**'
+              - 'Cargo.lock'
+              - 'Cargo.toml'
+              - 'deny.toml'
+              - 'rust-toolchain.toml'
+              - '**/Cargo.toml'
+              - 'crates/cli/**'
+              - 'integrations/omarchy/**'
+              - 'crates/session-sync-protocol/**'
+              - 'crates/session-sync-worker/**'
+              - 'crates/tunnel-protocol/**'
+            worker:
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/deploy-cloudflare-worker.yml'
+              - '.cargo/**'
+              - 'Cargo.lock'
+              - 'Cargo.toml'
+              - 'rust-toolchain.toml'
+              - '**/Cargo.toml'
+              - 'crates/session-sync-protocol/**'
+              - 'crates/session-sync-worker/**'
+              - 'crates/tunnel-protocol/**'
+            web:
+              - '.github/workflows/ci.yml'
+              - '.cargo/**'
+              - 'Cargo.lock'
+              - 'Cargo.toml'
+              - 'rust-toolchain.toml'
+              - '**/Cargo.toml'
+              - 'crates/session-sync-protocol/**'
+              - 'crates/tunnel-protocol/**'
+              - 'experimental/crates/**'
+              - 'experimental/web-client/**'
+
   rust:
     name: Core Rust quality gates
+    needs: changes
     if: >-
+      always() && !cancelled() &&
+      (github.event_name == 'push' ||
       github.event_name == 'workflow_dispatch' ||
-      github.event.pull_request.draft == false
+      (github.event.pull_request.draft == false &&
+      needs.changes.outputs.core == 'true'))
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -58,7 +138,13 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          cache-bin: false
           cache-on-failure: true
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
+        with:
+          tool: cargo-deny@0.20.2
+          fallback: none
       - name: Check core Rust formatting
         run: >-
           cargo fmt
@@ -80,14 +166,12 @@ jobs:
           --exclude attached-browser-sync
           --exclude herdr-tui-protocol
           -- -D warnings
-      - name: Build the core release workspace
+      - name: Build the core workspace
         run: >-
-          cargo build --workspace --release --locked
+          cargo build --workspace --locked
           --exclude attached-browser-iroh
           --exclude attached-browser-sync
           --exclude herdr-tui-protocol
-      - name: Install cargo-deny
-        run: cargo install cargo-deny --version 0.20.2 --locked
       - name: Check dependency, license, and source policy
         run: cargo deny check bans licenses sources
       - name: Check whitespace
@@ -95,9 +179,13 @@ jobs:
 
   cloudflare-worker:
     name: Cloudflare Worker build and local integration
+    needs: changes
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event.pull_request.draft == false
+      always() && !cancelled() &&
+      (github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+      github.event.pull_request.draft == false &&
+      needs.changes.outputs.worker == 'true'))
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     defaults:
@@ -107,13 +195,6 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - name: Install Linux build prerequisites
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends \
-            build-essential \
-            pkg-config \
-            libssl-dev
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
@@ -122,7 +203,7 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          key: cloudflare-worker
+          shared-key: cloudflare-worker
           cache-on-failure: true
       - name: Install worker-build
         run: cargo install worker-build --version 0.8.5 --locked
@@ -134,18 +215,20 @@ jobs:
         run: corepack enable
       - name: Install Worker dependencies
         run: pnpm install --frozen-lockfile
-      - name: Build Rust Worker
-        run: pnpm run build
       - name: Run Worker against local Durable Objects
         run: pnpm run test:integration
 
   web:
     name: Experimental web and browser quality gates
+    needs: changes
     # The browser client remains available for explicit, temporary opt-in runs.
     if: >-
+      always() && !cancelled() &&
       vars.ENABLE_EXPERIMENTAL_WEB == 'true' &&
       (github.event_name == 'workflow_dispatch' ||
-      github.event.pull_request.draft == false)
+      (github.event_name == 'pull_request' &&
+      github.event.pull_request.draft == false &&
+      needs.changes.outputs.web == 'true'))
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -158,13 +241,6 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - name: Install native build prerequisites
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends \
-            build-essential \
-            clang-18 \
-            lld-18
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
@@ -174,6 +250,7 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: browser-wasm
+          cache-bin: false
           cache-on-failure: true
       - name: Install Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -192,7 +269,10 @@ jobs:
         working-directory: experimental/web-client
         run: pnpm run lint
       - name: Install matching wasm-bindgen CLI
-        run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
+        with:
+          tool: wasm-bindgen@0.2.126
+          fallback: none
       - name: Assemble Attached browser client
         working-directory: experimental/web-client
         run: pnpm run build
@@ -205,11 +285,15 @@ jobs:
 
   macos:
     name: Core macOS workspace
+    needs: changes
     # Set this repository variable to true to opt in to supplemental macOS checks.
     if: >-
+      always() && !cancelled() &&
+      vars.ENABLE_GITHUB_HOSTED_MACOS == 'true' &&
       (github.event_name == 'workflow_dispatch' ||
-      github.event.pull_request.draft == false) &&
-      vars.ENABLE_GITHUB_HOSTED_MACOS == 'true'
+      (github.event_name == 'pull_request' &&
+      github.event.pull_request.draft == false &&
+      needs.changes.outputs.core == 'true'))
     runs-on: macos-15
     timeout-minutes: 30
     env:
@@ -229,7 +313,13 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: macos
+          cache-bin: false
           cache-on-failure: true
+      - name: Install cargo-deny on macOS
+        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
+        with:
+          tool: cargo-deny@0.20.2
+          fallback: none
       - name: Check core formatting on macOS
         run: >-
           cargo fmt
@@ -251,14 +341,12 @@ jobs:
           --exclude attached-browser-sync
           --exclude herdr-tui-protocol
           -- -D warnings
-      - name: Build the core release workspace on macOS
+      - name: Build the core workspace on macOS
         run: >-
-          cargo build --workspace --release --locked
+          cargo build --workspace --locked
           --exclude attached-browser-iroh
           --exclude attached-browser-sync
           --exclude herdr-tui-protocol
-      - name: Install cargo-deny on macOS
-        run: cargo install cargo-deny --version 0.20.2 --locked
       - name: Check dependency, license, and source policy on macOS
         run: cargo deny check bans licenses sources
       - name: Check whitespace on macOS

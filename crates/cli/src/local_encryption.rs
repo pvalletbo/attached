@@ -257,10 +257,16 @@ struct OnePasswordProvider<R> {
 struct ListedItem {
     id: String,
     title: String,
+    vault: ListedVault,
+}
+
+#[derive(Deserialize)]
+struct ListedVault {
+    id: String,
 }
 
 impl<R: OpRunner> OnePasswordProvider<R> {
-    fn item_id(&self) -> Result<Option<String>> {
+    fn item(&self) -> Result<Option<ListedItem>> {
         let output = self.runner.run(&[
             "item".to_owned(),
             "list".to_owned(),
@@ -286,14 +292,24 @@ impl<R: OpRunner> OnePasswordProvider<R> {
             !selected.id.is_empty() && selected.id.bytes().all(|byte| byte.is_ascii_alphanumeric()),
             "1Password returned an invalid item identifier"
         );
-        Ok(Some(selected.id))
+        ensure!(
+            !selected.vault.id.is_empty()
+                && selected
+                    .vault
+                    .id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric()),
+            "1Password returned an invalid vault identifier"
+        );
+        Ok(Some(selected))
     }
 
-    fn read_item_password(&self, item_id: String) -> Result<Zeroizing<Vec<u8>>> {
+    fn read_item_password(&self, item: ListedItem) -> Result<Zeroizing<Vec<u8>>> {
         let output = self.runner.run(&[
             "item".to_owned(),
             "get".to_owned(),
-            item_id,
+            item.id,
+            format!("--vault={}", item.vault.id),
             format!("--fields=label={ONE_PASSWORD_FIELD}"),
             "--reveal".to_owned(),
         ])?;
@@ -329,27 +345,30 @@ impl<R: OpRunner> PasswordProvider for OnePasswordProvider<R> {
             return Ok(Zeroizing::new(password.to_vec()));
         }
 
-        let item_id = match self.item_id()? {
-            Some(item_id) => item_id,
+        let item = match self.item()? {
+            Some(item) => item,
             None if create => {
                 self.create_item()?;
-                self.item_id()?
+                self.item()?
                     .context("1Password encryption password readback failed")?
             }
             None => bail!("encryption password is missing from 1Password"),
         };
-        let password = self.read_item_password(item_id)?;
+        let password = self.read_item_password(item)?;
         *cached = Some(Zeroizing::new(password.to_vec()));
         Ok(password)
     }
 
     fn remove(&self) -> Result<()> {
-        let Some(item_id) = self.item_id()? else {
+        let Some(item) = self.item()? else {
             return Ok(());
         };
-        let output = self
-            .runner
-            .run(&["item".to_owned(), "delete".to_owned(), item_id])?;
+        let output = self.runner.run(&[
+            "item".to_owned(),
+            "delete".to_owned(),
+            item.id,
+            format!("--vault={}", item.vault.id),
+        ])?;
         ensure!(output.success, ONE_PASSWORD_UNAVAILABLE);
         Ok(())
     }
@@ -804,10 +823,12 @@ mod tests {
     #[test]
     fn one_password_provider_reads_and_caches_the_concealed_password() {
         let item_id = "abcdefghijklmnopqrstuvwx12";
+        let vault_id = "abcdefghijklmnopqrstuvwx34";
         let password = "generated-1Password-secret";
         let listed = serde_json::json!([{
             "id": item_id,
             "title": ONE_PASSWORD_ITEM_TITLE,
+            "vault": { "id": vault_id },
         }]);
         let runner = FakeOpRunner::with_outputs([
             successful_op_output(serde_json::to_vec(&listed).unwrap()),
@@ -841,6 +862,12 @@ mod tests {
                 .iter()
                 .any(|argument| argument == item_id)
         );
+        assert!(
+            calls[1]
+                .arguments
+                .iter()
+                .any(|argument| argument == &format!("--vault={vault_id}"))
+        );
         assert!(calls.iter().all(|call| {
             call.arguments
                 .iter()
@@ -851,9 +878,11 @@ mod tests {
     #[test]
     fn one_password_provider_requests_an_auto_generated_password() {
         let item_id = "abcdefghijklmnopqrstuvwx12";
+        let vault_id = "abcdefghijklmnopqrstuvwx34";
         let listed = serde_json::json!([{
             "id": item_id,
             "title": ONE_PASSWORD_ITEM_TITLE,
+            "vault": { "id": vault_id },
         }]);
         let provider = OnePasswordProvider {
             runner: FakeOpRunner::with_outputs([
@@ -900,8 +929,16 @@ mod tests {
     #[test]
     fn one_password_provider_rejects_duplicate_managed_items() {
         let listed = serde_json::json!([
-            {"id": "abcdefghijklmnopqrstuvwx12", "title": ONE_PASSWORD_ITEM_TITLE},
-            {"id": "abcdefghijklmnopqrstuvwx13", "title": ONE_PASSWORD_ITEM_TITLE},
+            {
+                "id": "abcdefghijklmnopqrstuvwx12",
+                "title": ONE_PASSWORD_ITEM_TITLE,
+                "vault": { "id": "abcdefghijklmnopqrstuvwx34" },
+            },
+            {
+                "id": "abcdefghijklmnopqrstuvwx13",
+                "title": ONE_PASSWORD_ITEM_TITLE,
+                "vault": { "id": "abcdefghijklmnopqrstuvwx34" },
+            },
         ]);
         let provider = OnePasswordProvider {
             runner: FakeOpRunner::with_outputs([successful_op_output(

@@ -18,6 +18,7 @@ dist = true
 
 [dependencies]
 anyhow.workspace = true
+arboard.workspace = true
 argon2.workspace = true
 chrono = { workspace = true, features = ["clock"] }
 clap.workspace = true
