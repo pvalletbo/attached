@@ -25,6 +25,10 @@ curl --proto '=https' --tlsv1.2 -LsSf https://install.attached.sh | sh
 cargo install --git https://github.com/pvalletbo/attached.git --locked attached
 ```
 
+You can verify that herdr is correctly installed by running `herdr --version`. Although not mandatory, 
+it is highly recommended to have [fzf](https://junegunn.github.io/fzf/)
+installed as well for a better UX when attaching to remote sessions. 
+
 ## Attaching to your first remote session
 
 You must have two available hosts:
@@ -36,17 +40,24 @@ as long at can run herdr (a docker container would do it as well)
 Both hosts must have Herdr installed. You can find the instructions to install it 
 [here](https://herdr.dev/docs/install/). 
 
-Conceptually, these are the steps that you will be doing: 
+```bash
+# Client host
+# create an Attached account. No PII data is required.
+# You will need to add a password to protect the files written locally. 
+attached account create
+# Export the publisher-only credentials. They will be copied in your clipboard
+attached account export --type publish 
 
-1. Create a new Attached account in your client machine. No PII data required.
-2. Generate the `publish.bundle`, which contains the information required by the publisher.
-3. Run the `attached serve` command passing the `publish.bundle` in the publisher machine. 
-4. From the client host, connect to the remote session. 
+# Publisher host
+# On the publisher, start publishing its Herdr sessions.
+# You will need to paste the publish.bundle that was previously copied to the clipboard. 
+attached serve --host-label your-remote-session
 
+# Back on the client, select and attach to the remote session.
+attached attach
+```
 
-
-
-
-
+You should see something like the image below. You can just select the desired session and 
+you'll be attached to the remote herdr session. 
 
 
