@@ -9,8 +9,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use zeroize::Zeroizing;
 
 use crate::{
-    account_clipboard, herdr_version, identity, installation, local_encryption, publish_account,
-    secure_state, server, session, session_catalog,
+    account_clipboard, download_account, herdr_version, identity, installation, local_encryption,
+    publish_account, secure_state, server, session, session_catalog,
     session_picker::{self, SessionSelection},
     sync,
 };
@@ -35,7 +35,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create or export synchronization credentials.
+    /// Create, export, or import synchronization credentials.
     Account {
         #[command(subcommand)]
         command: AccountCommand,
@@ -149,6 +149,20 @@ enum AccountCommand {
         state_dir: Option<PathBuf>,
     },
 
+    /// Import a download-only account bundle for controlling synchronized machines.
+    Import {
+        /// Read the bundle from a file instead of prompting with hidden input.
+        #[arg(long, value_name = "FILE", conflicts_with = "bundle_stdin")]
+        bundle_file: Option<PathBuf>,
+
+        /// Read the bundle from standard input instead of prompting with hidden input.
+        #[arg(long, conflicts_with = "bundle_file")]
+        bundle_stdin: bool,
+
+        #[arg(long, hide = true)]
+        state_dir: Option<PathBuf>,
+    },
+
     /// Export one scoped secret bundle to the clipboard temporarily or to an explicit file.
     Export {
         /// API-key scope to export (`publish` is also accepted as `push`).
@@ -207,8 +221,20 @@ impl Cli {
                             "Use `attached account export --type publish` to copy a publish-only bundle, then paste it into `attached serve` on the serving host."
                         );
                         eprintln!(
-                            "If needed, create a download bundle with `attached account export --type download --output account.bundle`."
+                            "To add another downloader, export with `attached account export --type download --output account.bundle`, transfer the file securely, then run `attached account import --bundle-file account.bundle` there."
                         );
+                    }
+                    AccountCommand::Import {
+                        bundle_file,
+                        bundle_stdin,
+                        state_dir,
+                    } => {
+                        let state_dir = resolved_state_dir(state_dir)?;
+                        download_account::install(
+                            &state_dir,
+                            bundle_file.as_deref(),
+                            bundle_stdin,
+                        )?;
                     }
                     AccountCommand::Export {
                         key_type,
@@ -224,8 +250,16 @@ impl Cli {
                             account_clipboard::copy(&bundle).context(
                                 "could not copy the account bundle to the clipboard; no file was written (retry from a graphical session or pass `--output FILE`)",
                             )?;
+                            let destination = match scope {
+                                ApiKeyScope::Publish => {
+                                    "Paste it into `attached serve` on the serving host"
+                                }
+                                ApiKeyScope::Download => {
+                                    "Paste it into `attached account import` on another computer"
+                                }
+                            };
                             eprintln!(
-                                "Account bundle copied to the clipboard for {} minutes. Paste it into `attached serve`; Attached requested that clipboard managers not save it.",
+                                "Account bundle copied to the clipboard for {} minutes. {destination}; Attached requested that clipboard managers not save it.",
                                 account_clipboard::RETENTION.as_secs() / 60
                             );
                         }
@@ -426,6 +460,15 @@ mod tests {
                 "https://sync.example",
             ],
             vec!["attached", "account", "export", "--type", "publish"],
+            vec!["attached", "account", "import"],
+            vec!["attached", "account", "import", "--bundle-stdin"],
+            vec![
+                "attached",
+                "account",
+                "import",
+                "--bundle-file",
+                "/tmp/download.bundle",
+            ],
             vec![
                 "attached",
                 "account",
@@ -467,7 +510,6 @@ mod tests {
             Cli::try_parse_from(["attached", "sessions", "list", "--json"]).is_err(),
             "human list arguments must not accept the machine-readable flag"
         );
-        assert!(Cli::try_parse_from(["attached", "account", "import", "--bundle-stdin"]).is_err());
     }
 
     #[test]
@@ -496,6 +538,74 @@ mod tests {
             unreachable!();
         };
         assert_eq!(service, "https://sync.example");
+    }
+
+    #[test]
+    fn account_imports_prompt_by_default_and_accept_explicit_sources() {
+        let interactive = Cli::try_parse_from(["attached", "account", "import"]).unwrap();
+        let Command::Account {
+            command:
+                AccountCommand::Import {
+                    bundle_file,
+                    bundle_stdin,
+                    ..
+                },
+        } = interactive.command
+        else {
+            unreachable!();
+        };
+        assert_eq!(bundle_file, None);
+        assert!(!bundle_stdin);
+
+        let file = Cli::try_parse_from([
+            "attached",
+            "account",
+            "import",
+            "--bundle-file",
+            "account.bundle",
+        ])
+        .unwrap();
+        let Command::Account {
+            command:
+                AccountCommand::Import {
+                    bundle_file,
+                    bundle_stdin,
+                    ..
+                },
+        } = file.command
+        else {
+            unreachable!();
+        };
+        assert_eq!(bundle_file, Some(PathBuf::from("account.bundle")));
+        assert!(!bundle_stdin);
+
+        let stdin =
+            Cli::try_parse_from(["attached", "account", "import", "--bundle-stdin"]).unwrap();
+        let Command::Account {
+            command:
+                AccountCommand::Import {
+                    bundle_file,
+                    bundle_stdin,
+                    ..
+                },
+        } = stdin.command
+        else {
+            unreachable!();
+        };
+        assert_eq!(bundle_file, None);
+        assert!(bundle_stdin);
+
+        assert!(
+            Cli::try_parse_from([
+                "attached",
+                "account",
+                "import",
+                "--bundle-file",
+                "account.bundle",
+                "--bundle-stdin",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -601,6 +711,22 @@ mod tests {
             .to_string();
         assert!(export_help.contains("clipboard"), "{export_help}");
         assert!(export_help.contains("--output <FILE>"), "{export_help}");
+
+        let mut command = Cli::command();
+        let import_help = command
+            .find_subcommand_mut("account")
+            .unwrap()
+            .find_subcommand_mut("import")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(import_help.contains("download-only"), "{import_help}");
+        assert!(
+            import_help.contains("--bundle-file <FILE>"),
+            "{import_help}"
+        );
+        assert!(import_help.contains("--bundle-stdin"), "{import_help}");
+        assert!(import_help.contains("hidden input"), "{import_help}");
     }
 
     #[test]
