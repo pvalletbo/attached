@@ -25,6 +25,12 @@ pub struct Cli {
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count, global = true)]
     verbose: u8,
 
+    /// Write span timings in folded-stack format for flamegraph generation.
+    ///
+    /// Pass `-vv` as well to print each span's busy and idle durations.
+    #[arg(long, value_name = "FILE", global = true)]
+    flamegraph: Option<PathBuf>,
+
     /// Have 1Password generate and store the encryption password instead of prompting for one.
     #[arg(long, global = true)]
     use_1password: bool,
@@ -182,6 +188,11 @@ impl Cli {
         self.verbose
     }
 
+    pub fn flamegraph(&self) -> Option<&std::path::Path> {
+        self.flamegraph.as_deref()
+    }
+
+    #[tracing::instrument(name = "cli_run", level = "debug", skip_all)]
     pub async fn run(self) -> Result<i32> {
         local_encryption::configure_use_one_password(self.use_1password);
         match self.command {
@@ -750,11 +761,25 @@ mod tests {
     }
 
     #[test]
-    fn verbosity_is_repeatable_and_global() {
-        let cli = Cli::try_parse_from(["attached", "serve", "-vv"]).unwrap();
+    fn verbosity_and_flamegraph_output_are_global() {
+        let cli = Cli::try_parse_from(["attached", "serve", "-vv", "--flamegraph", "serve.folded"])
+            .unwrap();
         assert_eq!(cli.verbosity(), 2);
+        assert_eq!(cli.flamegraph(), Some(std::path::Path::new("serve.folded")));
 
-        let cli = Cli::try_parse_from(["attached", "-v", "attach", "office/work"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "attached",
+            "-v",
+            "--flamegraph",
+            "attach.folded",
+            "attach",
+            "office/work",
+        ])
+        .unwrap();
         assert_eq!(cli.verbosity(), 1);
+        assert_eq!(
+            cli.flamegraph(),
+            Some(std::path::Path::new("attach.folded"))
+        );
     }
 }

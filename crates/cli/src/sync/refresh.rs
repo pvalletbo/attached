@@ -61,6 +61,7 @@ impl fmt::Display for RefreshWarning {
     }
 }
 
+#[tracing::instrument(name = "refresh_sessions", level = "debug", skip_all)]
 pub async fn refresh_sessions(
     state_dir: &Path,
     local_version: HerdrVersion,
@@ -92,6 +93,7 @@ async fn refresh_sessions_with_registry(
     .await
 }
 
+#[tracing::instrument(name = "refresh_catalog", level = "debug", skip_all)]
 async fn refresh_sessions_with_registry_at(
     state_dir: &Path,
     local_version: HerdrVersion,

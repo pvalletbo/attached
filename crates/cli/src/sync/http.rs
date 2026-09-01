@@ -66,6 +66,7 @@ impl SyncHttpClient {
             .map_err(|_| anyhow::anyhow!("invalid account-creation response"))
     }
 
+    #[tracing::instrument(name = "http_list_records", level = "debug", skip_all)]
     pub async fn list_records(&self, account: &AccountCredentials) -> Result<LiveRecordIndex> {
         ensure!(
             account.api_key_scope() == ApiKeyScope::Download,
@@ -90,6 +91,7 @@ impl SyncHttpClient {
         parse_live_record_index(&body).map_err(|_| anyhow::anyhow!("invalid live-record index"))
     }
 
+    #[tracing::instrument(name = "http_get_record", level = "debug", skip_all)]
     pub async fn get_record(
         &self,
         account: &AccountCredentials,
@@ -205,6 +207,7 @@ fn ensure_json(response: &Response) -> Result<()> {
     Ok(())
 }
 
+#[tracing::instrument(name = "http_read_body", level = "debug", skip_all)]
 async fn bounded_response(response: Response, limit: usize) -> Result<Vec<u8>> {
     if response
         .content_length()
