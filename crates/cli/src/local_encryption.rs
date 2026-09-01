@@ -96,6 +96,7 @@ struct UserPasswordProvider<P> {
 }
 
 impl<P: PasswordPrompt> PasswordProvider for UserPasswordProvider<P> {
+    #[tracing::instrument(name = "user_password", level = "debug", skip_all)]
     fn password(&self, create: bool) -> Result<Zeroizing<Vec<u8>>> {
         let mut cached = self
             .cached
@@ -142,6 +143,7 @@ struct PasswordMasterKeyStore<P> {
 }
 
 impl<P: PasswordProvider> MasterKeyStore for PasswordMasterKeyStore<P> {
+    #[tracing::instrument(name = "master_key_load", level = "debug", skip_all)]
     fn load_or_create(
         &self,
         directory: &crate::secure_state::StateDir,
@@ -157,6 +159,7 @@ impl<P: PasswordProvider> MasterKeyStore for PasswordMasterKeyStore<P> {
     }
 }
 
+#[tracing::instrument(name = "kdf_salt_load", level = "debug", skip_all)]
 fn load_or_create_kdf_salt(
     directory: &crate::secure_state::StateDir,
     create: bool,
@@ -192,6 +195,7 @@ fn parse_kdf_salt(stored: &[u8]) -> Result<[u8; KDF_SALT_BYTES]> {
     Ok(salt)
 }
 
+#[tracing::instrument(name = "argon2id_kdf", level = "debug", skip_all)]
 fn derive_master_key(
     password: &[u8],
     salt: &[u8; KDF_SALT_BYTES],
@@ -229,6 +233,9 @@ struct ProcessOpRunner {
 #[cfg(not(test))]
 impl OpRunner for ProcessOpRunner {
     fn run(&self, arguments: &[String]) -> Result<OpOutput> {
+        let operation = arguments.get(1).map_or("unknown", String::as_str);
+        let span = tracing::debug_span!("one_password_cli", operation);
+        let _entered = span.enter();
         let output = Command::new(&self.executable)
             .args(arguments)
             .stdin(Stdio::null())
@@ -266,6 +273,7 @@ struct ListedVault {
 }
 
 impl<R: OpRunner> OnePasswordProvider<R> {
+    #[tracing::instrument(name = "one_password_find_item", level = "debug", skip_all)]
     fn item(&self) -> Result<Option<ListedItem>> {
         let output = self.runner.run(&[
             "item".to_owned(),
@@ -304,6 +312,7 @@ impl<R: OpRunner> OnePasswordProvider<R> {
         Ok(Some(selected))
     }
 
+    #[tracing::instrument(name = "one_password_read_item", level = "debug", skip_all)]
     fn read_item_password(&self, item: ListedItem) -> Result<Zeroizing<Vec<u8>>> {
         let output = self.runner.run(&[
             "item".to_owned(),
@@ -317,6 +326,7 @@ impl<R: OpRunner> OnePasswordProvider<R> {
         parse_one_password_output(output.stdout)
     }
 
+    #[tracing::instrument(name = "one_password_create_item", level = "debug", skip_all)]
     fn create_item(&self) -> Result<()> {
         let output = self.runner.run(&[
             "item".to_owned(),
@@ -336,6 +346,7 @@ impl<R: OpRunner> OnePasswordProvider<R> {
 }
 
 impl<R: OpRunner> PasswordProvider for OnePasswordProvider<R> {
+    #[tracing::instrument(name = "one_password", level = "debug", skip_all)]
     fn password(&self, create: bool) -> Result<Zeroizing<Vec<u8>>> {
         let mut cached = self
             .cached
@@ -461,6 +472,7 @@ pub(crate) fn with_master_key_store<T>(
     with_master_key_store_at(directory, &coordination, store, create, operation)
 }
 
+#[tracing::instrument(name = "master_key_operation", level = "debug", skip_all)]
 fn with_master_key_store_at<T>(
     directory: &crate::secure_state::StateDir,
     coordination: &Path,
@@ -565,6 +577,12 @@ pub(crate) fn has_envelope_shape(bytes: &[u8]) -> bool {
     is_envelope(bytes) || bytes.len() >= HEADER_BYTES + TAG_BYTES
 }
 
+#[tracing::instrument(
+    name = "local_secret_encrypt",
+    level = "debug",
+    skip_all,
+    fields(purpose = purpose.name(), plaintext_bytes = plaintext.len())
+)]
 pub(crate) fn seal(
     key: &[u8; 32],
     purpose: Purpose,
@@ -594,6 +612,12 @@ pub(crate) fn seal(
     Ok(envelope)
 }
 
+#[tracing::instrument(
+    name = "local_secret_decrypt",
+    level = "debug",
+    skip_all,
+    fields(purpose = purpose.name(), ciphertext_bytes = envelope.len())
+)]
 pub(crate) fn open(
     key: &[u8; 32],
     purpose: Purpose,
