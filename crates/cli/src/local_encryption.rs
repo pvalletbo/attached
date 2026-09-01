@@ -15,7 +15,7 @@ use std::{
 use anyhow::{Context as _, Result, bail, ensure};
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit as _, Nonce, aead::AeadInOut as _};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 const MAGIC: &[u8; 8] = b"ATSECR01";
@@ -41,6 +41,8 @@ const MAX_PASSWORD_BYTES: usize = 1024;
 const ONE_PASSWORD_ITEM_TITLE: &str = "Attached encryption password";
 const ONE_PASSWORD_ITEM_TAG: &str = "com.pvalletbo.attached/encryption-password-v1";
 const ONE_PASSWORD_FIELD: &str = "password";
+const ONE_PASSWORD_LOCATOR_FILE: &str = "one-password-item.json";
+const MAX_ONE_PASSWORD_LOCATOR_BYTES: usize = 1024;
 const ONE_PASSWORD_UNAVAILABLE: &str =
     "1Password is unavailable; unlock or sign in with the `op` CLI and retry";
 #[cfg(not(test))]
@@ -67,7 +69,11 @@ pub(crate) trait MasterKeyStore: Send + Sync {
 }
 
 trait PasswordProvider: Send + Sync {
-    fn password(&self, create: bool) -> Result<Zeroizing<Vec<u8>>>;
+    fn password(
+        &self,
+        directory: &crate::secure_state::StateDir,
+        create: bool,
+    ) -> Result<Zeroizing<Vec<u8>>>;
 
     fn remove(&self) -> Result<()> {
         bail!("user-provided encryption password is not stored")
@@ -96,7 +102,11 @@ struct UserPasswordProvider<P> {
 }
 
 impl<P: PasswordPrompt> PasswordProvider for UserPasswordProvider<P> {
-    fn password(&self, create: bool) -> Result<Zeroizing<Vec<u8>>> {
+    fn password(
+        &self,
+        _directory: &crate::secure_state::StateDir,
+        create: bool,
+    ) -> Result<Zeroizing<Vec<u8>>> {
         let mut cached = self
             .cached
             .lock()
@@ -137,8 +147,14 @@ fn validate_password(password: &[u8]) -> Result<()> {
     Ok(())
 }
 
+struct CachedMasterKey {
+    salt: [u8; KDF_SALT_BYTES],
+    key: Zeroizing<[u8; MASTER_KEY_BYTES]>,
+}
+
 struct PasswordMasterKeyStore<P> {
     passwords: P,
+    cached_key: Mutex<Option<CachedMasterKey>>,
 }
 
 impl<P: PasswordProvider> MasterKeyStore for PasswordMasterKeyStore<P> {
@@ -148,12 +164,32 @@ impl<P: PasswordProvider> MasterKeyStore for PasswordMasterKeyStore<P> {
         create: bool,
     ) -> Result<Zeroizing<[u8; MASTER_KEY_BYTES]>> {
         let salt = load_or_create_kdf_salt(directory, create)?;
-        let password = self.passwords.password(create)?;
-        derive_master_key(&password, &salt)
+        let mut cached = self
+            .cached_key
+            .lock()
+            .map_err(|_| anyhow::anyhow!("encryption key cache is unavailable"))?;
+        if let Some(cached) = cached.as_ref()
+            && cached.salt == salt
+        {
+            return Ok(Zeroizing::new(*cached.key));
+        }
+
+        let password = self.passwords.password(directory, create)?;
+        let key = derive_master_key(&password, &salt)?;
+        *cached = Some(CachedMasterKey {
+            salt,
+            key: Zeroizing::new(*key),
+        });
+        Ok(key)
     }
 
     fn remove(&self) -> Result<()> {
-        self.passwords.remove()
+        self.passwords.remove()?;
+        *self
+            .cached_key
+            .lock()
+            .map_err(|_| anyhow::anyhow!("encryption key cache is unavailable"))? = None;
+        Ok(())
     }
 }
 
@@ -265,8 +301,46 @@ struct ListedVault {
     id: String,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ItemLocator {
+    item_id: String,
+    vault_id: String,
+}
+
+impl ItemLocator {
+    fn from_item(item: ListedItem) -> Result<Self> {
+        let locator = Self {
+            item_id: item.id,
+            vault_id: item.vault.id,
+        };
+        locator.validate()?;
+        Ok(locator)
+    }
+
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.item_id.is_empty()
+                && self
+                    .item_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric()),
+            "1Password returned an invalid item identifier"
+        );
+        ensure!(
+            !self.vault_id.is_empty()
+                && self
+                    .vault_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric()),
+            "1Password returned an invalid vault identifier"
+        );
+        Ok(())
+    }
+}
+
 impl<R: OpRunner> OnePasswordProvider<R> {
-    fn item(&self) -> Result<Option<ListedItem>> {
+    fn item(&self) -> Result<Option<ItemLocator>> {
         let output = self.runner.run(&[
             "item".to_owned(),
             "list".to_owned(),
@@ -288,28 +362,62 @@ impl<R: OpRunner> OnePasswordProvider<R> {
         let Some(selected) = selected else {
             return Ok(None);
         };
-        ensure!(
-            !selected.id.is_empty() && selected.id.bytes().all(|byte| byte.is_ascii_alphanumeric()),
-            "1Password returned an invalid item identifier"
-        );
-        ensure!(
-            !selected.vault.id.is_empty()
-                && selected
-                    .vault
-                    .id
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric()),
-            "1Password returned an invalid vault identifier"
-        );
-        Ok(Some(selected))
+        ItemLocator::from_item(selected).map(Some)
     }
 
-    fn read_item_password(&self, item: ListedItem) -> Result<Zeroizing<Vec<u8>>> {
+    fn load_item_locator(
+        &self,
+        directory: &crate::secure_state::StateDir,
+    ) -> Result<Option<ItemLocator>> {
+        let Some(encoded) = directory.read_secret_optional_bounded(
+            ONE_PASSWORD_LOCATOR_FILE,
+            MAX_ONE_PASSWORD_LOCATOR_BYTES,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Ok(locator) = serde_json::from_slice::<ItemLocator>(&encoded) else {
+            tracing::debug!(
+                event = "one_password_item_locator_invalid",
+                "ignored invalid cached 1Password item metadata"
+            );
+            return Ok(None);
+        };
+        if locator.validate().is_err() {
+            tracing::debug!(
+                event = "one_password_item_locator_invalid",
+                "ignored invalid cached 1Password item metadata"
+            );
+            return Ok(None);
+        }
+        Ok(Some(locator))
+    }
+
+    fn store_item_locator(
+        &self,
+        directory: &crate::secure_state::StateDir,
+        locator: &ItemLocator,
+    ) -> Result<()> {
+        locator.validate()?;
+        let encoded = serde_json::to_vec(locator)
+            .context("could not encode cached 1Password item metadata")?;
+        ensure!(
+            encoded.len() <= MAX_ONE_PASSWORD_LOCATOR_BYTES,
+            "cached 1Password item metadata exceeds local limit"
+        );
+        if directory.create_noclobber(ONE_PASSWORD_LOCATOR_FILE, &encoded)? {
+            Ok(())
+        } else {
+            directory.atomic_replace(ONE_PASSWORD_LOCATOR_FILE, &encoded)
+        }
+    }
+
+    fn read_item_password(&self, locator: &ItemLocator) -> Result<Zeroizing<Vec<u8>>> {
         let output = self.runner.run(&[
             "item".to_owned(),
             "get".to_owned(),
-            item.id,
-            format!("--vault={}", item.vault.id),
+            locator.item_id.clone(),
+            format!("--vault={}", locator.vault_id),
             format!("--fields=label={ONE_PASSWORD_FIELD}"),
             "--reveal".to_owned(),
         ])?;
@@ -336,7 +444,11 @@ impl<R: OpRunner> OnePasswordProvider<R> {
 }
 
 impl<R: OpRunner> PasswordProvider for OnePasswordProvider<R> {
-    fn password(&self, create: bool) -> Result<Zeroizing<Vec<u8>>> {
+    fn password(
+        &self,
+        directory: &crate::secure_state::StateDir,
+        create: bool,
+    ) -> Result<Zeroizing<Vec<u8>>> {
         let mut cached = self
             .cached
             .lock()
@@ -345,8 +457,15 @@ impl<R: OpRunner> PasswordProvider for OnePasswordProvider<R> {
             return Ok(Zeroizing::new(password.to_vec()));
         }
 
-        let item = match self.item()? {
-            Some(item) => item,
+        if let Some(locator) = self.load_item_locator(directory)?
+            && let Ok(password) = self.read_item_password(&locator)
+        {
+            *cached = Some(Zeroizing::new(password.to_vec()));
+            return Ok(password);
+        }
+
+        let locator = match self.item()? {
+            Some(locator) => locator,
             None if create => {
                 self.create_item()?;
                 self.item()?
@@ -354,20 +473,21 @@ impl<R: OpRunner> PasswordProvider for OnePasswordProvider<R> {
             }
             None => bail!("encryption password is missing from 1Password"),
         };
-        let password = self.read_item_password(item)?;
+        let password = self.read_item_password(&locator)?;
+        self.store_item_locator(directory, &locator)?;
         *cached = Some(Zeroizing::new(password.to_vec()));
         Ok(password)
     }
 
     fn remove(&self) -> Result<()> {
-        let Some(item) = self.item()? else {
+        let Some(locator) = self.item()? else {
             return Ok(());
         };
         let output = self.runner.run(&[
             "item".to_owned(),
             "delete".to_owned(),
-            item.id,
-            format!("--vault={}", item.vault.id),
+            locator.item_id,
+            format!("--vault={}", locator.vault_id),
         ])?;
         ensure!(output.success, ONE_PASSWORD_UNAVAILABLE);
         Ok(())
@@ -395,6 +515,7 @@ static USER_PASSWORD_STORE: LazyLock<
         prompt: TtyPasswordPrompt,
         cached: Mutex::new(None),
     },
+    cached_key: Mutex::new(None),
 });
 
 #[cfg(not(test))]
@@ -406,6 +527,7 @@ static ONE_PASSWORD_STORE: LazyLock<PasswordMasterKeyStore<OnePasswordProvider<P
             },
             cached: Mutex::new(None),
         },
+        cached_key: Mutex::new(None),
     });
 
 // Uninstall deliberately preserves a shared 1Password-managed password because
@@ -691,10 +813,37 @@ mod tests {
 
     struct FixedPasswordProvider(&'static [u8]);
 
+    struct CountingPasswordProvider {
+        calls: AtomicUsize,
+    }
+
+    impl PasswordProvider for CountingPasswordProvider {
+        fn password(
+            &self,
+            _directory: &crate::secure_state::StateDir,
+            _create: bool,
+        ) -> Result<Zeroizing<Vec<u8>>> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(Zeroizing::new(b"correct horse battery staple".to_vec()))
+        }
+    }
+
     impl PasswordProvider for FixedPasswordProvider {
-        fn password(&self, _create: bool) -> Result<Zeroizing<Vec<u8>>> {
+        fn password(
+            &self,
+            _directory: &crate::secure_state::StateDir,
+            _create: bool,
+        ) -> Result<Zeroizing<Vec<u8>>> {
             Ok(Zeroizing::new(self.0.to_vec()))
         }
+    }
+
+    fn test_state_directory() -> (tempfile::TempDir, crate::secure_state::StateDir) {
+        let root = crate::test_support::canonical_tempdir();
+        let state = root.path().join("state");
+        crate::secure_state::prepare_private_dir(&state).unwrap();
+        let directory = crate::secure_state::StateDir::open(&state).unwrap();
+        (root, directory)
     }
 
     #[derive(Debug)]
@@ -738,6 +887,7 @@ mod tests {
 
     #[test]
     fn user_password_creation_prompts_for_confirmation_and_caches_the_result() {
+        let (_root, directory) = test_state_directory();
         let provider = UserPasswordProvider {
             prompt: FakePrompt::new([
                 "correct horse battery staple",
@@ -746,8 +896,8 @@ mod tests {
             cached: Mutex::new(None),
         };
 
-        let first = provider.password(true).unwrap();
-        let second = provider.password(false).unwrap();
+        let first = provider.password(&directory, true).unwrap();
+        let second = provider.password(&directory, false).unwrap();
 
         assert_eq!(first.as_slice(), b"correct horse battery staple");
         assert_eq!(second.as_slice(), first.as_slice());
@@ -756,11 +906,12 @@ mod tests {
 
     #[test]
     fn mismatched_or_empty_user_passwords_are_rejected_without_caching() {
+        let (_root, directory) = test_state_directory();
         let mismatch = UserPasswordProvider {
             prompt: FakePrompt::new(["first password", "different password"]),
             cached: Mutex::new(None),
         };
-        let error = mismatch.password(true).unwrap_err().to_string();
+        let error = mismatch.password(&directory, true).unwrap_err().to_string();
         assert!(error.contains("do not match"), "{error}");
         assert!(mismatch.cached.lock().unwrap().is_none());
 
@@ -768,7 +919,7 @@ mod tests {
             prompt: FakePrompt::new([""]),
             cached: Mutex::new(None),
         };
-        let error = empty.password(false).unwrap_err().to_string();
+        let error = empty.password(&directory, false).unwrap_err().to_string();
         assert!(error.contains("cannot be empty"), "{error}");
     }
 
@@ -801,6 +952,7 @@ mod tests {
         let directory = crate::secure_state::StateDir::open(&state).unwrap();
         let store = PasswordMasterKeyStore {
             passwords: FixedPasswordProvider(b"correct horse battery staple"),
+            cached_key: Mutex::new(None),
         };
 
         let first = store.load_or_create(&directory, true).unwrap();
@@ -821,7 +973,44 @@ mod tests {
     }
 
     #[test]
+    fn password_store_reuses_the_derived_key_until_the_salt_changes() {
+        let root = crate::test_support::canonical_tempdir();
+        let first_state = root.path().join("first");
+        let second_state = root.path().join("second");
+        crate::secure_state::prepare_private_dir(&first_state).unwrap();
+        crate::secure_state::prepare_private_dir(&second_state).unwrap();
+        let first_directory = crate::secure_state::StateDir::open(&first_state).unwrap();
+        let second_directory = crate::secure_state::StateDir::open(&second_state).unwrap();
+        assert!(
+            first_directory
+                .create_noclobber(KDF_SALT_FILE, &[0x41; KDF_SALT_BYTES])
+                .unwrap()
+        );
+        assert!(
+            second_directory
+                .create_noclobber(KDF_SALT_FILE, &[0x42; KDF_SALT_BYTES])
+                .unwrap()
+        );
+        let store = PasswordMasterKeyStore {
+            passwords: CountingPasswordProvider {
+                calls: AtomicUsize::new(0),
+            },
+            cached_key: Mutex::new(None),
+        };
+
+        let first = store.load_or_create(&first_directory, false).unwrap();
+        let repeated = store.load_or_create(&first_directory, false).unwrap();
+        assert_eq!(first, repeated);
+        assert_eq!(store.passwords.calls.load(AtomicOrdering::SeqCst), 1);
+
+        let second = store.load_or_create(&second_directory, false).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(store.passwords.calls.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    #[test]
     fn one_password_provider_reads_and_caches_the_concealed_password() {
+        let (root, directory) = test_state_directory();
         let item_id = "abcdefghijklmnopqrstuvwx12";
         let vault_id = "abcdefghijklmnopqrstuvwx34";
         let password = "generated-1Password-secret";
@@ -840,11 +1029,11 @@ mod tests {
         };
 
         assert_eq!(
-            provider.password(false).unwrap().as_slice(),
+            provider.password(&directory, false).unwrap().as_slice(),
             password.as_bytes()
         );
         assert_eq!(
-            provider.password(false).unwrap().as_slice(),
+            provider.password(&directory, false).unwrap().as_slice(),
             password.as_bytes()
         );
 
@@ -873,10 +1062,109 @@ mod tests {
                 .iter()
                 .all(|argument| !argument.contains(password))
         }));
+        drop(calls);
+
+        let locator_path = root.path().join("state").join(ONE_PASSWORD_LOCATOR_FILE);
+        let locator = std::fs::read(&locator_path).unwrap();
+        assert!(
+            !locator
+                .windows(password.len())
+                .any(|bytes| bytes == password.as_bytes())
+        );
+        assert_eq!(
+            std::fs::metadata(&locator_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o600
+        );
+
+        let resumed = OnePasswordProvider {
+            runner: FakeOpRunner::with_outputs([successful_op_output(format!("{password}\n"))]),
+            cached: Mutex::new(None),
+        };
+        assert_eq!(
+            resumed.password(&directory, false).unwrap().as_slice(),
+            password.as_bytes()
+        );
+        let resumed_calls = resumed.runner.calls.lock().unwrap();
+        assert_eq!(resumed_calls.len(), 1);
+        assert!(
+            resumed_calls[0]
+                .arguments
+                .iter()
+                .any(|argument| argument == "get")
+        );
+        assert!(
+            !resumed_calls[0]
+                .arguments
+                .iter()
+                .any(|argument| argument == "list")
+        );
+    }
+
+    #[test]
+    fn stale_one_password_item_locator_is_rediscovered_and_replaced() {
+        let (root, directory) = test_state_directory();
+        let stale = ItemLocator {
+            item_id: "abcdefghijklmnopqrstuvwx99".to_owned(),
+            vault_id: "abcdefghijklmnopqrstuvwx98".to_owned(),
+        };
+        assert!(
+            directory
+                .create_noclobber(
+                    ONE_PASSWORD_LOCATOR_FILE,
+                    &serde_json::to_vec(&stale).unwrap(),
+                )
+                .unwrap()
+        );
+        let item_id = "abcdefghijklmnopqrstuvwx12";
+        let vault_id = "abcdefghijklmnopqrstuvwx34";
+        let listed = serde_json::json!([{
+            "id": item_id,
+            "title": ONE_PASSWORD_ITEM_TITLE,
+            "vault": { "id": vault_id },
+        }]);
+        let provider = OnePasswordProvider {
+            runner: FakeOpRunner::with_outputs([
+                OpOutput {
+                    success: false,
+                    stdout: Zeroizing::new(Vec::new()),
+                },
+                successful_op_output(serde_json::to_vec(&listed).unwrap()),
+                successful_op_output(b"rediscovered-password\n"),
+            ]),
+            cached: Mutex::new(None),
+        };
+
+        assert_eq!(
+            provider.password(&directory, false).unwrap().as_slice(),
+            b"rediscovered-password"
+        );
+        let calls = provider.runner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 3);
+        assert!(calls[0].arguments.iter().any(|argument| argument == "get"));
+        assert!(calls[1].arguments.iter().any(|argument| argument == "list"));
+        assert!(
+            calls[2]
+                .arguments
+                .iter()
+                .any(|argument| argument == item_id)
+        );
+        drop(calls);
+
+        let stored: ItemLocator = serde_json::from_slice(
+            &std::fs::read(root.path().join("state").join(ONE_PASSWORD_LOCATOR_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stored.item_id, item_id);
+        assert_eq!(stored.vault_id, vault_id);
     }
 
     #[test]
     fn one_password_provider_requests_an_auto_generated_password() {
+        let (_root, directory) = test_state_directory();
         let item_id = "abcdefghijklmnopqrstuvwx12";
         let vault_id = "abcdefghijklmnopqrstuvwx34";
         let listed = serde_json::json!([{
@@ -895,7 +1183,7 @@ mod tests {
         };
 
         assert_eq!(
-            provider.password(true).unwrap().as_slice(),
+            provider.password(&directory, true).unwrap().as_slice(),
             b"generated-password"
         );
 
@@ -912,6 +1200,7 @@ mod tests {
 
     #[test]
     fn one_password_provider_reports_unavailable_cli_without_backend_details() {
+        let (_root, directory) = test_state_directory();
         let provider = OnePasswordProvider {
             runner: FakeOpRunner::with_outputs([OpOutput {
                 success: false,
@@ -920,7 +1209,10 @@ mod tests {
             cached: Mutex::new(None),
         };
 
-        let error = provider.password(false).unwrap_err().to_string();
+        let error = provider
+            .password(&directory, false)
+            .unwrap_err()
+            .to_string();
 
         assert!(error.contains("unlock or sign in"), "{error}");
         assert!(!error.contains("synthetic sensitive"), "{error}");
@@ -928,6 +1220,7 @@ mod tests {
 
     #[test]
     fn one_password_provider_rejects_duplicate_managed_items() {
+        let (_root, directory) = test_state_directory();
         let listed = serde_json::json!([
             {
                 "id": "abcdefghijklmnopqrstuvwx12",
@@ -947,7 +1240,10 @@ mod tests {
             cached: Mutex::new(None),
         };
 
-        let error = provider.password(false).unwrap_err().to_string();
+        let error = provider
+            .password(&directory, false)
+            .unwrap_err()
+            .to_string();
 
         assert!(
             error.contains("multiple Attached encryption password items"),
