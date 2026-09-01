@@ -18,20 +18,24 @@ test("manifest declares a loadable third-party overlay", () => {
   assert.ok(fs.statSync(path.join(plugin, manifest.entryPoints.overlay)).isFile());
 });
 
-test("documentation matches the 1Password integration contract", () => {
+test("configuration and documentation match both password providers", () => {
+  const config = JSON.parse(fs.readFileSync(path.join(integration, "config.json"), "utf8"));
+  assert.deepEqual(config, { encryptionPasswordProvider: "password" });
+
   const readme = fs.readFileSync(path.join(integration, "README.md"), "utf8");
   for (const contract of [
     "AI contribution notice",
+    "encryptionPasswordProvider",
+    '"password"',
+    '"1password"',
+    "attached sessions --json --password-stdin",
     "attached --use-1password sessions --json",
-    "attached --use-1password attach <target>",
-    "Existing password-prompt state is not automatically migrated",
     "Ctrl+O",
     "qmlformat",
     "real Omarchy 4.0.1 Wayland session"
   ]) {
     assert.match(readme, new RegExp(contract.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), contract);
   }
-  assert.doesNotMatch(readme, /It passes `attached attach <target>`/);
 
   const rootReadme = fs.readFileSync(path.join(repository, "README.md"), "utf8");
   assert.match(rootReadme, /AI contribution notice/);
@@ -41,7 +45,12 @@ test("documentation matches the 1Password integration contract", () => {
 test("overlay supports safe catalog loading, keyboard and pointer activation", () => {
   const qml = fs.readFileSync(path.join(plugin, "Overlay.qml"), "utf8");
   for (const contract of [
-    'command: ["attached", "--use-1password", "sessions", "--json"]',
+    "FileView",
+    'path: root.configHome + "/attached/omarchy.json"',
+    "SessionModel.catalogCommand",
+    "stdinEnabled: true",
+    "catalogProcess.write",
+    "TextInput.Password",
     "stderr: StdioCollector",
     "SessionModel.parseCatalog",
     "SessionModel.filterSessions",

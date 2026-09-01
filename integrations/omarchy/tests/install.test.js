@@ -24,6 +24,7 @@ test("installer is idempotent and refuses every destructive or partial write", (
   const log = path.join(root, "commands.log");
   const bindingsPath = path.join(config, "hypr", "bindings.lua");
   const destination = path.join(config, "omarchy", "plugins", "pvalletbo.attached");
+  const providerConfig = path.join(config, "attached", "omarchy.json");
   fs.mkdirSync(path.dirname(bindingsPath), { recursive: true });
   fs.mkdirSync(bin, { recursive: true });
 
@@ -53,6 +54,18 @@ test("installer is idempotent and refuses every destructive or partial write", (
 
   const cleanBindings = "-- existing user binding\n";
   fs.writeFileSync(bindingsPath, cleanBindings);
+
+  fs.mkdirSync(path.dirname(providerConfig), { recursive: true });
+  const providerTarget = path.join(root, "provider-target.json");
+  fs.writeFileSync(providerTarget, "user data\n");
+  fs.symlinkSync(providerTarget, providerConfig);
+  const symlinkedProvider = runInstaller(env);
+  assert.notEqual(symlinkedProvider.status, 0);
+  assert.match(symlinkedProvider.stderr, /symlinked plugin configuration/);
+  assert.equal(fs.readFileSync(providerTarget, "utf8"), "user data\n");
+  assert.equal(fs.existsSync(destination), false);
+  fs.unlinkSync(providerConfig);
+
   for (const failedCommand of [
     "omarchy-shell shell rescanPlugins",
     "omarchy plugin enable pvalletbo.attached"
@@ -64,13 +77,26 @@ test("installer is idempotent and refuses every destructive or partial write", (
     assert.notEqual(failed.status, 0);
     assert.match(failed.stderr, /restored the previous plugin and bindings/);
     assert.equal(fs.existsSync(destination), false, "failed install must remove plugin files");
+    assert.equal(fs.existsSync(providerConfig), false, "failed install must remove new config");
     assert.equal(fs.readFileSync(bindingsPath, "utf8"), cleanBindings);
   }
 
-  for (let run = 0; run < 2; run++) {
-    const installed = runInstaller(env);
-    assert.equal(installed.status, 0, installed.stderr);
-  }
+  const installed = runInstaller(env);
+  assert.equal(installed.status, 0, installed.stderr);
+  assert.deepEqual(JSON.parse(fs.readFileSync(providerConfig, "utf8")), {
+    encryptionPasswordProvider: "password"
+  });
+  assert.equal(fs.statSync(providerConfig).mode & 0o777, 0o600);
+
+  const customizedProvider = '{\n  "encryptionPasswordProvider": "1password"\n}\n';
+  fs.writeFileSync(providerConfig, customizedProvider, { mode: 0o600 });
+  const reinstalled = runInstaller(env);
+  assert.equal(reinstalled.status, 0, reinstalled.stderr);
+  assert.equal(
+    fs.readFileSync(providerConfig, "utf8"),
+    customizedProvider,
+    "installer must preserve the user-owned provider preference"
+  );
 
   for (const file of ["manifest.json", "Overlay.qml", "SessionModel.js"])
     assert.ok(fs.statSync(path.join(destination, file)).isFile(), file);

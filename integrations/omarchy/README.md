@@ -8,14 +8,9 @@ The first-party-style Omarchy Shell overlay in this directory searches the sessi
 
 - Omarchy 4.0.1 or newer with `omarchy` and `omarchy-shell` on `PATH`.
 - `attached` installed on `PATH`.
-- The 1Password CLI (`op`) connected to a signed-in 1Password app.
-- An Attached download account whose encrypted local state was created with `--use-1password`. Verify it with:
+- An Attached download account. Verify password-backed state with `attached sessions --json`, or state created with `--use-1password` with `attached --use-1password sessions --json`.
 
-  ```bash
-  attached --use-1password sessions --json
-  ```
-
-  An unconfigured account prints `[]`; configuration, unlock, and network errors fail with a non-zero exit code. The overlay has no controlling terminal and therefore always selects the 1Password backend. Existing password-prompt state is not automatically migrated.
+An unconfigured account prints `[]`; configuration, unlock, and network errors fail with a non-zero exit code. 1Password is optional.
 
 ## Install
 
@@ -25,13 +20,23 @@ From a checkout of this repository:
 ./integrations/omarchy/install.sh
 ```
 
-The installer validates and copies only the three plugin runtime files, adds one managed shortcut block to `~/.config/hypr/bindings.lua`, rescans Omarchy Shell, and enables `pvalletbo.attached`. Re-running it is idempotent while installed files are unchanged. It refuses to overwrite an unrecognized installation, local plugin modifications, or symlinked destinations. If copying, rescanning, or enabling fails, it restores the previous plugin files and bindings.
+The installer validates and copies only the three plugin runtime files, adds one managed shortcut block to `~/.config/hypr/bindings.lua`, creates `~/.config/attached/omarchy.json` when it does not exist, rescans Omarchy Shell, and enables `pvalletbo.attached`. Re-running it is idempotent while installed files are unchanged, and it never overwrites the user-owned provider configuration. It refuses to overwrite an unrecognized installation, local plugin modifications, or symlinked destinations. If copying, rescanning, or enabling fails, it restores the previous plugin files and bindings and removes any configuration created by the failed attempt.
 
-Press **Super+Ctrl+Shift+H** to toggle the right-side picker. Type to fuzzy-filter, use **Up/Down** to move, **Enter** or a mouse click to connect, **Escape** to clear the query or dismiss, **Ctrl+R** to retry a failed refresh, and **Ctrl+O** to ask Omarchy to open or install 1Password.
+The default configuration uses the regular encryption password:
+
+```json
+{
+  "encryptionPasswordProvider": "password"
+}
+```
+
+Set `encryptionPasswordProvider` to `"1password"` to use the 1Password CLI instead. Existing encrypted state is not migrated when this setting changes, so select the provider that was used to create it.
+
+Press **Super+Ctrl+Shift+H** to toggle the right-side picker. With the default provider, enter the encryption password first. Then type to fuzzy-filter, use **Up/Down** to move, **Enter** or a mouse click to connect, **Escape** to clear the query or dismiss, and **Ctrl+R** to retry a failed refresh. With the 1Password provider, **Ctrl+O** asks Omarchy to open or install 1Password.
 
 ## Integration contract
 
-`attached sessions --json` is the stable machine boundary. Because Omarchy Shell cannot answer an interactive password prompt, the overlay invokes it as `attached --use-1password sessions --json`. It returns a JSON array containing only:
+`attached sessions --json` is the stable machine boundary. Omarchy Shell has no controlling terminal, so the default provider invokes it as `attached sessions --json --password-stdin` and writes the password to the process's anonymous standard-input pipe. The password is not placed in arguments or environment variables and is cleared from the overlay immediately after writing. The configured 1Password provider instead invokes `attached --use-1password sessions --json`. Both return a JSON array containing only:
 
 ```json
 [
@@ -44,7 +49,7 @@ Press **Super+Ctrl+Shift+H** to toggle the right-side picker. Type to fuzzy-filt
 ]
 ```
 
-The overlay rejects malformed, oversized, and inconsistent rows before display. It passes `attached --use-1password attach <target>` to the Omarchy terminal launcher as an argv array rather than a shell string, so a target can never become shell syntax. Session and query text is rendered as plain text. Raw command stderr is not rendered in the overlay; failures become bounded guidance for opening 1Password, retrying, or running the same command in a terminal. Diagnostics report lifecycle events and counts without logging session targets or catalog payloads.
+The overlay rejects malformed, oversized, and inconsistent rows before display. It passes `attached attach <target>` to the Omarchy terminal launcher for password-backed state, where Attached prompts again in the new terminal. It adds `--use-1password` only for the configured 1Password provider. Both commands are argv arrays rather than shell strings, so a target can never become shell syntax. Session and query text is rendered as plain text. Raw command stderr is not rendered in the overlay; failures become bounded provider-specific guidance. Diagnostics report lifecycle events and counts without logging session targets, passwords, or catalog payloads.
 
 ## Validate
 
@@ -63,13 +68,14 @@ On an Omarchy host, also validate the plugin manifest and target-only imports:
 omarchy plugin validate integrations/omarchy/pvalletbo.attached
 ```
 
-The JavaScript tests cover strict catalog parsing, bounded inputs, deterministic case-insensitive fuzzy ranking, safe terminal argv construction, documentation contracts, plugin structure, and installer idempotency, rollback, and fail-closed behavior.
+The JavaScript tests cover strict catalog parsing, bounded inputs, provider configuration, deterministic case-insensitive fuzzy ranking, safe terminal argv construction, documentation contracts, plugin structure, and installer idempotency, rollback, and fail-closed behavior.
 
-Static checks cannot validate the compositor or 1Password desktop integration. Before release, exercise the plugin in a real Omarchy 4.0.1 Wayland session and confirm:
+Static checks cannot validate the compositor or desktop password interactions. Before release, exercise the plugin in a real Omarchy 4.0.1 Wayland session and confirm:
 
 - the overlay loads and follows the active theme;
 - the compositor delivers **Super+Ctrl+Shift+H**;
+- a typed encryption password refreshes password-backed state without appearing in process arguments;
 - keyboard and mouse selection work;
-- **Ctrl+O** opens or offers to install 1Password;
+- with the 1Password provider, **Ctrl+O** opens or offers to install 1Password;
 - a locked 1Password account can be authorized and the catalog retried;
-- selecting a session launches a terminal and attaches successfully.
+- selecting a session launches a terminal and attaches successfully with either provider.

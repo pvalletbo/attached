@@ -83,28 +83,71 @@ function filterSessions(sessions, query) {
   });
 }
 
-function catalogErrorMessage(raw, exitCode) {
-  var detail = String(raw || "").toLocaleLowerCase();
-  if (detail.indexOf("1password") !== -1) {
-    return "Open or unlock 1Password (Ctrl+O), then press Ctrl+R. If it still fails, run `attached --use-1password sessions --json` in a terminal for details.";
-  }
-  if (detail.indexOf("encrypted local secret authentication failed") !== -1) {
-    return "This Attached state could not be unlocked with 1Password. Run `attached --use-1password sessions --json` in a terminal for setup details.";
-  }
+function encryptionPasswordProvider(raw) {
+  var text = String(raw || "").trim();
+  if (text.length === 0)
+    return "password";
+  if (text.length > 4096)
+    throw new Error("Attached Omarchy configuration is too large");
 
-  return "Attached could not refresh sessions (exit " + exitCode
-    + "). Run `attached --use-1password sessions --json` in a terminal for details, then press Ctrl+R.";
+  var parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    throw new Error("Attached Omarchy configuration is not valid JSON");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+    throw new Error("Attached Omarchy configuration must be a JSON object");
+
+  var provider = parsed.encryptionPasswordProvider;
+  if (provider !== "password" && provider !== "1password")
+    throw new Error("encryptionPasswordProvider must be \"password\" or \"1password\"");
+  return provider;
 }
 
-function terminalCommand(session) {
+function catalogCommand(provider) {
+  if (provider === "1password")
+    return ["attached", "--use-1password", "sessions", "--json"];
+  if (provider === "password")
+    return ["attached", "sessions", "--json", "--password-stdin"];
+  throw new Error("unsupported encryption password provider");
+}
+
+function catalogErrorMessage(raw, exitCode, provider) {
+  var detail = String(raw || "").toLocaleLowerCase();
+  if (provider === "1password") {
+    if (detail.indexOf("1password") !== -1) {
+      return "Open or unlock 1Password (Ctrl+O), then press Ctrl+R. If it still fails, run `attached --use-1password sessions --json` in a terminal for details.";
+    }
+    if (detail.indexOf("encrypted local secret authentication failed") !== -1) {
+      return "This Attached state could not be unlocked with 1Password. Run `attached --use-1password sessions --json` in a terminal for setup details.";
+    }
+    return "Attached could not refresh sessions (exit " + exitCode
+      + "). Run `attached --use-1password sessions --json` in a terminal for details, then press Ctrl+R.";
+  }
+
+  if (detail.indexOf("encrypted local secret authentication failed") !== -1) {
+    return "That encryption password could not unlock Attached. Press Ctrl+R to try again.";
+  }
+  return "Attached could not refresh sessions (exit " + exitCode
+    + "). Press Ctrl+R to re-enter the encryption password, or run `attached sessions --json` in a terminal for details.";
+}
+
+function terminalCommand(session, provider) {
   if (!session || typeof session.target !== "string" || session.target.length === 0)
     throw new Error("cannot launch a session without a session target");
 
   // Quickshell receives an argv array, not shell text. Keeping the externally
   // supplied target in one element prevents quotes or metacharacters from being
-  // interpreted by a shell. 1Password provides noninteractive state unlock for
-  // both the background catalog process and the newly launched terminal.
-  return ["omarchy-launch-terminal", "attached", "--use-1password", "attach", session.target];
+  // interpreted by a shell. Password users enter it in the launched terminal;
+  // 1Password remains noninteractive when explicitly configured.
+  var command = ["omarchy-launch-terminal", "attached"];
+  if (provider === "1password")
+    command.push("--use-1password");
+  else if (provider !== "password")
+    throw new Error("unsupported encryption password provider");
+  command.push("attach", session.target);
+  return command;
 }
 
 if (typeof module !== "undefined")
@@ -112,6 +155,8 @@ if (typeof module !== "undefined")
     parseCatalog: parseCatalog,
     fuzzyScore: fuzzyScore,
     filterSessions: filterSessions,
+    encryptionPasswordProvider: encryptionPasswordProvider,
+    catalogCommand: catalogCommand,
     catalogErrorMessage: catalogErrorMessage,
     terminalCommand: terminalCommand
   };

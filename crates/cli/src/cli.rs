@@ -69,6 +69,10 @@ enum Command {
         #[arg(long, required = true)]
         json: bool,
 
+        /// Read the encryption password as one newline-terminated value from standard input.
+        #[arg(long, requires = "json", hide = true)]
+        password_stdin: bool,
+
         /// Path to the local Herdr executable used for version compatibility.
         #[arg(long, default_value = "herdr")]
         herdr_bin: PathBuf,
@@ -182,7 +186,14 @@ impl Cli {
     }
 
     pub async fn run(self) -> Result<i32> {
-        local_encryption::configure_use_one_password(self.use_1password);
+        let password_stdin = matches!(
+            &self.command,
+            Command::Sessions {
+                password_stdin: true,
+                ..
+            }
+        );
+        local_encryption::configure_password_provider(self.use_1password, password_stdin);
         match self.command {
             Command::Account { command } => {
                 match command {
@@ -235,6 +246,7 @@ impl Cli {
             }
             Command::Sessions {
                 json,
+                password_stdin: _,
                 herdr_bin,
                 state_dir,
                 command,
@@ -624,6 +636,29 @@ mod tests {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("--use-1password"), "{help}");
         assert!(help.contains("generate and store"), "{help}");
+    }
+
+    #[test]
+    fn machine_catalog_accepts_password_stdin_without_exposing_it_in_help() {
+        let cli =
+            Cli::try_parse_from(["attached", "sessions", "--json", "--password-stdin"]).unwrap();
+        let Command::Sessions { password_stdin, .. } = cli.command else {
+            unreachable!();
+        };
+        assert!(password_stdin);
+
+        assert!(Cli::try_parse_from(["attached", "sessions", "list", "--password-stdin"]).is_err());
+
+        let mut command = Cli::command();
+        let sessions_help = command
+            .find_subcommand_mut("sessions")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(
+            !sessions_help.contains("--password-stdin"),
+            "{sessions_help}"
+        );
     }
 
     #[test]

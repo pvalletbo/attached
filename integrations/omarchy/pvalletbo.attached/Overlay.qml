@@ -16,14 +16,22 @@ Item {
 
   property bool opened: false
   property bool loading: false
+  property bool awaitingPassword: false
   property bool requestActive: false
+  property bool catalogStarted: false
   property bool catalogExited: false
   property bool catalogCollected: false
   property bool catalogErrorCollected: false
   property int catalogExitCode: -1
   property string catalogOutput: ""
   property string catalogErrorOutput: ""
+  property string pendingPassword: ""
   property string errorText: ""
+  property string encryptionPasswordProvider: "password"
+  property string configHome: {
+    var configured = String(Quickshell.env("XDG_CONFIG_HOME") || "")
+    return configured.length > 0 ? configured : String(Quickshell.env("HOME")) + "/.config"
+  }
   property var sessions: []
   property var filteredSessions: []
   property int selectedIndex: 0
@@ -34,8 +42,9 @@ Item {
   function open(payloadJson) {
     root.opened = true
     searchInput.text = ""
+    root.pendingPassword = ""
     root.selectedIndex = 0
-    root.refreshCatalog()
+    root.refreshConfiguredCatalog()
     Qt.callLater(function() { searchInput.forceActiveFocus() })
   }
 
@@ -44,7 +53,11 @@ Item {
   function close() {
     root.opened = false
     root.requestActive = false
+    root.catalogStarted = false
     root.loading = false
+    root.awaitingPassword = false
+    root.pendingPassword = ""
+    searchInput.text = ""
     refreshDeadline.stop()
     if (catalogProcess.running)
       catalogProcess.running = false
@@ -64,13 +77,30 @@ Item {
       root.open("{}")
   }
 
+  function refreshConfiguredCatalog() {
+    try {
+      root.encryptionPasswordProvider = SessionModel.encryptionPasswordProvider(configFile.text())
+    } catch (error) {
+      root.loading = false
+      root.awaitingPassword = false
+      root.errorText = String(error) + ". Fix " + configFile.path + " and press Ctrl+R."
+      console.warn("attached-picker event=config_invalid")
+      return
+    }
+    root.refreshCatalog()
+  }
+
   function refreshCatalog() {
     // One Process instance means refreshes cannot overlap. This prevents a slow
     // older request from replacing a newer catalog after the overlay reopens.
     if (catalogProcess.running)
       return
-    root.loading = true
+    searchInput.text = ""
+    root.pendingPassword = ""
+    root.loading = root.encryptionPasswordProvider === "1password"
+    root.awaitingPassword = root.encryptionPasswordProvider === "password"
     root.requestActive = true
+    root.catalogStarted = false
     root.catalogExited = false
     root.catalogCollected = false
     root.catalogErrorCollected = false
@@ -79,7 +109,29 @@ Item {
     root.catalogErrorOutput = ""
     root.errorText = ""
     catalogProcess.running = true
+    if (root.encryptionPasswordProvider === "1password")
+      refreshDeadline.restart()
+    Qt.callLater(function() { searchInput.forceActiveFocus() })
+  }
+
+  function submitEncryptionPassword() {
+    if (!root.awaitingPassword || !catalogProcess.running || searchInput.text.length === 0)
+      return
+    root.pendingPassword = searchInput.text
+    searchInput.text = ""
+    root.awaitingPassword = false
+    root.loading = true
+    root.sendPendingPassword()
     refreshDeadline.restart()
+  }
+
+  function sendPendingPassword() {
+    if (!root.catalogStarted || root.pendingPassword.length === 0)
+      return
+    // A second copy satisfies Attached's confirmation read if this catalog load
+    // is also migrating legacy plaintext state to password encryption.
+    catalogProcess.write(root.pendingPassword + "\n" + root.pendingPassword + "\n")
+    root.pendingPassword = ""
   }
 
   function openOnePassword() {
@@ -94,9 +146,16 @@ Item {
 
     root.requestActive = false
     root.loading = false
+    root.awaitingPassword = false
+    root.pendingPassword = ""
+    searchInput.text = ""
     refreshDeadline.stop()
     if (root.catalogExitCode !== 0) {
-      root.errorText = SessionModel.catalogErrorMessage(root.catalogErrorOutput, root.catalogExitCode)
+      root.errorText = SessionModel.catalogErrorMessage(
+        root.catalogErrorOutput,
+        root.catalogExitCode,
+        root.encryptionPasswordProvider
+      )
       root.catalogErrorOutput = ""
       console.warn("attached-picker event=catalog_failed exit_code=" + root.catalogExitCode)
       return
@@ -141,17 +200,25 @@ Item {
     var row = root.filteredSessions[index]
     // execDetached receives an argv array. No shell parses the remote session
     // label, so spaces and metacharacters remain ordinary target characters.
-    var command = SessionModel.terminalCommand(row)
+    var command = SessionModel.terminalCommand(row, root.encryptionPasswordProvider)
     Quickshell.execDetached(command)
     console.info("attached-picker event=session_launch_requested")
     root.dismiss()
   }
 
+  FileView {
+    id: configFile
+    path: root.configHome + "/attached/omarchy.json"
+    blockLoading: true
+    printErrors: false
+  }
+
   Process {
     id: catalogProcess
-    // Omarchy Shell has no interactive terminal for password prompts. 1Password
-    // unlocks encrypted Attached state without putting secrets in argv or env.
-    command: ["attached", "--use-1password", "sessions", "--json"]
+    // Passwords travel over an anonymous stdin pipe and are cleared from the
+    // overlay immediately. They never appear in process arguments or environment.
+    command: SessionModel.catalogCommand(root.encryptionPasswordProvider)
+    stdinEnabled: true
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -168,7 +235,12 @@ Item {
         root.finishCatalogLoad()
       }
     }
+    onStarted: {
+      root.catalogStarted = true
+      root.sendPendingPassword()
+    }
     onExited: function(exitCode, exitStatus) {
+      root.catalogStarted = false
       if (!root.requestActive)
         return
       root.catalogExitCode = exitCode
@@ -186,7 +258,11 @@ Item {
         return
       root.requestActive = false
       root.loading = false
-      root.errorText = "Attached took too long to refresh sessions. Unlock 1Password (Ctrl+O to open it), then press Ctrl+R."
+      root.awaitingPassword = false
+      root.pendingPassword = ""
+      root.errorText = root.encryptionPasswordProvider === "1password"
+        ? "Attached took too long to refresh sessions. Unlock 1Password (Ctrl+O to open it), then press Ctrl+R."
+        : "Attached took too long to refresh sessions. Press Ctrl+R to re-enter the encryption password."
       if (catalogProcess.running)
         catalogProcess.running = false
       console.warn("attached-picker event=catalog_timeout")
@@ -254,9 +330,15 @@ Item {
             verticalAlignment: TextInput.AlignVCenter
             clip: true
             focus: true
+            echoMode: root.awaitingPassword ? TextInput.Password : TextInput.Normal
+            inputMethodHints: root.awaitingPassword
+              ? Qt.ImhSensitiveData | Qt.ImhNoPredictiveText
+              : Qt.ImhNone
             onTextChanged: {
-              root.selectedIndex = 0
-              root.rebuildResults()
+              if (!root.awaitingPassword) {
+                root.selectedIndex = 0
+                root.rebuildResults()
+              }
             }
 
             Keys.priority: Keys.BeforeItem
@@ -267,19 +349,27 @@ Item {
                 else
                   root.dismiss()
                 event.accepted = true
-              } else if (event.key === Qt.Key_Up) {
+              } else if (root.awaitingPassword
+                         && (event.key === Qt.Key_Return || event.key === Qt.Key_Enter)) {
+                root.submitEncryptionPassword()
+                event.accepted = true
+              } else if (!root.awaitingPassword && event.key === Qt.Key_Up) {
                 root.moveSelection(-1)
                 event.accepted = true
-              } else if (event.key === Qt.Key_Down) {
+              } else if (!root.awaitingPassword && event.key === Qt.Key_Down) {
                 root.moveSelection(1)
                 event.accepted = true
-              } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+              } else if (!root.awaitingPassword
+                         && (event.key === Qt.Key_Return || event.key === Qt.Key_Enter)) {
                 root.activate(root.selectedIndex)
                 event.accepted = true
-              } else if (event.key === Qt.Key_R && (event.modifiers & Qt.ControlModifier)) {
-                root.refreshCatalog()
+              } else if (!root.awaitingPassword && event.key === Qt.Key_R
+                         && (event.modifiers & Qt.ControlModifier)) {
+                root.refreshConfiguredCatalog()
                 event.accepted = true
-              } else if (event.key === Qt.Key_O && (event.modifiers & Qt.ControlModifier)) {
+              } else if (!root.awaitingPassword && root.encryptionPasswordProvider === "1password"
+                         && event.key === Qt.Key_O
+                         && (event.modifiers & Qt.ControlModifier)) {
                 root.openOnePassword()
                 event.accepted = true
               }
@@ -289,7 +379,9 @@ Item {
               textFormat: Text.PlainText
               visible: searchInput.text.length === 0
               anchors.fill: parent
-              text: "Search Attached sessions…"
+              text: root.awaitingPassword
+                ? "Attached encryption password…"
+                : "Search Attached sessions…"
               color: Color.menu.text
               opacity: 0.55
               font: searchInput.font
@@ -305,7 +397,8 @@ Item {
           ListView {
             id: sessionList
             anchors.fill: parent
-            visible: !root.loading && !root.errorText && root.filteredSessions.length > 0
+            visible: !root.loading && !root.awaitingPassword && !root.errorText
+              && root.filteredSessions.length > 0
             model: root.filteredSessions
             spacing: Style.space(4)
             clip: true
@@ -363,8 +456,10 @@ Item {
             textFormat: Text.PlainText
             anchors.centerIn: parent
             width: parent.width - Style.spacing.panelPadding * 2
-            visible: root.loading || root.errorText || root.filteredSessions.length === 0
-            text: root.loading ? "Refreshing Attached sessions…"
+            visible: root.awaitingPassword || root.loading || root.errorText
+              || root.filteredSessions.length === 0
+            text: root.awaitingPassword ? "Enter your Attached encryption password and press Enter."
+                 : root.loading ? "Refreshing Attached sessions…"
                  : root.errorText ? root.errorText
                  : root.sessions.length === 0 ? "No synchronized sessions are available."
                  : "No sessions match “" + searchInput.text + "”."

@@ -4,39 +4,92 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const SessionModel = require("../SessionModel.js");
 
-test("terminalCommand uses 1Password and preserves the target as one argv element", () => {
-  assert.deepEqual(
-    SessionModel.terminalCommand({ target: "travel/shell; touch /tmp/nope" }),
-    [
-      "omarchy-launch-terminal",
-      "attached",
-      "--use-1password",
-      "attach",
-      "travel/shell; touch /tmp/nope"
-    ]
+test("configuration defaults to typed passwords and validates explicit providers", () => {
+  assert.equal(SessionModel.encryptionPasswordProvider(""), "password");
+  assert.equal(
+    SessionModel.encryptionPasswordProvider('{"encryptionPasswordProvider":"password"}'),
+    "password"
   );
-  assert.throws(() => SessionModel.terminalCommand(null), /session target/);
+  assert.equal(
+    SessionModel.encryptionPasswordProvider('{"encryptionPasswordProvider":"1password"}'),
+    "1password"
+  );
+  assert.throws(() => SessionModel.encryptionPasswordProvider("[]"), /JSON object/);
+  assert.throws(
+    () => SessionModel.encryptionPasswordProvider('{"encryptionPasswordProvider":"keyring"}'),
+    /password.*1password/
+  );
 });
 
-test("catalog errors give actionable 1Password guidance without echoing stderr", () => {
+test("catalog and terminal commands honor the provider and preserve targets as argv", () => {
+  assert.deepEqual(SessionModel.catalogCommand("password"), [
+    "attached",
+    "sessions",
+    "--json",
+    "--password-stdin"
+  ]);
+  assert.deepEqual(SessionModel.catalogCommand("1password"), [
+    "attached",
+    "--use-1password",
+    "sessions",
+    "--json"
+  ]);
+
+  const session = { target: "travel/shell; touch /tmp/nope" };
+  assert.deepEqual(SessionModel.terminalCommand(session, "password"), [
+    "omarchy-launch-terminal",
+    "attached",
+    "attach",
+    "travel/shell; touch /tmp/nope"
+  ]);
+  assert.deepEqual(SessionModel.terminalCommand(session, "1password"), [
+    "omarchy-launch-terminal",
+    "attached",
+    "--use-1password",
+    "attach",
+    "travel/shell; touch /tmp/nope"
+  ]);
+  assert.throws(() => SessionModel.terminalCommand(null, "password"), /session target/);
+  assert.throws(() => SessionModel.catalogCommand("unknown"), /unsupported/);
+});
+
+test("catalog errors give provider-specific guidance without echoing stderr", () => {
   assert.match(
     SessionModel.catalogErrorMessage(
       "Error: 1Password is unavailable; unlock or sign in with the op CLI and retry",
-      1
+      1,
+      "1password"
     ),
     /Open or unlock 1Password.*Ctrl\+O.*Ctrl\+R/
   );
   assert.match(
     SessionModel.catalogErrorMessage(
       "Error: encrypted local secret authentication failed",
-      1
+      1,
+      "1password"
     ),
     /could not be unlocked with 1Password.*attached --use-1password sessions --json/
   );
 
-  const generic = SessionModel.catalogErrorMessage("private backend detail", 7);
-  assert.match(generic, /exit 7.*attached --use-1password sessions --json/);
-  assert.doesNotMatch(generic, /private backend detail/);
+  const onePasswordGeneric = SessionModel.catalogErrorMessage(
+    "private backend detail",
+    7,
+    "1password"
+  );
+  assert.match(onePasswordGeneric, /exit 7.*attached --use-1password sessions --json/);
+  assert.doesNotMatch(onePasswordGeneric, /private backend detail/);
+
+  const passwordFailure = SessionModel.catalogErrorMessage(
+    "encrypted local secret authentication failed: private ciphertext detail",
+    1,
+    "password"
+  );
+  assert.match(passwordFailure, /could not unlock Attached.*Ctrl\+R/);
+  assert.doesNotMatch(passwordFailure, /ciphertext/);
+
+  const passwordGeneric = SessionModel.catalogErrorMessage("private backend detail", 9, "password");
+  assert.match(passwordGeneric, /exit 9.*re-enter.*attached sessions --json/);
+  assert.doesNotMatch(passwordGeneric, /private backend detail/);
 });
 
 test("filterSessions performs stable case-insensitive fuzzy ranking", () => {

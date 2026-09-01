@@ -6,9 +6,12 @@ set -euo pipefail
 # rescan and enable the plugin.
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 source_dir="$script_dir/pvalletbo.attached"
+config_source="$script_dir/config.json"
 config_home=${XDG_CONFIG_HOME:-"$HOME/.config"}
 destination="$config_home/omarchy/plugins/pvalletbo.attached"
 bindings="$config_home/hypr/bindings.lua"
+attached_config_dir="$config_home/attached"
+plugin_config="$attached_config_dir/omarchy.json"
 marker='-- BEGIN Attached session picker'
 end_marker='-- END Attached session picker'
 managed_checksum='.attached-plugin-checksums'
@@ -151,8 +154,28 @@ if [[ $begin_count -eq 1 ]]; then
   fi
 fi
 
+# The user-owned provider preference is created once and never overwritten.
+# Refuse symlinks and special files before any transactional write.
+if [[ -L "$attached_config_dir" ]]; then
+  printf 'Refusing to create configuration through a symlink: %s\n' "$attached_config_dir" >&2
+  exit 1
+fi
+if [[ -e "$attached_config_dir" && ! -d "$attached_config_dir" ]]; then
+  printf 'Refusing to replace a non-directory configuration path: %s\n' "$attached_config_dir" >&2
+  exit 1
+fi
+if [[ -L "$plugin_config" ]]; then
+  printf 'Refusing to replace a symlinked plugin configuration: %s\n' "$plugin_config" >&2
+  exit 1
+fi
+if [[ -e "$plugin_config" && ! -f "$plugin_config" ]]; then
+  printf 'Refusing to replace a non-regular plugin configuration: %s\n' "$plugin_config" >&2
+  exit 1
+fi
+
 # Snapshot both managed paths before the first write. Any copy, rescan, or
-# enable failure restores their byte-exact pre-install state.
+# enable failure restores their byte-exact pre-install state and removes a
+# provider configuration created by the failed attempt.
 backup_root=$(mktemp -d "${TMPDIR:-/tmp}/attached-omarchy-install.XXXXXX")
 destination_existed=false
 bindings_existed=false
@@ -165,6 +188,9 @@ if [[ -f "$bindings" ]]; then
   cp -p "$bindings" "$backup_root/bindings.lua"
 fi
 transaction_committed=false
+plugin_config_created=false
+config_dir_created=false
+plugin_config_temp=""
 
 finish_install() {
   status=$?
@@ -183,10 +209,20 @@ finish_install() {
       cp -p "$backup_root/bindings.lua" "$bindings"
     fi
 
+    if [[ $plugin_config_created == true ]]; then
+      rm -f -- "$plugin_config"
+    fi
+    if [[ $config_dir_created == true ]]; then
+      rmdir -- "$attached_config_dir" 2>/dev/null || true
+    fi
+
     # Reconcile the running registry with the restored filesystem. Rollback
     # must preserve the original failure even if the shell is unavailable.
     omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
     printf 'Installation failed; restored the previous plugin and bindings.\n' >&2
+  fi
+  if [[ -n $plugin_config_temp ]]; then
+    rm -f -- "$plugin_config_temp"
   fi
   rm -rf -- "$backup_root"
   exit "$status"
@@ -211,8 +247,22 @@ if [[ $begin_count -eq 0 ]]; then
   binding_block >> "$bindings"
 fi
 
+if [[ ! -d "$attached_config_dir" ]]; then
+  install -d -m 0700 "$attached_config_dir"
+  config_dir_created=true
+fi
+if [[ ! -e "$plugin_config" ]]; then
+  plugin_config_temp=$(mktemp "$attached_config_dir/.omarchy.json.XXXXXX")
+  install -m 0600 "$config_source" "$plugin_config_temp"
+  ln -- "$plugin_config_temp" "$plugin_config"
+  plugin_config_created=true
+  rm -f -- "$plugin_config_temp"
+  plugin_config_temp=""
+fi
+
 omarchy-shell shell rescanPlugins
 omarchy plugin enable pvalletbo.attached
 transaction_committed=true
 printf 'Installed Attached picker. Press Super+Ctrl+Shift+H to open it.\n'
-printf 'Attached state is unlocked through 1Password; press Ctrl+O in the picker if needed.\n'
+printf 'Encryption password provider configuration: %s (default: password).\n' "$plugin_config"
+printf 'Set encryptionPasswordProvider to "1password" there to use 1Password instead.\n'
