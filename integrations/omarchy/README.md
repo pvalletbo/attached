@@ -8,7 +8,7 @@ The first-party-style Omarchy Shell overlay in this directory searches the sessi
 
 - Omarchy 4.0.1 or newer with `omarchy` and `omarchy-shell` on `PATH`.
 - `attached` installed on `PATH`.
-- An Attached download account. Verify password-backed state with `attached sessions --json`, or state created with `--use-1password` with `attached --use-1password sessions --json`.
+- An Attached download account. Verify password-backed state with `attached sessions`, or state created with `--use-1password` with `attached --use-1password sessions`.
 
 An unconfigured account prints `[]`; configuration, unlock, and network errors fail with a non-zero exit code. 1Password is optional.
 
@@ -36,7 +36,7 @@ Press **Super+Ctrl+Shift+H** to toggle the centered command palette. With the de
 
 ## Integration contract
 
-`attached sessions --json` is the stable machine boundary. Omarchy Shell has no controlling terminal, so the default provider invokes it as `attached sessions --json --password-stdin` and writes the password to the process's anonymous standard-input pipe. The password is not placed in arguments or environment variables and is cleared from the overlay immediately after writing. The configured 1Password provider instead invokes `attached --use-1password sessions --json`. Both return a JSON array containing only:
+`attached sessions` is the stable machine boundary and always emits JSON. Omarchy Shell has no controlling terminal, so the default provider invokes it as `attached sessions --password-stdin` and writes the password to the process's anonymous standard-input pipe. The password is not placed in arguments or environment variables and is cleared from the overlay immediately after writing. The configured 1Password provider instead invokes `attached --use-1password sessions`. Both return a JSON array containing only:
 
 ```json
 [

@@ -152,9 +152,9 @@ function encryptionPasswordProvider(raw) {
 
 function catalogCommand(provider) {
   if (provider === "1password")
-    return ["attached", "--use-1password", "sessions", "--json"];
+    return ["attached", "--use-1password", "sessions"];
   if (provider === "password")
-    return ["attached", "sessions", "--json", "--password-stdin"];
+    return ["attached", "sessions", "--password-stdin"];
   throw new Error("unsupported encryption password provider");
 }
 
@@ -162,20 +162,20 @@ function catalogErrorMessage(raw, exitCode, provider) {
   var detail = String(raw || "").toLocaleLowerCase();
   if (provider === "1password") {
     if (detail.indexOf("1password") !== -1) {
-      return "Open or unlock 1Password (Ctrl+O), then press Ctrl+R. If it still fails, run `attached --use-1password sessions --json` in a terminal for details.";
+      return "Open or unlock 1Password (Ctrl+O), then press Ctrl+R. If it still fails, run `attached --use-1password sessions` in a terminal for details.";
     }
     if (detail.indexOf("encrypted local secret authentication failed") !== -1) {
-      return "This Attached state could not be unlocked with 1Password. Run `attached --use-1password sessions --json` in a terminal for setup details.";
+      return "This Attached state could not be unlocked with 1Password. Run `attached --use-1password sessions` in a terminal for setup details.";
     }
     return "Attached could not refresh sessions (exit " + exitCode
-      + "). Run `attached --use-1password sessions --json` in a terminal for details, then press Ctrl+R.";
+      + "). Run `attached --use-1password sessions` in a terminal for details, then press Ctrl+R.";
   }
 
   if (detail.indexOf("encrypted local secret authentication failed") !== -1) {
     return "That encryption password could not unlock Attached. Press Ctrl+R to try again.";
   }
   return "Attached could not refresh sessions (exit " + exitCode
-    + "). Press Ctrl+R to re-enter the encryption password, or run `attached sessions --json` in a terminal for details.";
+    + "). Press Ctrl+R to re-enter the encryption password, or run `attached sessions` in a terminal for details.";
 }
 
 function terminalCommand(session, provider) {

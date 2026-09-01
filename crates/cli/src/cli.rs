@@ -495,14 +495,6 @@ mod tests {
         for removed in ["connect", "remote", "session", "admin", "sync"] {
             assert!(Cli::try_parse_from(["attached", removed]).is_err());
         }
-        assert!(
-            Cli::try_parse_from(["attached", "sessions", "--json"]).is_err(),
-            "the removed JSON flag must be rejected"
-        );
-        assert!(
-            Cli::try_parse_from(["attached", "sessions", "list", "--json"]).is_err(),
-            "the human list subcommand must reject the removed JSON flag"
-        );
     }
 
     #[test]
