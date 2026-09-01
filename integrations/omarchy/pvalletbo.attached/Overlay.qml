@@ -353,10 +353,16 @@ Item {
                          && (event.key === Qt.Key_Return || event.key === Qt.Key_Enter)) {
                 root.submitEncryptionPassword()
                 event.accepted = true
-              } else if (!root.awaitingPassword && event.key === Qt.Key_Up) {
+              } else if (!root.awaitingPassword
+                         && (event.key === Qt.Key_Up
+                             || (event.key === Qt.Key_P
+                                 && (event.modifiers & Qt.ControlModifier)))) {
                 root.moveSelection(-1)
                 event.accepted = true
-              } else if (!root.awaitingPassword && event.key === Qt.Key_Down) {
+              } else if (!root.awaitingPassword
+                         && (event.key === Qt.Key_Down
+                             || (event.key === Qt.Key_N
+                                 && (event.modifiers & Qt.ControlModifier)))) {
                 root.moveSelection(1)
                 event.accepted = true
               } else if (!root.awaitingPassword
