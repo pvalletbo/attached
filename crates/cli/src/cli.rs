@@ -65,12 +65,8 @@ enum Command {
     /// Inspect synchronized remote Herdr sessions.
     #[command(subcommand_negates_reqs = true, args_conflicts_with_subcommands = true)]
     Sessions {
-        /// Emit a stable machine-readable JSON array.
-        #[arg(long, required = true)]
-        json: bool,
-
         /// Read the encryption password as one newline-terminated value from standard input.
-        #[arg(long, requires = "json", hide = true)]
+        #[arg(long, hide = true)]
         password_stdin: bool,
 
         /// Path to the local Herdr executable used for version compatibility.
@@ -279,7 +275,6 @@ impl Cli {
                 Ok(0)
             }
             Command::Sessions {
-                json,
                 password_stdin: _,
                 herdr_bin,
                 state_dir,
@@ -309,7 +304,6 @@ impl Cli {
                     Ok(0)
                 }
                 None => {
-                    debug_assert!(json, "Clap requires --json when no subcommand is used");
                     let state_dir = resolved_state_dir(state_dir)?;
                     let refreshed = session_catalog::refresh(&state_dir, &herdr_bin).await?;
                     for warning in refresh_warnings_to_display(&refreshed.warnings, self.verbose) {
@@ -478,6 +472,7 @@ mod tests {
                 "--output",
                 "/tmp/publish.bundle",
             ],
+            vec!["attached", "sessions"],
             vec!["attached", "sessions", "list"],
             vec![
                 "attached",
@@ -489,7 +484,6 @@ mod tests {
             ],
             vec!["attached", "attach"],
             vec!["attached", "attach", "office/work"],
-            vec!["attached", "sessions", "--json"],
             vec!["attached", "update"],
             vec!["attached", "upgrade"],
             vec!["attached", "uninstall"],
@@ -501,14 +495,13 @@ mod tests {
         for removed in ["connect", "remote", "session", "admin", "sync"] {
             assert!(Cli::try_parse_from(["attached", removed]).is_err());
         }
-        assert!(Cli::try_parse_from(["attached", "sessions"]).is_err());
         assert!(
-            Cli::try_parse_from(["attached", "sessions", "--json", "list"]).is_err(),
-            "machine-readable arguments must not be mixed with the human list subcommand"
+            Cli::try_parse_from(["attached", "sessions", "--json"]).is_err(),
+            "the removed JSON flag must be rejected"
         );
         assert!(
             Cli::try_parse_from(["attached", "sessions", "list", "--json"]).is_err(),
-            "human list arguments must not accept the machine-readable flag"
+            "the human list subcommand must reject the removed JSON flag"
         );
     }
 
@@ -766,8 +759,7 @@ mod tests {
 
     #[test]
     fn machine_catalog_accepts_password_stdin_without_exposing_it_in_help() {
-        let cli =
-            Cli::try_parse_from(["attached", "sessions", "--json", "--password-stdin"]).unwrap();
+        let cli = Cli::try_parse_from(["attached", "sessions", "--password-stdin"]).unwrap();
         let Command::Sessions { password_stdin, .. } = cli.command else {
             unreachable!();
         };
