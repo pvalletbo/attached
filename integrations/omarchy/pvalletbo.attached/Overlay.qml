@@ -290,25 +290,25 @@ Item {
     }
 
     BorderSurface {
-      id: drawer
-      anchors.top: parent.top
-      anchors.bottom: parent.bottom
-      anchors.right: parent.right
-      width: Math.min(Style.space(520), parent.width)
+      id: card
+      anchors.centerIn: parent
+      width: Math.min(Style.space(720), parent.width - Style.gapsOut * 2)
+      height: Math.min(Style.space(560), parent.height - Style.gapsOut * 2)
+      radius: Style.cornerRadius
       color: Color.menu.background
       borderSpec: Border.surfaceSpec("menu", "border", Color.menu.border, Math.max(1, Style.space(2)))
       padding: Style.spacing.panelPadding
 
-      // Consume clicks inside the drawer so the fullscreen dismiss area only
-      // closes the overlay when the user clicks outside it.
+      // The fullscreen layer provides reliable keyboard focus and outside-click
+      // dismissal; this centered card is the always-open command palette.
       MouseArea { anchors.fill: parent; onClicked: {} }
 
       Column {
         anchors.fill: parent
-        anchors.topMargin: drawer.contentTopInset
-        anchors.rightMargin: drawer.contentRightInset
-        anchors.bottomMargin: drawer.contentBottomInset
-        anchors.leftMargin: drawer.contentLeftInset
+        anchors.topMargin: card.contentTopInset
+        anchors.rightMargin: card.contentRightInset
+        anchors.bottomMargin: card.contentBottomInset
+        anchors.leftMargin: card.contentLeftInset
         spacing: Style.spacing.panelGap
 
         Rectangle {
@@ -381,7 +381,7 @@ Item {
               anchors.fill: parent
               text: root.awaitingPassword
                 ? "Attached encryption password…"
-                : "Search Attached sessions…"
+                : "Search hosts and sessions…"
               color: Color.menu.text
               opacity: 0.55
               font: searchInput.font
@@ -409,7 +409,11 @@ Item {
               required property int index
               required property var modelData
               width: ListView.view.width
-              height: Math.max(Style.space(62), Style.font.title + Style.font.caption + Style.spacing.rowPaddingX * 2)
+              height: Math.max(
+                Style.space(86),
+                Style.font.heading + Style.font.body + Style.font.caption
+                  + Style.spacing.rowPaddingX * 2 + Style.space(6)
+              )
               radius: Style.cornerRadius
               color: index === root.selectedIndex ? Color.menu.selectedBackground : "transparent"
 
@@ -424,18 +428,29 @@ Item {
                 Text {
                   textFormat: Text.PlainText
                   width: parent.width
-                  text: row.modelData.session
+                  text: row.modelData.host
                   color: row.index === root.selectedIndex ? Color.menu.selectedText : Color.menu.text
                   font.family: Style.font.menuFamily
-                  font.pixelSize: Style.font.title
+                  font.pixelSize: Style.font.heading
+                  font.weight: Font.Medium
                   elide: Text.ElideRight
                 }
                 Text {
                   textFormat: Text.PlainText
                   width: parent.width
-                  text: row.modelData.host
+                  text: row.modelData.session
                   color: row.index === root.selectedIndex ? Color.menu.selectedText : Color.menu.text
-                  opacity: 0.65
+                  opacity: 0.78
+                  font.family: Style.font.menuFamily
+                  font.pixelSize: Style.font.body
+                  elide: Text.ElideRight
+                }
+                Text {
+                  textFormat: Text.PlainText
+                  width: parent.width
+                  text: SessionModel.metadataSummary(row.modelData)
+                  color: row.index === root.selectedIndex ? Color.menu.selectedText : Color.menu.text
+                  opacity: 0.55
                   font.family: Style.font.menuFamily
                   font.pixelSize: Style.font.caption
                   elide: Text.ElideRight

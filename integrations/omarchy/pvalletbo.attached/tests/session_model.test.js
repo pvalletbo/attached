@@ -92,6 +92,25 @@ test("catalog errors give provider-specific guidance without echoing stderr", ()
   assert.doesNotMatch(passwordGeneric, /private backend detail/);
 });
 
+test("metadata matches the fzf version and last-publish summaries", () => {
+  const now = Date.parse("2026-08-29T12:35:26Z");
+  const current = {
+    attachedVersion: [0, 3, 1],
+    herdrVersion: [0, 9, 0],
+    publishedAt: "2026-08-29T12:34:56Z"
+  };
+  assert.equal(
+    SessionModel.metadataSummary(current, now),
+    "Attached 0.3.1  •  Herdr 0.9.0  •  Last publish 30s ago"
+  );
+  assert.equal(SessionModel.lastPublishSummary("2026-08-29T12:31:26Z", now), "4m ago");
+  assert.equal(SessionModel.lastPublishSummary("2026-08-29T10:35:26Z", now), "2h ago");
+  assert.equal(SessionModel.lastPublishSummary("2026-08-27T12:35:26Z", now), "2d ago");
+  assert.equal(SessionModel.lastPublishSummary("2026-08-29T12:36:26Z", now), "clock skew");
+  assert.equal(SessionModel.lastPublishSummary(null, now), "unknown");
+  assert.equal(SessionModel.versionSummary(null), "unknown");
+});
+
 test("filterSessions performs stable case-insensitive fuzzy ranking", () => {
   const sessions = [
     { target: "home/slow", host: "home", session: "slow", publishedAt: null },
@@ -124,12 +143,16 @@ test("parseCatalog accepts the public Attached schema and rejects unsafe rows", 
       target: "office/deep work",
       host: "office",
       session: "deep work",
+      attachedVersion: [0, 3, 1],
+      herdrVersion: [0, 9, 0],
       publishedAt: "2026-08-29T12:34:56Z"
     },
     {
       target: "travel/shell; touch /tmp/nope",
       host: "travel",
       session: "shell; touch /tmp/nope",
+      attachedVersion: null,
+      herdrVersion: [0, 8, 2],
       publishedAt: null
     }
   ]));
@@ -138,6 +161,9 @@ test("parseCatalog accepts the public Attached schema and rejects unsafe rows", 
     "office/deep work",
     "travel/shell; touch /tmp/nope"
   ]);
+  assert.deepEqual(rows[0].attachedVersion, [0, 3, 1]);
+  assert.deepEqual(rows[0].herdrVersion, [0, 9, 0]);
+  assert.equal(rows[1].attachedVersion, null);
   assert.throws(() => SessionModel.parseCatalog("not json"), /valid JSON/);
   assert.throws(
     () => SessionModel.parseCatalog('{"target":"office/work"}'),
@@ -152,10 +178,33 @@ test("parseCatalog accepts the public Attached schema and rejects unsafe rows", 
     /row 1.*target/
   );
   assert.throws(
+    () => SessionModel.parseCatalog(JSON.stringify([{
+      target: "office/work",
+      host: "office",
+      session: "work",
+      attachedVersion: [0, 3, 1],
+      publishedAt: null
+    }])),
+    /row 1.*herdrVersion/
+  );
+  assert.throws(
+    () => SessionModel.parseCatalog(JSON.stringify([{
+      target: "office/work",
+      host: "office",
+      session: "work",
+      attachedVersion: [0, -1, 1],
+      herdrVersion: [0, 9, 0],
+      publishedAt: null
+    }])),
+    /row 1.*attachedVersion/
+  );
+  assert.throws(
     () => SessionModel.parseCatalog(JSON.stringify(Array.from({ length: 4097 }, (_, index) => ({
       target: "host/session" + index,
       host: "host",
-      session: "session" + index
+      session: "session" + index,
+      attachedVersion: null,
+      herdrVersion: [0, 9, 0]
     })))),
     /too many sessions/
   );

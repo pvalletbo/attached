@@ -38,6 +38,8 @@ struct SessionJson<'a> {
     target: &'a str,
     host: &'a str,
     session: &'a str,
+    attached_version: Option<[u16; 3]>,
+    herdr_version: [u16; 3],
     published_at: Option<DateTime<Utc>>,
 }
 
@@ -48,6 +50,8 @@ pub(crate) fn write_json(mut writer: impl Write, sessions: &[SyncedSession]) -> 
             target: &session.target,
             host: &session.host,
             session: &session.session,
+            attached_version: session.attached_version,
+            herdr_version: session.herdr_version,
             published_at: session.published_at,
         })
         .collect::<Vec<_>>();
@@ -109,8 +113,10 @@ mod tests {
             String::from_utf8(output).unwrap(),
             concat!(
                 "[{\"target\":\"office/deep work\",\"host\":\"office\",\"session\":\"deep work\",",
+                "\"attachedVersion\":[0,3,1],\"herdrVersion\":[0,9,0],",
                 "\"publishedAt\":\"2026-08-29T12:34:56Z\"},{\"target\":\"travel/shell\",",
-                "\"host\":\"travel\",\"session\":\"shell\",\"publishedAt\":null}]\n"
+                "\"host\":\"travel\",\"session\":\"shell\",\"attachedVersion\":null,",
+                "\"herdrVersion\":[0,8,2],\"publishedAt\":null}]\n"
             )
         );
     }

@@ -55,6 +55,7 @@ test("overlay supports safe catalog loading, keyboard and pointer activation", (
     "SessionModel.parseCatalog",
     "SessionModel.filterSessions",
     "SessionModel.catalogErrorMessage",
+    "SessionModel.metadataSummary",
     "SessionModel.terminalCommand",
     "Quickshell.execDetached",
     '["omarchy-launch-1password"]',
@@ -63,7 +64,7 @@ test("overlay supports safe catalog loading, keyboard and pointer activation", (
     "Qt.Key_Return",
     "Qt.Key_O",
     "onClicked:",
-    "anchors.right: parent.right",
+    "anchors.centerIn: parent",
     "forceActiveFocus()",
     "console.info",
     "console.warn",
@@ -75,6 +76,20 @@ test("overlay supports safe catalog loading, keyboard and pointer activation", (
     assert.match(qml, new RegExp(contract.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), contract);
   }
   assert.doesNotMatch(qml, /\b(?:bash|sh)\b.*-c/);
+  assert.ok(
+    qml.indexOf("text: row.modelData.host") < qml.indexOf("text: row.modelData.session"),
+    "host must be the primary row label"
+  );
+  assert.match(
+    qml,
+    /text: row\.modelData\.host[\s\S]{0,300}font\.pixelSize: Style\.font\.heading/,
+    "host must use the largest row font"
+  );
+  assert.match(
+    qml,
+    /text: SessionModel\.metadataSummary\(row\.modelData\)[\s\S]{0,300}font\.pixelSize: Style\.font\.caption/,
+    "session metadata must use the smallest row font"
+  );
   assert.equal(
     (qml.match(/\bText\s*\{/g) || []).length,
     (qml.match(/textFormat:\s*Text\.PlainText/g) || []).length,

@@ -24,17 +24,62 @@ function parseCatalog(raw) {
     }
     if (row.target !== row.host + "/" + row.session)
       throw new Error("session row " + number + " has an invalid target");
+    var attachedVersion = parseVersion(row.attachedVersion, "attachedVersion", number, true);
+    var herdrVersion = parseVersion(row.herdrVersion, "herdrVersion", number, false);
     if (row.publishedAt !== null && row.publishedAt !== undefined
-        && typeof row.publishedAt !== "string")
+        && (typeof row.publishedAt !== "string" || isNaN(Date.parse(row.publishedAt))))
       throw new Error("session row " + number + " has an invalid publishedAt");
 
     return {
       target: row.target,
       host: row.host,
       session: row.session,
+      attachedVersion: attachedVersion,
+      herdrVersion: herdrVersion,
       publishedAt: row.publishedAt === undefined ? null : row.publishedAt
     };
   });
+}
+
+function parseVersion(value, field, rowNumber, optional) {
+  if (optional && value === null)
+    return null;
+  if (!Array.isArray(value) || value.length !== 3)
+    throw new Error("session row " + rowNumber + " has an invalid " + field);
+  for (var component of value) {
+    if (typeof component !== "number" || !isFinite(component)
+        || Math.floor(component) !== component || component < 0 || component > 65535)
+      throw new Error("session row " + rowNumber + " has an invalid " + field);
+  }
+  return value.slice();
+}
+
+function versionSummary(version) {
+  return version === null ? "unknown" : version.join(".");
+}
+
+function lastPublishSummary(publishedAt, nowMilliseconds) {
+  if (publishedAt === null)
+    return "unknown";
+  var now = nowMilliseconds === undefined ? Date.now() : nowMilliseconds;
+  var published = Date.parse(publishedAt);
+  if (published - now > 30000)
+    return "clock skew";
+
+  var ageSeconds = Math.max(0, Math.floor((now - published) / 1000));
+  if (ageSeconds < 60)
+    return ageSeconds + "s ago";
+  if (ageSeconds < 3600)
+    return Math.floor(ageSeconds / 60) + "m ago";
+  if (ageSeconds < 86400)
+    return Math.floor(ageSeconds / 3600) + "h ago";
+  return Math.floor(ageSeconds / 86400) + "d ago";
+}
+
+function metadataSummary(session, nowMilliseconds) {
+  return "Attached " + versionSummary(session.attachedVersion)
+    + "  •  Herdr " + versionSummary(session.herdrVersion)
+    + "  •  Last publish " + lastPublishSummary(session.publishedAt, nowMilliseconds);
 }
 
 function fuzzyScore(query, candidate) {
@@ -153,6 +198,9 @@ function terminalCommand(session, provider) {
 if (typeof module !== "undefined")
   module.exports = {
     parseCatalog: parseCatalog,
+    versionSummary: versionSummary,
+    lastPublishSummary: lastPublishSummary,
+    metadataSummary: metadataSummary,
     fuzzyScore: fuzzyScore,
     filterSessions: filterSessions,
     encryptionPasswordProvider: encryptionPasswordProvider,

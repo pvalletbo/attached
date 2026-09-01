@@ -32,7 +32,7 @@ The default configuration uses the regular encryption password:
 
 Set `encryptionPasswordProvider` to `"1password"` to use the 1Password CLI instead. Existing encrypted state is not migrated when this setting changes, so select the provider that was used to create it.
 
-Press **Super+Ctrl+Shift+H** to toggle the right-side picker. With the default provider, enter the encryption password first. Then type to fuzzy-filter, use **Up/Down** to move, **Enter** or a mouse click to connect, **Escape** to clear the query or dismiss, and **Ctrl+R** to retry a failed refresh. With the 1Password provider, **Ctrl+O** asks Omarchy to open or install 1Password.
+Press **Super+Ctrl+Shift+H** to toggle the centered command palette. With the default provider, enter the encryption password first. The host is the primary result label; the session name, Attached version, Herdr version, and last-publish age appear as smaller supporting information. Type to fuzzy-filter, use **Up/Down** to move, **Enter** or a mouse click to connect, **Escape** to clear the query or dismiss, and **Ctrl+R** to retry a failed refresh. With the 1Password provider, **Ctrl+O** asks Omarchy to open or install 1Password.
 
 ## Integration contract
 
@@ -44,6 +44,8 @@ Press **Super+Ctrl+Shift+H** to toggle the right-side picker. With the default p
     "target": "host/session",
     "host": "host",
     "session": "session",
+    "attachedVersion": [0, 3, 1],
+    "herdrVersion": [0, 9, 0],
     "publishedAt": "2026-08-29T12:34:56Z"
   }
 ]
