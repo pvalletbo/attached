@@ -1,4 +1,5 @@
 use std::{
+    io::BufRead as _,
     path::{Path, PathBuf},
     sync::{
         Mutex,
@@ -49,9 +50,11 @@ const COORDINATION_DIRECTORY: &str = "attached-encryption";
 const MASTER_KEY_LOCK: &str = "local-master-key.lock";
 
 static USE_ONE_PASSWORD: AtomicBool = AtomicBool::new(false);
+static USE_PASSWORD_STDIN: AtomicBool = AtomicBool::new(false);
 
-pub(crate) fn configure_use_one_password(enabled: bool) {
-    USE_ONE_PASSWORD.store(enabled, Ordering::SeqCst);
+pub(crate) fn configure_password_provider(use_one_password: bool, use_password_stdin: bool) {
+    USE_ONE_PASSWORD.store(use_one_password, Ordering::SeqCst);
+    USE_PASSWORD_STDIN.store(use_password_stdin, Ordering::SeqCst);
 }
 
 pub(crate) trait MasterKeyStore: Send + Sync {
@@ -88,6 +91,34 @@ impl PasswordPrompt for TtyPasswordPrompt {
             .context("could not read the encryption password from the controlling terminal")?;
         Ok(Zeroizing::new(password.into_bytes()))
     }
+}
+
+#[cfg(not(test))]
+struct StdinPasswordPrompt;
+
+#[cfg(not(test))]
+impl PasswordPrompt for StdinPasswordPrompt {
+    fn read_password(&self, _prompt: &str) -> Result<Zeroizing<Vec<u8>>> {
+        let mut input = std::io::stdin().lock();
+        read_password_line(&mut input)
+            .context("could not read the encryption password from standard input")
+    }
+}
+
+fn read_password_line(reader: &mut impl std::io::BufRead) -> Result<Zeroizing<Vec<u8>>> {
+    let mut password = Zeroizing::new(Vec::with_capacity(MAX_PASSWORD_BYTES));
+    let mut limited = std::io::Read::take(&mut *reader, (MAX_PASSWORD_BYTES + 2) as u64);
+    limited
+        .read_until(b'\n', &mut password)
+        .context("could not read encryption password input")?;
+    if password.last() == Some(&b'\n') {
+        password.pop();
+        if password.last() == Some(&b'\r') {
+            password.pop();
+        }
+    }
+    validate_password(&password)?;
+    Ok(password)
 }
 
 struct UserPasswordProvider<P> {
@@ -398,6 +429,16 @@ static USER_PASSWORD_STORE: LazyLock<
 });
 
 #[cfg(not(test))]
+static STDIN_PASSWORD_STORE: LazyLock<
+    PasswordMasterKeyStore<UserPasswordProvider<StdinPasswordPrompt>>,
+> = LazyLock::new(|| PasswordMasterKeyStore {
+    passwords: UserPasswordProvider {
+        prompt: StdinPasswordPrompt,
+        cached: Mutex::new(None),
+    },
+});
+
+#[cfg(not(test))]
 static ONE_PASSWORD_STORE: LazyLock<PasswordMasterKeyStore<OnePasswordProvider<ProcessOpRunner>>> =
     LazyLock::new(|| PasswordMasterKeyStore {
         passwords: OnePasswordProvider {
@@ -509,6 +550,8 @@ pub(crate) const fn stored_limit(plaintext_limit: usize) -> usize {
 pub(crate) fn active_store() -> &'static dyn MasterKeyStore {
     if USE_ONE_PASSWORD.load(Ordering::SeqCst) {
         &*ONE_PASSWORD_STORE
+    } else if USE_PASSWORD_STDIN.load(Ordering::SeqCst) {
+        &*STDIN_PASSWORD_STORE
     } else {
         &*USER_PASSWORD_STORE
     }
@@ -770,6 +813,24 @@ mod tests {
         };
         let error = empty.password(false).unwrap_err().to_string();
         assert!(error.contains("cannot be empty"), "{error}");
+    }
+
+    #[test]
+    fn password_stdin_reader_accepts_one_bounded_line() {
+        assert_eq!(
+            read_password_line(&mut &b"correct horse battery staple\n"[..])
+                .unwrap()
+                .as_slice(),
+            b"correct horse battery staple"
+        );
+        assert_eq!(
+            read_password_line(&mut &b"windows line\r\n"[..])
+                .unwrap()
+                .as_slice(),
+            b"windows line"
+        );
+        assert!(read_password_line(&mut &b"\n"[..]).is_err());
+        assert!(read_password_line(&mut vec![b'x'; MAX_PASSWORD_BYTES + 1].as_slice()).is_err());
     }
 
     #[test]

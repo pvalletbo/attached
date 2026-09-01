@@ -10,7 +10,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     account_clipboard, download_account, herdr_version, identity, installation, local_encryption,
-    publish_account, secure_state, server, session,
+    publish_account, secure_state, server, session, session_catalog,
     session_picker::{self, SessionSelection},
     sync,
 };
@@ -63,9 +63,22 @@ enum Command {
     },
 
     /// Inspect synchronized remote Herdr sessions.
+    #[command(subcommand_negates_reqs = true, args_conflicts_with_subcommands = true)]
     Sessions {
+        /// Read the encryption password as one newline-terminated value from standard input.
+        #[arg(long, hide = true)]
+        password_stdin: bool,
+
+        /// Path to the local Herdr executable used for version compatibility.
+        #[arg(long, default_value = "herdr")]
+        herdr_bin: PathBuf,
+
+        /// Override persistent state location (primarily for testing).
+        #[arg(long, hide = true)]
+        state_dir: Option<PathBuf>,
+
         #[command(subcommand)]
-        command: SessionsCommand,
+        command: Option<SessionsCommand>,
     },
 
     /// Select and attach to a local or synchronized Herdr session.
@@ -183,7 +196,14 @@ impl Cli {
     }
 
     pub async fn run(self) -> Result<i32> {
-        local_encryption::configure_use_one_password(self.use_1password);
+        let password_stdin = matches!(
+            &self.command,
+            Command::Sessions {
+                password_stdin: true,
+                ..
+            }
+        );
+        local_encryption::configure_password_provider(self.use_1password, password_stdin);
         match self.command {
             Command::Account { command } => {
                 match command {
@@ -254,11 +274,16 @@ impl Cli {
                 server::serve(state_dir, herdr_bin, host_label).await?;
                 Ok(0)
             }
-            Command::Sessions { command } => match command {
-                SessionsCommand::List {
+            Command::Sessions {
+                password_stdin: _,
+                herdr_bin,
+                state_dir,
+                command,
+            } => match command {
+                Some(SessionsCommand::List {
                     herdr_bin,
                     state_dir,
-                } => {
+                }) => {
                     let state_dir = resolved_state_dir(state_dir)?;
                     sync::state::load_account(&state_dir, ApiKeyScope::Download)
                         .context("`sessions list` requires a download account bundle")?;
@@ -276,6 +301,15 @@ impl Cli {
                         .lock()
                         .write_all(rendered.as_bytes())
                         .context("could not write synchronized session list")?;
+                    Ok(0)
+                }
+                None => {
+                    let state_dir = resolved_state_dir(state_dir)?;
+                    let refreshed = session_catalog::refresh(&state_dir, &herdr_bin).await?;
+                    for warning in refresh_warnings_to_display(&refreshed.warnings, self.verbose) {
+                        eprintln!("Warning: {warning}");
+                    }
+                    session_catalog::write_json(stdout().lock(), &refreshed.sessions)?;
                     Ok(0)
                 }
             },
@@ -438,6 +472,7 @@ mod tests {
                 "--output",
                 "/tmp/publish.bundle",
             ],
+            vec!["attached", "sessions"],
             vec!["attached", "sessions", "list"],
             vec![
                 "attached",
@@ -712,6 +747,28 @@ mod tests {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("--use-1password"), "{help}");
         assert!(help.contains("generate and store"), "{help}");
+    }
+
+    #[test]
+    fn machine_catalog_accepts_password_stdin_without_exposing_it_in_help() {
+        let cli = Cli::try_parse_from(["attached", "sessions", "--password-stdin"]).unwrap();
+        let Command::Sessions { password_stdin, .. } = cli.command else {
+            unreachable!();
+        };
+        assert!(password_stdin);
+
+        assert!(Cli::try_parse_from(["attached", "sessions", "list", "--password-stdin"]).is_err());
+
+        let mut command = Cli::command();
+        let sessions_help = command
+            .find_subcommand_mut("sessions")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(
+            !sessions_help.contains("--password-stdin"),
+            "{sessions_help}"
+        );
     }
 
     #[test]

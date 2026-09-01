@@ -19,6 +19,7 @@ on:
       - deny.toml
       - rust-toolchain.toml
       - crates/cli/**
+      - integrations/omarchy/**
       - crates/session-sync-protocol/**
       - crates/session-sync-worker/**
       - crates/tunnel-protocol/**
@@ -66,6 +67,7 @@ jobs:
               - 'rust-toolchain.toml'
               - '**/Cargo.toml'
               - 'crates/cli/**'
+              - 'integrations/omarchy/**'
               - 'crates/session-sync-protocol/**'
               - 'crates/session-sync-worker/**'
               - 'crates/tunnel-protocol/**'
@@ -107,6 +109,27 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      - name: Install Node.js for Omarchy integration tests
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - name: Test the Omarchy integration
+        run: node --test integrations/omarchy/tests/*.test.js integrations/omarchy/pvalletbo.attached/tests/*.test.js
+      - name: Install Linux build and QML validation prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential \
+            cmake \
+            pkg-config \
+            qt6-declarative-dev-tools
+      - name: Check Omarchy QML syntax
+        # qmlformat parses syntax without requiring Quickshell or Omarchy's
+        # target-only QML modules. Its version-specific output is discarded.
+        run: >-
+          /usr/lib/qt6/bin/qmlformat
+          integrations/omarchy/pvalletbo.attached/Overlay.qml
+          > /dev/null
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:

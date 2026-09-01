@@ -8,4 +8,8 @@ Attach to remote Herdr session no matter where they run. No networking setup req
 
 [View the VHS tape](demo/attached-demo.tape)
 
-_This README was updated with assistance from an AI coding agent._
+## Desktop integrations
+
+- [Omarchy Shell session picker](integrations/omarchy/README.md)
+
+_**AI contribution notice:** This README was updated with assistance from an AI coding agent._
