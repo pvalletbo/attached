@@ -62,4 +62,8 @@ mv -f -- "$staged_binary" "$destination"
 staged_binary=""
 
 "$script_dir/install.sh"
+# Quickshell can retain a compiled component for the plugin entry-point URL even
+# after a registry rescan. Restart the shell so local QML changes are guaranteed
+# to be instantiated before testing.
+omarchy restart shell
 printf 'Local Attached build and Omarchy plugin are ready. Press Super+Ctrl+Shift+H to test.\n'

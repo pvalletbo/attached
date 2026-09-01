@@ -85,6 +85,11 @@ test("local test script replaces the binary without a backup and reloads the plu
   assert.match(commands, /cargo build --locked --package attached --release/);
   assert.match(commands, /omarchy-shell shell rescanPlugins/);
   assert.match(commands, /omarchy plugin enable pvalletbo\.attached/);
+  assert.equal(
+    (commands.match(/omarchy restart shell/g) || []).length,
+    2,
+    "each local install must restart Quickshell so changed QML is re-instantiated"
+  );
 
   const invalid = run(["--unknown"], env);
   assert.equal(invalid.status, 2);
