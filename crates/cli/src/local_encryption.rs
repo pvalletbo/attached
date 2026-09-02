@@ -9,7 +9,7 @@ use std::{
 #[cfg(not(test))]
 use std::{
     process::{Command, Stdio},
-    sync::LazyLock,
+    sync::{LazyLock, OnceLock},
 };
 
 use anyhow::{Context as _, Result, bail, ensure};
@@ -51,6 +51,23 @@ const COORDINATION_DIRECTORY: &str = "attached-encryption";
 const MASTER_KEY_LOCK: &str = "local-master-key.lock";
 
 static USE_ONE_PASSWORD: AtomicBool = AtomicBool::new(false);
+
+#[cfg(not(test))]
+struct HandoffMasterKeyStore(Zeroizing<[u8; MASTER_KEY_BYTES]>);
+
+#[cfg(not(test))]
+impl MasterKeyStore for HandoffMasterKeyStore {
+    fn load_or_create(
+        &self,
+        _directory: &crate::secure_state::StateDir,
+        _create: bool,
+    ) -> Result<Zeroizing<[u8; MASTER_KEY_BYTES]>> {
+        Ok(Zeroizing::new(*self.0))
+    }
+}
+
+#[cfg(not(test))]
+static HANDOFF_MASTER_KEY_STORE: OnceLock<HandoffMasterKeyStore> = OnceLock::new();
 
 pub(crate) fn configure_use_one_password(enabled: bool) {
     USE_ONE_PASSWORD.store(enabled, Ordering::SeqCst);
@@ -562,6 +579,26 @@ fn remove_master_key_at(coordination: &Path, store: &dyn MasterKeyStore) -> Resu
     })
 }
 
+#[cfg(not(test))]
+pub(crate) fn configure_handoff_master_key(key: [u8; MASTER_KEY_BYTES]) -> Result<()> {
+    HANDOFF_MASTER_KEY_STORE
+        .set(HandoffMasterKeyStore(Zeroizing::new(key)))
+        .map_err(|_| anyhow::anyhow!("handoff master key was already configured"))
+}
+
+#[cfg(test)]
+pub(crate) fn configure_handoff_master_key(_key: [u8; MASTER_KEY_BYTES]) -> Result<()> {
+    Ok(())
+}
+
+pub(crate) fn handoff_master_key(state_dir: &Path) -> Result<Zeroizing<[u8; MASTER_KEY_BYTES]>> {
+    let directory = crate::secure_state::StateDir::open(state_dir)
+        .context("could not open state for an Attached update handoff")?;
+    active_store()
+        .load_or_create(&directory, false)
+        .context("could not retain the local encryption key for an Attached update handoff")
+}
+
 pub(crate) fn load_or_create_master_key(
     directory: &crate::secure_state::StateDir,
     store: &dyn MasterKeyStore,
@@ -641,7 +678,9 @@ pub(crate) const fn stored_limit(plaintext_limit: usize) -> usize {
 
 #[cfg(not(test))]
 pub(crate) fn active_store() -> &'static dyn MasterKeyStore {
-    if USE_ONE_PASSWORD.load(Ordering::SeqCst) {
+    if let Some(store) = HANDOFF_MASTER_KEY_STORE.get() {
+        store
+    } else if USE_ONE_PASSWORD.load(Ordering::SeqCst) {
         &*ONE_PASSWORD_STORE
     } else {
         &*USER_PASSWORD_STORE

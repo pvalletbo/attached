@@ -3,6 +3,7 @@ use std::process::ExitCode;
 use clap::Parser;
 
 mod account_clipboard;
+mod attached_version;
 mod bounded_process;
 mod cli;
 mod diagnostics;
@@ -16,6 +17,7 @@ mod local_sockets;
 mod proxy;
 mod publish_account;
 mod secure_state;
+mod serve_handoff;
 mod server;
 mod session;
 mod session_picker;
