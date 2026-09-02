@@ -64,7 +64,7 @@ to the remote Herdr session.
 
 ## How it works
 
-To attach to remote Herdr sessions, a secure peer-to-peer channel must be established. Instead of
+To attach to remote Herdr sessions, a secure peer-to-peer (P2P) channel must be established. Instead of
 implementing a custom solution to create this channel, Attached uses [Iroh](https://www.iroh.computer/)
 under the hood to create P2P QUIC connections in which all transmitted bytes are end-to-end encrypted.
 This means that no one except the two ends of the tunnel can read the commands sent between the Herdr
@@ -92,4 +92,66 @@ other technical details, the following information is shared:
 * **Attached version**: the running version of the Attached binary
 * **Herdr version**: the running version of Herdr
 * **Sessions**: a list of the Herdr session names running on the remote machine
+
+### Security model and limitations
+
+If you want to know what things could go wrong, and how the Attached protects against different threats, 
+do not skip this section. 
+
+The following properties are guaranteed by the Attached's design if private and encryption 
+keys are not leaked: 
+
+* Communication between the Herdr client and server cannot be read by a third party
+
+Protected by the end to end encryption provided by the Iroh quic tunnels.
+
+* A malicious synchronization service cannot connect to remote Herdr sessions
+
+Even though the synchronization service is used to share the connection details, the information 
+is sent to the server encrypted using a symmetric key only known by the client and the publisher hosts. 
+The symmetric key is shared using an out of bounds channel from the client to the publisher using 
+the `attached export` command.
+
+* A malicious synchronization service cannot lead the client to connect to remote sessions controlled by it
+
+Because the connection details are encrypted and authenticated using symmetric encryption algorithm (XChaCha20-Poly1305)
+and the service does not know the symmetric key, the client would not be able to decrypt the 
+malicious connection details added by the rogue service. 
+
+* A publisher host cannot connect to remote sessions
+
+Even though the publisher hosts know the symmetric key used to encrypt the connection details, 
+it is not able to fetch that information from the sync service because the API key possessed by it
+only allows to upload information. The sync service must be trusted to verify the scope of the API 
+key used to prevent malicious retrievals of connection details. 
+
+* Local sensitive data is never stored in plain text
+
+Both the client and publisher hosts need to store sensitive data, such as private and encryption keys. 
+This information is never stored in plain text. Instead, the tool prompts the user to provide a password
+that will be used to derive a local encryption key, or it will use [1Password](https://1password.com/)
+to automatically generate a strong password. 
+
+There are some limitations that must be understood before using the Attached cli. 
+
+* The sync service may cause denial of service
+
+Nothing prevents the synchronizaiton service to stop responding to the client, or to hide valid 
+session details shared by the publisher. If this happens the client will not be able to connect 
+to remote Herdr sesions. The sync service source code can be found in this repo so you are free to 
+self host it if you feel like it. 
+
+* Leaking client secrets may lead to RCE on hosts publishing Herdr sessions
+
+If an attacker gains access to the secrets stored in the client machine, they will be able to 
+connect to remote Herdr sessions meaning that they will get access to those hosts. Currently, 
+there is no way to revoke or shut down sessions, so this is something to really take into account. 
+
+## TODO
+
+* Implement token revocation and sessions shut down in case of credentials leak
+* Raycast support
+
+
+
 
