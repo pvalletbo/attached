@@ -158,5 +158,3 @@ there is no way to revoke or shut down sessions, so this is something to really 
 * Multi account support
 * Remote notifications center
 
-_This README was updated with assistance from an AI coding agent._
-
