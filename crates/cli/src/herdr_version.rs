@@ -38,6 +38,7 @@ pub fn parse_version_output(output: &[u8]) -> Result<HerdrVersion> {
 const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 const QUERY_CAPTURE_LIMIT: u64 = 4096;
 
+#[tracing::instrument(name = "herdr_version_query", level = "debug", skip_all)]
 pub fn query(executable: &Path) -> Result<HerdrVersion> {
     query_with_limits(executable, QUERY_TIMEOUT, QUERY_CAPTURE_LIMIT)
 }

@@ -1,5 +1,7 @@
 use std::{
-    io::{self, IsTerminal, Write},
+    fs::File,
+    io::{self, BufWriter, IsTerminal, Write},
+    path::Path,
     sync::{
         Mutex,
         atomic::{AtomicU64, Ordering},
@@ -12,9 +14,10 @@ use tracing::{
     field::{Field, Visit},
 };
 use tracing_subscriber::{
-    filter::{LevelFilter, Targets},
+    filter::{Filtered, LevelFilter, Targets},
     fmt::format::FmtSpan,
     layer::{Context, Layer, SubscriberExt},
+    registry::Registry,
     util::SubscriberInitExt,
 };
 
@@ -193,22 +196,62 @@ impl Drop for TerminalOutputGuard {
     }
 }
 
-pub fn init(verbosity: u8) -> Result<()> {
+type FlameWriter = BufWriter<File>;
+type FlameGuard = tracing_flame::FlushGuard<FlameWriter>;
+type ProfileLayer = Filtered<tracing_flame::FlameLayer<Registry, FlameWriter>, Targets, Registry>;
+
+pub struct DiagnosticsGuard {
+    _flame: Option<FlameGuard>,
+}
+
+fn profile_layer(path: &Path) -> Result<(ProfileLayer, FlameGuard)> {
+    let (layer, guard) = tracing_flame::FlameLayer::<Registry, FlameWriter>::with_file(path)
+        .map_err(|error| {
+            anyhow!(
+                "could not create flamegraph trace {}: {error}",
+                path.display()
+            )
+        })?;
     let filter = Targets::new()
+        .with_default(LevelFilter::OFF)
+        .with_target("attached", LevelFilter::DEBUG);
+    let layer = layer
+        .with_threads_collapsed(true)
+        .with_module_path(false)
+        .with_file_and_line(false)
+        .with_filter(filter);
+    Ok((layer, guard))
+}
+
+pub fn init(verbosity: u8, flamegraph: Option<&Path>) -> Result<DiagnosticsGuard> {
+    let terminal_filter = Targets::new()
         .with_default(LevelFilter::WARN)
         .with_target("attached", level_for(verbosity));
     let formatter = tracing_subscriber::fmt::layer()
         .with_writer(TerminalSafeWriter)
         .with_target(verbosity >= 2)
-        .with_span_events(FmtSpan::NONE)
+        .with_span_events(if flamegraph.is_some() {
+            FmtSpan::CLOSE
+        } else {
+            FmtSpan::NONE
+        })
         .with_ansi(false)
-        .compact();
+        .compact()
+        .with_filter(terminal_filter);
+    let (profile, flame) = match flamegraph {
+        Some(path) => {
+            let (layer, guard) = profile_layer(path)?;
+            (Some(layer), Some(guard))
+        }
+        None => (None, None),
+    };
     tracing_subscriber::registry()
-        .with(filter)
+        .with(profile)
         .with(SuppressExpectedQadMappingWarnings)
         .with(formatter)
         .try_init()
-        .map_err(|error| anyhow!("failed to initialize diagnostics: {error}"))
+        .map_err(|error| anyhow!("failed to initialize diagnostics: {error}"))?;
+    Ok(DiagnosticsGuard { _flame: flame })
 }
 
 pub fn level_for(verbosity: u8) -> Level {
@@ -263,6 +306,7 @@ mod tests {
     use std::{
         io::Write,
         sync::{Arc, Mutex},
+        time::Duration,
     };
 
     #[derive(Clone, Default)]
@@ -426,6 +470,33 @@ mod tests {
         assert!(log.contains("retained-iroh-warning"), "{log}");
         assert!(log.contains("retained-other-target"), "{log}");
         assert!(log.contains("retained-error"), "{log}");
+    }
+
+    #[test]
+    fn flame_profile_records_nested_application_spans_without_fields() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("attached.folded");
+        let (profile, guard) = profile_layer(&output).unwrap();
+        let subscriber = tracing_subscriber::registry().with(profile);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let root = tracing::debug_span!(
+                target: "attached",
+                "profile_root",
+                password = "must-not-be-recorded"
+            );
+            let _root = root.enter();
+            std::thread::sleep(Duration::from_millis(1));
+            let child = tracing::debug_span!(target: "attached", "profile_child");
+            let _child = child.enter();
+            std::thread::sleep(Duration::from_millis(1));
+        });
+        drop(guard);
+
+        let folded = std::fs::read_to_string(output).unwrap();
+        assert!(folded.contains("profile_root"), "{folded}");
+        assert!(folded.contains("profile_root; profile_child"), "{folded}");
+        assert!(!folded.contains("must-not-be-recorded"), "{folded}");
     }
 
     #[test]
