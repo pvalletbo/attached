@@ -343,7 +343,7 @@ fn duplicate_executable(
     executable: &Path,
     parent: &Path,
     prefix: &str,
-) -> Result<tempfile::NamedTempFile> {
+) -> Result<tempfile::TempPath> {
     let duplicate = tempfile::Builder::new()
         .prefix(prefix)
         .tempfile_in(parent)
@@ -353,7 +353,7 @@ fn duplicate_executable(
     let permissions = std::fs::metadata(executable)?.permissions();
     std::fs::set_permissions(duplicate.path(), permissions)?;
     duplicate.as_file().sync_all()?;
-    Ok(duplicate)
+    Ok(duplicate.into_temp_path())
 }
 
 fn replace_executable(source: &Path, destination: &Path) -> Result<()> {
@@ -409,8 +409,8 @@ fn package_managed_executable(executable: &Path) -> bool {
 
 struct ExecutableTransaction {
     destination: PathBuf,
-    original: tempfile::NamedTempFile,
-    candidate: tempfile::NamedTempFile,
+    original: tempfile::TempPath,
+    candidate: tempfile::TempPath,
 }
 
 impl ExecutableTransaction {
@@ -429,11 +429,11 @@ impl ExecutableTransaction {
     }
 
     fn install_candidate(&self) -> Result<()> {
-        replace_executable(self.candidate.path(), &self.destination)
+        replace_executable(self.candidate.as_ref(), &self.destination)
     }
 
     fn restore_original(&self) -> Result<()> {
-        replace_executable(self.original.path(), &self.destination)
+        replace_executable(self.original.as_ref(), &self.destination)
     }
 }
 
@@ -595,7 +595,7 @@ fn rollback_transaction(
     );
     if handoff_attempted
         && reconcile_live_sessions(
-            transaction.candidate.path(),
+            transaction.candidate.as_ref(),
             &transaction.destination,
             selected_session,
             original_version,
@@ -621,7 +621,7 @@ fn roll_forward_transaction(
     requested_version: HerdrVersion,
 ) -> Result<()> {
     ensure!(
-        query(transaction.candidate.path())? == requested_version,
+        query(transaction.candidate.as_ref())? == requested_version,
         "staged Herdr candidate is not the requested version"
     );
     let installed = query(&transaction.destination)?;
@@ -631,7 +631,7 @@ fn roll_forward_transaction(
     );
     transaction.install_candidate()?;
     reconcile_live_sessions(
-        transaction.candidate.path(),
+        transaction.candidate.as_ref(),
         &transaction.destination,
         selected_session,
         requested_version,
@@ -696,11 +696,11 @@ pub(crate) fn update_session_with_config(
     let mut candidate_installed = false;
     let forward_result = (|| -> Result<()> {
         let update_result = invoke_update_command_with_limits(
-            sandbox.update_command(transaction.candidate.path()),
+            sandbox.update_command(transaction.candidate.as_ref()),
             UPDATE_TIMEOUT,
             UPDATE_CAPTURE_LIMIT,
         );
-        let candidate_version = query(transaction.candidate.path())
+        let candidate_version = query(transaction.candidate.as_ref())
             .context("could not query the staged Herdr candidate")?;
         ensure!(
             candidate_version == requested_version,
@@ -724,7 +724,7 @@ pub(crate) fn update_session_with_config(
         );
         handoff_attempted = true;
         reconcile_live_sessions(
-            transaction.candidate.path(),
+            transaction.candidate.as_ref(),
             &transaction.destination,
             session,
             requested_version,
@@ -764,6 +764,12 @@ mod tests {
     const FIXTURE_RUNTIME_LIMIT: Duration = Duration::from_secs(10);
     const OVER_32_BYTES: &[u8] = b"printf '0123456789abcdef0123456789abcdefX'\n";
     static PROCESS_FIXTURE_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_process_fixtures() -> std::sync::MutexGuard<'static, ()> {
+        PROCESS_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     fn fake_herdr(body: &[u8]) -> tempfile::TempPath {
         let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
@@ -878,7 +884,7 @@ exit 9
     fn queries_configured_executable_and_handles_failures() {
         // These process-heavy cases and the update cases would otherwise run in
         // parallel and can exhaust constrained CI runners during a full suite.
-        let _fixture_guard = PROCESS_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_guard = lock_process_fixtures();
         let valid = fake_herdr(b"printf 'herdr 4.5.6\\n'\n");
         assert_eq!(
             query_with_limits(&valid, FIXTURE_RUNTIME_LIMIT, QUERY_CAPTURE_LIMIT).unwrap(),
@@ -926,7 +932,7 @@ exit 9
             );
         }
 
-        let _fixture_guard = PROCESS_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_guard = lock_process_fixtures();
         let root = tempfile::tempdir().unwrap();
         let source_config = root.path().join("config.toml");
         fs::write(&source_config, b"[update]\nchannel = 'preview'\n").unwrap();
@@ -981,7 +987,7 @@ exit 9
 
     #[test]
     fn remote_update_verifies_and_repairs_live_sessions_offline() {
-        let _fixture_guard = PROCESS_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_guard = lock_process_fixtures();
         let requested = HerdrVersion::new(4, 5, 6);
 
         let updated = tempfile::tempdir().unwrap();
