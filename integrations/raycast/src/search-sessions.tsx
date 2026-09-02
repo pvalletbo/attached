@@ -233,7 +233,11 @@ function SessionList({
           icon={Icon.Terminal}
           title="No Synchronized Sessions"
           description="Attached did not find any remote Herdr sessions."
-          actions={<CommonActions provider={provider} onRefresh={onRefresh} />}
+          actions={
+            <ActionPanel>
+              <CommonActions provider={provider} onRefresh={onRefresh} />
+            </ActionPanel>
+          }
         />
       ) : (
         <List.Section title="Synchronized Sessions" subtitle={String(sessions.length)}>

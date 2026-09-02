@@ -32,6 +32,7 @@ describe("parseCatalog", () => {
     ["non-object row", JSON.stringify(["office/work"])],
     ["empty host", JSON.stringify([{ ...VALID_SESSION, host: "", target: "/deep work" }])],
     ["null byte", JSON.stringify([{ ...VALID_SESSION, session: "bad\0name", target: "office/bad\0name" }])],
+    ["line break", JSON.stringify([{ ...VALID_SESSION, session: "bad\nname", target: "office/bad\nname" }])],
     ["inconsistent target", JSON.stringify([{ ...VALID_SESSION, target: "elsewhere/deep work" }])],
     ["missing Attached version", JSON.stringify([{ ...VALID_SESSION, attachedVersion: undefined }])],
     ["invalid Herdr version", JSON.stringify([{ ...VALID_SESSION, herdrVersion: [0, -1, 0] }])],

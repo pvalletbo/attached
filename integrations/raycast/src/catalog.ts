@@ -71,7 +71,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function parseText(value: unknown, field: string, rowNumber: number): string {
-  if (typeof value !== "string" || value.length === 0 || value.includes("\0")) {
+  if (typeof value !== "string" || value.length === 0 || /\p{Cc}/u.test(value)) {
     throw new CatalogValidationError(`session row ${rowNumber} has an invalid ${field}`);
   }
   return value;
