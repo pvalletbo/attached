@@ -1,0 +1,32 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "attached-herdr-container",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-02",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "ATTACHED_HOST_LABEL": "cloudflare-container"
+  },
+  "containers": [
+    {
+      "class_name": "HerdrContainer",
+      "image": "../docker/Dockerfile",
+      "instance_type": "standard-1",
+      "max_instances": 1
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "HERDR_CONTAINER",
+        "class_name": "HerdrContainer"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["HerdrContainer"]
+    }
+  ]
+}

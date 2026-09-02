@@ -11,6 +11,15 @@ the outside.
 
 ![Attached terminal demo showing a consumer connected to a Herdr session running in Docker](demo/attached-demo.gif)
 
+## Deployment recipes
+
+See [`recipes/`](recipes/) for tested examples that publish headless Herdr sessions from Docker,
+Cloudflare Containers, Cloudflare Agents backed by Sandbox, Kubernetes, GitHub Actions, and other
+ephemeral OCI hosts.
+
+> **AI contribution notice:** This deployment-recipes section and the linked recipe documentation
+> were prepared with AI assistance and require human review before production use.
+
 ## Install
 
 ### Curl 

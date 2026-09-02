@@ -1,0 +1,20 @@
+{
+  "name": "attached-herdr-cloudflare-agent-recipe",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "typecheck": "tsc --noEmit --pretty false"
+  },
+  "dependencies": {
+    "@cloudflare/sandbox": "0.12.9",
+    "agents": "0.22.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260902.1",
+    "typescript": "5.9.3",
+    "wrangler": "4.128.0"
+  }
+}

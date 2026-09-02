@@ -1,0 +1,8 @@
+packages:
+  - cloudflare-agent
+  - cloudflare-containers
+
+allowBuilds:
+  core-js-pure: false
+  esbuild: true
+  workerd: true

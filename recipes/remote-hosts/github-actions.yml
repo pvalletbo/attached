@@ -1,0 +1,104 @@
+name: Ephemeral Attached Herdr session
+
+on:
+  workflow_dispatch:
+    inputs:
+      lifetime_minutes:
+        description: Maximum session lifetime in minutes
+        required: true
+        default: "60"
+
+permissions:
+  contents: read
+
+jobs:
+  herdr:
+    runs-on: ubuntu-24.04
+    environment: attached-herdr
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Validate requested lifetime
+        env:
+          LIFETIME_MINUTES: ${{ inputs.lifetime_minutes }}
+        run: |
+          case "$LIFETIME_MINUTES" in
+            ''|*[!0-9]*) echo "lifetime_minutes must be an integer" >&2; exit 2 ;;
+          esac
+          test "$LIFETIME_MINUTES" -ge 1
+          test "$LIFETIME_MINUTES" -le 330
+
+      - name: Build pinned Herdr and Attached image
+        run: docker build --tag attached-herdr:recipe recipes/docker
+
+      - name: Start ephemeral publisher
+        env:
+          ATTACHED_PUBLISH_BUNDLE: ${{ secrets.ATTACHED_PUBLISH_BUNDLE }}
+          ATTACHED_LOCAL_PASSWORD: ${{ secrets.ATTACHED_LOCAL_PASSWORD }}
+          ATTACHED_HOST_LABEL: gha-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          unset publish_bundle local_password
+          publish_bundle="$ATTACHED_PUBLISH_BUNDLE"
+          local_password="$ATTACHED_LOCAL_PASSWORD"
+          unset ATTACHED_PUBLISH_BUNDLE ATTACHED_LOCAL_PASSWORD
+
+          umask 077
+          secret_dir="$RUNNER_TEMP/attached-herdr-secrets"
+          home_dir="$RUNNER_TEMP/attached-herdr-home"
+          mkdir -p "$secret_dir" "$home_dir"
+          printf '%s' "$publish_bundle" >"$secret_dir/publish.bundle"
+          printf '%s' "$local_password" >"$secret_dir/local-password"
+          publish_bundle=""
+          local_password=""
+          sudo chown root:root "$secret_dir/publish.bundle" "$secret_dir/local-password"
+
+          run_uid="$(id -u)"
+          run_gid="$(id -g)"
+          docker run --detach --name attached-herdr \
+            --user 0:0 \
+            --cap-drop ALL \
+            --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add SETGID --cap-add SETUID \
+            --security-opt no-new-privileges \
+            --read-only \
+            --no-healthcheck \
+            --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
+            --mount "type=bind,src=$secret_dir/publish.bundle,dst=/run/secrets/publish.bundle,readonly" \
+            --mount "type=bind,src=$secret_dir/local-password,dst=/run/secrets/local-password,readonly" \
+            --mount "type=bind,src=$home_dir,dst=/home/herdr" \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/workspace" \
+            --env ATTACHED_PUBLISH_BUNDLE_FILE=/run/secrets/publish.bundle \
+            --env ATTACHED_LOCAL_PASSWORD_FILE=/run/secrets/local-password \
+            --env ATTACHED_RUN_AS_UID="$run_uid" \
+            --env ATTACHED_RUN_AS_GID="$run_gid" \
+            --env ATTACHED_HOST_LABEL \
+            attached-herdr:recipe
+          for attempt in $(seq 1 75); do
+            if docker exec --user "$run_uid:$run_gid" attached-herdr \
+              busybox wget -q -O - http://127.0.0.1:8080/healthz; then
+              exit 0
+            fi
+            if ! docker inspect --format '{{.State.Running}}' attached-herdr | grep -qx true; then
+              docker logs attached-herdr
+              exit 1
+            fi
+            sleep 2
+          done
+          docker logs attached-herdr
+          exit 1
+
+      - name: Keep session available
+        env:
+          LIFETIME_MINUTES: ${{ inputs.lifetime_minutes }}
+        run: sleep "${LIFETIME_MINUTES}m"
+
+      - name: Stop publisher
+        if: always()
+        run: |
+          docker stop --time 20 attached-herdr || true
+          docker rm --force attached-herdr || true
+          sudo rm -rf \
+            "$RUNNER_TEMP/attached-herdr-secrets" \
+            "$RUNNER_TEMP/attached-herdr-home"

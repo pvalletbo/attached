@@ -1,0 +1,37 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "attached-herdr-agent",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-02",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "ATTACHED_HOST_LABEL_PREFIX": "cloudflare-agent",
+    "ENABLE_COMPUTER_TOOL": "false"
+  },
+  "containers": [
+    {
+      "class_name": "Sandbox",
+      "image": "../docker/Dockerfile.cloudflare-sandbox",
+      "instance_type": "standard-1",
+      "max_instances": 5
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "Sandbox",
+        "class_name": "Sandbox"
+      },
+      {
+        "name": "HerdrAgent",
+        "class_name": "HerdrAgent"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["Sandbox", "HerdrAgent"]
+    }
+  ]
+}

@@ -1,0 +1,65 @@
+services:
+  herdr:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    stop_grace_period: 20s
+    # Root is used only to stage mode-0600 bind-mounted secrets; the entrypoint
+    # drops permanently to 10001:10001 before starting Attached or Herdr.
+    user: "0:0"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,mode=1777
+    environment:
+      ATTACHED_PUBLISH_BUNDLE_FILE: /run/secrets/attached_publish_bundle
+      ATTACHED_LOCAL_PASSWORD_FILE: /run/secrets/attached_local_password
+      ATTACHED_HOST_LABEL: ${ATTACHED_HOST_LABEL:-docker-herdr}
+    secrets:
+      - attached_publish_bundle
+      - attached_local_password
+    volumes:
+      - herdr-home:/home/herdr
+      - herdr-workspace:/workspace
+    ports:
+      - "127.0.0.1:${ATTACHED_HEALTH_PORT:-8080}:8080"
+    healthcheck:
+      test:
+        - CMD
+        - env
+        - -i
+        - PATH=/usr/local/bin:/usr/bin:/bin
+        - setpriv
+        - --no-new-privs
+        - --reuid=10001
+        - --regid=10001
+        - --clear-groups
+        - busybox
+        - wget
+        - -q
+        - -O
+        - /dev/null
+        - http://127.0.0.1:8080/healthz
+      interval: 10s
+      timeout: 3s
+      start_period: 130s
+      retries: 3
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - SETGID
+      - SETUID
+
+secrets:
+  attached_publish_bundle:
+    file: ${ATTACHED_PUBLISH_BUNDLE_FILE:?set ATTACHED_PUBLISH_BUNDLE_FILE}
+  attached_local_password:
+    file: ${ATTACHED_LOCAL_PASSWORD_FILE:?set ATTACHED_LOCAL_PASSWORD_FILE}
+
+volumes:
+  herdr-home:
+  herdr-workspace:

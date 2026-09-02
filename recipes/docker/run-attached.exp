@@ -1,0 +1,125 @@
+#!/usr/bin/expect -f
+
+if {$argc < 5} {
+    puts stderr "usage: run-attached.exp PASSWORD_FILE BUNDLE_FILE READY_FILE CHILD_PID_FILE COMMAND ..."
+    exit 2
+}
+
+set password_file [lindex $argv 0]
+set bundle_file [lindex $argv 1]
+set ready_file [lindex $argv 2]
+set child_pid_file [lindex $argv 3]
+set command [lrange $argv 4 end]
+set password_handle [open $password_file rb]
+set password [string trimright [read $password_handle] "\r\n"]
+close $password_handle
+file delete -force -- $password_file
+
+if {[string first "\n" $password] >= 0 || [string first "\r" $password] >= 0} {
+    puts stderr "Attached local encryption password must be a single line"
+    exit 2
+}
+if {[string length $password] == 0} {
+    puts stderr "Attached local encryption password is empty"
+    exit 2
+}
+
+set timeout 120
+if {[info exists env(ATTACHED_STARTUP_TIMEOUT_SECONDS)]} {
+    set timeout $env(ATTACHED_STARTUP_TIMEOUT_SECONDS)
+}
+if {![string is integer -strict $timeout] || $timeout < 1 || $timeout > 900} {
+    puts stderr "ATTACHED_STARTUP_TIMEOUT_SECONDS must be an integer from 1 to 900"
+    exit 2
+}
+
+log_user 1
+spawn -noecho {*}$command
+set child_pid_handle [open "${child_pid_file}.tmp" w]
+puts $child_pid_handle [exp_pid]
+close $child_pid_handle
+file rename -force -- "${child_pid_file}.tmp" $child_pid_file
+
+proc delete_bundle {} {
+    global bundle_file
+    file delete -force -- $bundle_file
+}
+
+set interrupted 0
+proc forward_interrupt {} {
+    global interrupted spawn_id
+    set interrupted 1
+    if {[info exists spawn_id]} {
+        catch {exec kill -INT -- [exp_pid -i $spawn_id]}
+    }
+}
+
+trap {forward_interrupt} SIGINT
+trap {forward_interrupt} SIGTERM
+trap {forward_interrupt} SIGHUP
+
+set ready 0
+set startup_failed 0
+expect {
+    -re {Create Attached encryption password: ?$} {
+        delete_bundle
+        send -- "$password\r"
+        exp_continue
+    }
+    -re {Confirm Attached encryption password: ?$} {
+        delete_bundle
+        send -- "$password\r"
+        exp_continue
+    }
+    -re {Attached encryption password: ?$} {
+        delete_bundle
+        send -- "$password\r"
+        exp_continue
+    }
+    -re {Publish account configured\.} {
+        delete_bundle
+        exp_continue
+    }
+    -re {Enter the publish bundle.*: ?$} {
+        puts stderr "publisher bundle prompt was unexpected; configure a publish bundle"
+        set startup_failed 1
+        forward_interrupt
+        after 2000
+        catch {exec kill -KILL -- [exp_pid]}
+        exp_continue
+    }
+    -re {Serving synchronized Herdr sessions as `[^`]+`\.} {
+        delete_bundle
+        set ready_handle [open "${ready_file}.tmp" w]
+        puts $ready_handle "ok"
+        close $ready_handle
+        file rename -force -- "${ready_file}.tmp" $ready_file
+        set password ""
+        set ready 1
+        set timeout -1
+        exp_continue
+    }
+    timeout {
+        puts stderr "Attached did not become ready within $timeout seconds"
+        set startup_failed 1
+        forward_interrupt
+        after 2000
+        catch {exec kill -KILL -- [exp_pid]}
+        exp_continue
+    }
+    eof {}
+}
+
+if {!$ready} {
+    file delete -force -- $ready_file
+}
+
+lassign [wait] child_pid spawn_identifier os_error status
+if {$startup_failed || (!$ready && !$interrupted)} {
+    exit 1
+}
+if {$os_error == 0} {
+    exit $status
+}
+puts stderr "Attached wait failed: $status"
+exit 1

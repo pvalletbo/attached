@@ -1,0 +1,37 @@
+# syntax=docker/dockerfile:1.7.0@sha256:dbbd5e059e8a07ff7ea6233b213b36aa516b4c53c645f1817a4dd18b83cbea56
+FROM docker.io/cloudflare/sandbox:0.12.9@sha256:4a56a37a3cfd9b38d65bb4b5d0b341e6490a3a4c0226274ae4c1cca4948e85fe
+
+LABEL org.opencontainers.image.title="Attached Herdr Sandbox" \
+      org.opencontainers.image.description="Cloudflare Sandbox with Herdr and Attached installed" \
+      org.opencontainers.image.source="https://github.com/pvalletbo/attached" \
+      dev.herdr.version="0.8.2" \
+      sh.attached.version="0.2.3" \
+      com.cloudflare.sandbox.version="0.12.9"
+
+ARG TARGETARCH
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash \
+        busybox \
+        expect \
+        passwd \
+        procps \
+        util-linux \
+        xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --chmod=0755 install-runtime.sh /tmp/install-runtime.sh
+RUN TARGETARCH="$TARGETARCH" /tmp/install-runtime.sh \
+    && rm -f /tmp/install-runtime.sh
+
+COPY --chmod=0755 entrypoint.sh /usr/local/bin/attached-herdr-entrypoint
+COPY --chmod=0755 run-attached.exp /usr/local/libexec/attached-herdr/run-attached.exp
+
+RUN groupadd --gid 10001 herdr \
+    && useradd --no-log-init --uid 10001 --gid 10001 \
+        --home-dir /workspace/home --shell /bin/bash herdr \
+    && install -d -o herdr -g herdr -m 0700 /workspace /workspace/home
+
+# Keep the Sandbox image's /container-server/sandbox ENTRYPOINT. The Agent starts
+# attached-herdr-entrypoint as a managed background process through the SDK.

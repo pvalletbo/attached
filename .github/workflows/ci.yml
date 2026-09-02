@@ -22,6 +22,7 @@ on:
       - crates/session-sync-protocol/**
       - crates/session-sync-worker/**
       - crates/tunnel-protocol/**
+      - recipes/**
       - "**/Cargo.toml"
   workflow_dispatch:
 
@@ -51,6 +52,7 @@ jobs:
       core: ${{ steps.filter.outputs.core }}
       worker: ${{ steps.filter.outputs.worker }}
       web: ${{ steps.filter.outputs.web }}
+      recipes: ${{ steps.filter.outputs.recipes }}
     steps:
       - name: Select affected CI jobs
         id: filter
@@ -91,6 +93,67 @@ jobs:
               - 'crates/tunnel-protocol/**'
               - 'experimental/crates/**'
               - 'experimental/web-client/**'
+            recipes:
+              - '.github/workflows/ci.yml'
+              - 'recipes/**'
+
+  recipes:
+    name: Deployment recipe quality gates
+    needs: changes
+    if: >-
+      always() && !cancelled() &&
+      (github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.draft == false &&
+      needs.changes.outputs.recipes == 'true'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: recipes
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.18.0
+      - name: Enable the pinned pnpm version
+        run: corepack enable
+      - name: Install Expect for entrypoint integration tests
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends expect
+      - name: Install recipe dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Run recipe tests and type checks
+        run: pnpm check
+      - name: Validate the Docker Compose recipe
+        run: >-
+          docker compose --file docker/compose.yaml
+          --env-file docker/.env.example config --quiet
+      - name: Build the portable runtime image
+        run: docker build --tag attached-herdr:ci docker
+      - name: Smoke-test installed release binaries
+        run: |
+          docker run --rm --entrypoint herdr attached-herdr:ci --version
+          docker run --rm --entrypoint attached attached-herdr:ci --version
+      - name: Build the Cloudflare Sandbox runtime image
+        run: >-
+          docker build --tag attached-herdr-sandbox:ci
+          --file docker/Dockerfile.cloudflare-sandbox docker
+      - name: Bundle the Cloudflare Container Worker
+        run: >-
+          pnpm --dir cloudflare-containers exec wrangler deploy
+          --dry-run --containers-rollout=none
+          --outdir "$RUNNER_TEMP/cloudflare-container-worker"
+      - name: Bundle the Cloudflare Agent Worker
+        run: >-
+          pnpm --dir cloudflare-agent exec wrangler deploy
+          --dry-run --containers-rollout=none
+          --outdir "$RUNNER_TEMP/cloudflare-agent-worker"
+      - name: Check whitespace
+        working-directory: .
+        run: git diff --check
 
   rust:
     name: Core Rust quality gates
