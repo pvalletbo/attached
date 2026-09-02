@@ -72,8 +72,8 @@
   "scripts": {
     "build": "ray build -e dist",
     "dev": "ray develop",
-    "fix-lint": "ray lint --fix",
-    "lint": "ray lint",
+    "fix-lint": "eslint src --fix && prettier --write src package.json tsconfig.json eslint.config.js .prettierrc",
+    "lint": "eslint src --max-warnings=0 && prettier --check src package.json tsconfig.json eslint.config.js .prettierrc",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   }
