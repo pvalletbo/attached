@@ -151,7 +151,6 @@ there is no way to revoke or shut down sessions, so this is something to really 
 
 * Implement token revocation and sessions shut down in case of credentials leak
 * Raycast support
-
-
-
+* Multi account support
+* Remote notifications center
 
