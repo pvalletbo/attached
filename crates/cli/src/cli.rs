@@ -85,11 +85,13 @@ enum Command {
 
         /// In noninteractive use, request an upgrade when remote Herdr is older than local Herdr.
         ///
-        /// The authenticated host runs exactly `herdr update --handoff` with its configured Herdr
-        /// executable. This installs from the remote configured channel and attempts Herdr's live
-        /// handoff; no requested release is selected. Attachment starts only if the installed
-        /// version then exactly matches the local Herdr version. A newer remote fails with
-        /// guidance to update local Herdr and is never mutated by this option.
+        /// The authenticated host stages `herdr update --handoff` noninteractively with inherited
+        /// Herdr session routing removed, atomically installs it, and hands off every live session.
+        /// Failures restore the previous binary and live version. If the binary was already
+        /// updated by an incomplete attempt, Attached retries Herdr's native handoff directly.
+        /// Attachment starts only after the binary and all live sessions exactly match local. A
+        /// newer remote fails with guidance to update local Herdr and is never mutated by this
+        /// option. Package-managed remote installations must be updated on their serving host.
         #[arg(long)]
         upgrade_remote: bool,
 

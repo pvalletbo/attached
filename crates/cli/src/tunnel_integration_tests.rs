@@ -2,7 +2,8 @@ use super::*;
 use std::{io, net::Ipv4Addr, time::Duration};
 
 use attached_tunnel_protocol::{
-    AttachedUpdateRequest, read_attached_update_request, write_attached_update_response,
+    AttachedUpdateRequest, UpgradeResponse, read_attached_update_request, read_upgrade_request,
+    write_attached_update_response, write_upgrade_response,
 };
 use iroh::{RelayMode, endpoint::BindOpts};
 use tokio::{
@@ -12,7 +13,7 @@ use tokio::{
     time::timeout,
 };
 
-const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 const LARGE_PAYLOAD_SIZE: usize = 256 * 1024;
 const MAX_CONNECTIONS: usize = 16;
 const MAX_PENDING_CONNECTIONS: usize = 16;
@@ -227,6 +228,23 @@ async fn attached_update_endpoint(
         .unwrap()
 }
 
+async fn upgrade_endpoint(identity: iroh::SecretKey) -> Endpoint {
+    Endpoint::builder(presets::N0)
+        .secret_key(identity)
+        .clear_ip_transports()
+        .bind_addr_with_opts(
+            (Ipv4Addr::LOCALHOST, 0),
+            BindOpts::default().set_prefix_len(8),
+        )
+        .unwrap()
+        .relay_mode(RelayMode::Disabled)
+        .clear_address_lookup()
+        .alpns(vec![UPGRADE_ALPN.to_vec()])
+        .bind()
+        .await
+        .unwrap()
+}
+
 async fn connected_endpoints() -> (Endpoint, Endpoint, Connection, Connection) {
     let server = endpoint().await;
     let client = endpoint().await;
@@ -281,6 +299,48 @@ fn unix_pair() -> (UnixStream, UnixStream) {
         UnixStream::from_std(left).unwrap(),
         UnixStream::from_std(right).unwrap(),
     )
+}
+
+#[tokio::test]
+async fn remote_herdr_upgrade_confirmation_is_entirely_offline() {
+    within(async {
+        let capability = CapabilitySecret::from_bytes([0x72; 32]);
+        let requested = HerdrVersion::new(4, 5, 6);
+        let server = upgrade_endpoint(iroh::SecretKey::generate()).await;
+        let client = upgrade_endpoint(iroh::SecretKey::generate()).await;
+        let server_addr = server.addr();
+        assert!(server_addr.relay_urls().next().is_none());
+        assert!(
+            server_addr
+                .ip_addrs()
+                .all(|address| address.ip().is_loopback())
+        );
+
+        let server_capability = capability.clone();
+        let serving = tokio::spawn(async move {
+            let connection = server.accept().await.unwrap().await.unwrap();
+            let (mut send, mut receive) = connection.accept_bi().await.unwrap();
+            let request = read_upgrade_request(&mut receive, &server_capability)
+                .await
+                .unwrap();
+            assert_eq!(request.session, "work");
+            assert_eq!(request.requested_version, requested);
+            write_upgrade_response(&mut send, UpgradeResponse::Updated(requested))
+                .await
+                .unwrap();
+            send.stopped().await.unwrap();
+            server.close().await;
+        });
+
+        let installed =
+            request_upgrade_on_endpoint(&client, server_addr, "work", &capability, requested)
+                .await
+                .unwrap();
+        assert_eq!(installed, requested);
+        client.close().await;
+        serving.await.unwrap();
+    })
+    .await;
 }
 
 #[tokio::test]

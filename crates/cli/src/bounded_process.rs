@@ -23,10 +23,18 @@ pub fn run(
     runtime_limit: Duration,
     capture_limit: u64,
 ) -> Result<BoundedOutput> {
-    let command_display = format_command(executable, args);
     let mut command = Command::new(executable);
+    command.args(args);
+    run_command(command, runtime_limit, capture_limit)
+}
+
+pub fn run_command(
+    mut command: Command,
+    runtime_limit: Duration,
+    capture_limit: u64,
+) -> Result<BoundedOutput> {
+    let command_display = format_command(&command);
     command
-        .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
@@ -116,9 +124,10 @@ pub(crate) fn terminate_process_group(child_id: u32) {
     let _ = kill_process_group(process_group, Signal::KILL);
 }
 
-fn format_command(executable: &Path, args: &[&OsStr]) -> String {
-    let args = args
-        .iter()
+fn format_command(command: &Command) -> String {
+    let executable = Path::new(command.get_program());
+    let args = command
+        .get_args()
         .map(|arg| arg.to_string_lossy())
         .collect::<Vec<_>>()
         .join(" ");
