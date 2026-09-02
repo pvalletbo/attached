@@ -95,62 +95,63 @@ other technical details, the following information is shared:
 
 ### Security model and limitations
 
-If you want to know what things could go wrong, and how the Attached protects against different threats, 
-do not skip this section. 
+If you want to know what things could go wrong and how Attached protects against different threats,
+do not skip this section.
 
-The following properties are guaranteed by the Attached's design if private and encryption 
-keys are not leaked: 
+The following properties are guaranteed by Attached's design if private keys and encryption
+keys are not leaked:
 
 * Communication between the Herdr client and server cannot be read by a third party
 
-Protected by the end to end encryption provided by the Iroh quic tunnels.
+This is protected by the end-to-end encryption provided by the Iroh QUIC tunnels.
 
 * A malicious synchronization service cannot connect to remote Herdr sessions
 
-Even though the synchronization service is used to share the connection details, the information 
-is sent to the server encrypted using a symmetric key only known by the client and the publisher hosts. 
-The symmetric key is shared using an out of bounds channel from the client to the publisher using 
+Even though the synchronization service is used to share the connection details, the information
+is sent to the server encrypted using a symmetric key known only to the client and the publisher hosts.
+The symmetric key is shared using an out-of-band channel from the client to the publisher using
 the `attached export` command.
 
 * A malicious synchronization service cannot lead the client to connect to remote sessions controlled by it
 
-Because the connection details are encrypted and authenticated using symmetric encryption algorithm (XChaCha20-Poly1305)
-and the service does not know the symmetric key, the client would not be able to decrypt the 
-malicious connection details added by the rogue service. 
+Because the connection details are encrypted and authenticated using a symmetric encryption algorithm (XChaCha20-Poly1305)
+and the service does not know the symmetric key, the client would not be able to decrypt the
+malicious connection details added by the rogue service.
 
 * A publisher host cannot connect to remote sessions
 
-Even though the publisher hosts know the symmetric key used to encrypt the connection details, 
-it is not able to fetch that information from the sync service because the API key possessed by it
-only allows to upload information. The sync service must be trusted to verify the scope of the API 
-key used to prevent malicious retrievals of connection details. 
+Even though a publisher host knows the symmetric key used to encrypt the connection details,
+it is not able to fetch that information from the sync service because its API key only allows it
+to upload information. The sync service must be trusted to verify the API key's scope to prevent
+malicious retrievals of connection details.
 
 * Local sensitive data is never stored in plain text
 
-Both the client and publisher hosts need to store sensitive data, such as private and encryption keys. 
+Both the client and publisher hosts need to store sensitive data, such as private keys and encryption keys.
 This information is never stored in plain text. Instead, the tool prompts the user to provide a password
 that will be used to derive a local encryption key, or it will use [1Password](https://1password.com/)
-to automatically generate a strong password. 
+to automatically generate a strong password.
 
-There are some limitations that must be understood before using the Attached cli. 
+There are some limitations that must be understood before using the Attached CLI.
 
 * The sync service may cause denial of service
 
-Nothing prevents the synchronizaiton service to stop responding to the client, or to hide valid 
-session details shared by the publisher. If this happens the client will not be able to connect 
-to remote Herdr sesions. The sync service source code can be found in this repo so you are free to 
-self host it if you feel like it. 
+Nothing prevents the synchronization service from stopping its responses to the client or hiding valid
+session details shared by the publisher. If this happens, the client will not be able to connect
+to remote Herdr sessions. The sync service source code can be found in this repo, so you are free to
+self-host it if you feel like it.
 
 * Leaking client secrets may lead to RCE on hosts publishing Herdr sessions
 
-If an attacker gains access to the secrets stored in the client machine, they will be able to 
-connect to remote Herdr sessions meaning that they will get access to those hosts. Currently, 
-there is no way to revoke or shut down sessions, so this is something to really take into account. 
+If an attacker gains access to the secrets stored on the client machine, they will be able to
+connect to remote Herdr sessions, meaning that they will get access to those hosts. Currently,
+there is no way to revoke or shut down sessions, so this is something to really take into account.
 
 ## TODO
 
-* Implement token revocation and sessions shut down in case of credentials leak
+* Implement token revocation and session shutdown in case of a credential leak
 * Raycast support
 * Multi account support
 * Remote notifications center
+
 
