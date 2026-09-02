@@ -135,6 +135,7 @@ export async function loadSessionCatalog(
 
   return new Promise((resolve, reject) => {
     const child = spawn(executable, catalogArguments(provider), {
+      detached: true,
       env: attachedEnvironment(),
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -166,13 +167,26 @@ export async function loadSessionCatalog(
       callback(value);
     }
 
+    function killProcessGroup(signal: NodeJS.Signals) {
+      if (child.pid !== undefined) {
+        try {
+          process.kill(-child.pid, signal);
+          return;
+        } catch {
+          // The process may have exited between the event and this signal. The
+          // ChildProcess fallback still handles platforms without process groups.
+        }
+      }
+      child.kill(signal);
+    }
+
     function terminate(reason: CatalogCommandErrorKind) {
       if (termination !== undefined || settled) {
         return;
       }
       termination = reason;
-      child.kill("SIGTERM");
-      forceKillTimer = setTimeout(() => child.kill("SIGKILL"), FORCE_KILL_DELAY_MILLISECONDS);
+      killProcessGroup("SIGTERM");
+      forceKillTimer = setTimeout(() => killProcessGroup("SIGKILL"), FORCE_KILL_DELAY_MILLISECONDS);
       forceKillTimer.unref();
     }
 
