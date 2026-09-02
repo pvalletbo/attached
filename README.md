@@ -60,4 +60,4 @@ attached attach
 You should see something like the image below. You can just select the desired session and 
 you'll be attached to the remote herdr session. 
 
-
+![attahed attach](./docs/img/attached_attach.png)
