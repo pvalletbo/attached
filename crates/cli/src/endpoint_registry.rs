@@ -10,7 +10,13 @@ use rustix::process::geteuid;
 use crate::secure_state::StateDir;
 
 pub struct ActiveEndpoint {
-    _file: File,
+    file: File,
+}
+
+impl Drop for ActiveEndpoint {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
 }
 
 pub fn default_dir() -> Result<PathBuf> {
@@ -51,7 +57,7 @@ pub fn register(registry_dir: &Path, endpoint_identity: [u8; 32]) -> Result<Acti
     FileExt::try_lock(&file)
         .map_err(|error| anyhow::anyhow!("endpoint is already registered: {error}"))?;
     directory.verify_locked_file(registry_dir, &name, &file)?;
-    Ok(ActiveEndpoint { _file: file })
+    Ok(ActiveEndpoint { file })
 }
 
 pub fn is_active(registry_dir: &Path, endpoint_identity: [u8; 32]) -> Result<bool> {

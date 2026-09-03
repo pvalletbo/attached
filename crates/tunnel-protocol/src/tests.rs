@@ -72,6 +72,140 @@ async fn remote_upgrade_frames_bind_session_capability_and_exact_version() {
 }
 
 #[tokio::test]
+async fn attached_update_frames_cover_restart_confirmation_and_terminal_statuses() {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let secret = CapabilitySecret([9; 32]);
+        let operation_id = UpdateOperationId::from_bytes([0x42; 16]);
+        let version = AttachedVersion::new(0, 4, 1);
+
+        let (mut client, mut server) = tokio::io::duplex(256);
+        let writing = write_attached_update_start_request(&mut client, "work", &secret);
+        let reading = read_attached_update_request(&mut server, &secret);
+        let ((), request) = tokio::try_join!(writing, reading).unwrap();
+        assert_eq!(
+            request,
+            AttachedUpdateRequest::Start {
+                session: "work".to_owned()
+            }
+        );
+
+        let (mut client, mut server) = tokio::io::duplex(256);
+        let writing = write_attached_update_confirm_request(
+            &mut client,
+            "work",
+            &secret,
+            operation_id,
+            version,
+        );
+        let reading = read_attached_update_request(&mut server, &secret);
+        let ((), request) = tokio::try_join!(writing, reading).unwrap();
+        assert_eq!(
+            request,
+            AttachedUpdateRequest::Confirm {
+                session: "work".to_owned(),
+                operation_id,
+                observed_version: version,
+            }
+        );
+
+        for response in [
+            AttachedUpdateResponse::Restarting {
+                operation_id,
+                version,
+                reconnect_timeout_secs: 30,
+            },
+            AttachedUpdateResponse::Committed(version),
+            AttachedUpdateResponse::Current(version),
+            AttachedUpdateResponse::Failed("candidate failed".to_owned()),
+            AttachedUpdateResponse::Busy,
+            AttachedUpdateResponse::Waiting,
+        ] {
+            let (mut server, mut client) = tokio::io::duplex(1024);
+            let writing = write_attached_update_response(&mut server, response);
+            let reading = read_attached_update_response(&mut client);
+            let ((), decoded) = tokio::try_join!(writing, reading).unwrap();
+            match decoded {
+                AttachedUpdateResponse::Restarting {
+                    operation_id: decoded_id,
+                    version: decoded_version,
+                    reconnect_timeout_secs,
+                } => {
+                    assert_eq!(decoded_id, operation_id);
+                    assert_eq!(decoded_version, version);
+                    assert_eq!(reconnect_timeout_secs, 30);
+                }
+                AttachedUpdateResponse::Committed(decoded_version)
+                | AttachedUpdateResponse::Current(decoded_version) => {
+                    assert_eq!(decoded_version, version)
+                }
+                AttachedUpdateResponse::Failed(message) => {
+                    assert_eq!(message, "candidate failed")
+                }
+                AttachedUpdateResponse::Busy | AttachedUpdateResponse::Waiting => {}
+            }
+        }
+    })
+    .await
+    .expect("Attached update frame scenario timed out");
+}
+
+#[tokio::test]
+async fn attached_update_requests_reject_wrong_capabilities_and_malformed_frames() {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let expected = CapabilitySecret([7; 32]);
+        let wrong = CapabilitySecret([8; 32]);
+        let mut valid = Vec::new();
+        valid.extend_from_slice(&ATTACHED_UPDATE_MAGIC);
+        valid.extend_from_slice(&[ATTACHED_UPDATE_PROTOCOL_VERSION, 0]);
+        valid.extend_from_slice(&4_u16.to_be_bytes());
+        valid.extend_from_slice(b"work");
+        valid.extend_from_slice(&wrong.0);
+
+        let mut wrong_reader = valid.as_slice();
+        assert!(
+            read_attached_update_request(&mut wrong_reader, &expected)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("denied")
+        );
+
+        for length in 0..valid.len() {
+            let mut truncated = &valid[..length];
+            assert!(
+                read_attached_update_request(&mut truncated, &wrong)
+                    .await
+                    .is_err(),
+                "accepted request truncated at byte {length}"
+            );
+        }
+
+        let mut unknown_operation = valid.clone();
+        unknown_operation[5] = 9;
+        let mut unknown_reader = unknown_operation.as_slice();
+        assert!(
+            read_attached_update_request(&mut unknown_reader, &wrong)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("unknown")
+        );
+
+        let oversized = "x".repeat(MAX_ATTACHED_UPDATE_MESSAGE_LEN + 1);
+        let (mut writer, _reader) = tokio::io::duplex(1024);
+        assert!(
+            write_attached_update_response(&mut writer, AttachedUpdateResponse::Failed(oversized))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("too long")
+        );
+    })
+    .await
+    .expect("Attached update rejection scenario timed out");
+}
+
+#[tokio::test]
 async fn upgrade_requests_reject_wrong_capability_and_bounded_malformed_frames() {
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         let expected = CapabilitySecret([7; 32]);
@@ -174,6 +308,9 @@ fn all_tunnel_protocol_constants_remain_unchanged() {
     assert_eq!(MAX_VERSION_WIRE_LEN, 16);
     assert_eq!(PROTOCOL_VERSION, 3);
     assert_eq!(TUNNEL_ALPN, b"herdr-tunnel/3");
+    assert_eq!(ATTACHED_UPDATE_PROTOCOL_VERSION, 1);
+    assert_eq!(ATTACHED_UPDATE_ALPN, b"attached-update/1");
+    assert_eq!(UPDATE_OPERATION_ID_BYTES, 16);
 }
 
 #[tokio::test]

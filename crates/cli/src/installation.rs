@@ -5,14 +5,17 @@ use std::{
     io::{self, BufRead, IsTerminal, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, ensure};
 
-use crate::{identity, local_encryption};
+use crate::{attached_version::AttachedVersion, identity, local_encryption};
 
 const ATTACHED_BINARY: &str = "attached";
 const INSTALLER_URL: &str = "https://install.attached.sh";
+const REMOTE_UPDATE_TIMEOUT: Duration = Duration::from_secs(120);
+const REMOTE_UPDATE_OUTPUT_LIMIT: u64 = 64 * 1024;
 
 pub fn update() -> Result<()> {
     let executable = current_attached_executable()?;
@@ -49,7 +52,7 @@ pub fn uninstall(assume_yes: bool) -> Result<()> {
     Ok(())
 }
 
-fn current_attached_executable() -> Result<PathBuf> {
+pub(crate) fn current_attached_executable() -> Result<PathBuf> {
     let executable =
         env::current_exe().context("could not locate the current Attached executable")?;
     validate_executable_path(&executable)?;
@@ -78,6 +81,143 @@ fn validate_executable_path(executable: &Path) -> Result<()> {
         executable.display()
     );
     Ok(())
+}
+
+pub(crate) struct PreparedRemoteUpdate {
+    executable: PathBuf,
+    rollback: Option<tempfile::NamedTempFile>,
+    candidate_version: AttachedVersion,
+}
+
+impl PreparedRemoteUpdate {
+    pub(crate) fn executable(&self) -> &Path {
+        &self.executable
+    }
+
+    pub(crate) const fn candidate_version(&self) -> AttachedVersion {
+        self.candidate_version
+    }
+
+    pub(crate) fn commit(mut self) -> Result<()> {
+        let rollback = self
+            .rollback
+            .take()
+            .context("update rollback is unavailable")?;
+        rollback
+            .close()
+            .context("could not remove the previous Attached binary after commit")?;
+        sync_parent(&self.executable)
+    }
+
+    pub(crate) fn rollback(mut self) -> Result<()> {
+        let rollback = self
+            .rollback
+            .take()
+            .context("update rollback is unavailable")?;
+        restore_backup(&self.executable, rollback)
+    }
+}
+
+impl Drop for PreparedRemoteUpdate {
+    fn drop(&mut self) {
+        if let Some(rollback) = self.rollback.take() {
+            let _ = restore_backup(&self.executable, rollback);
+        }
+    }
+}
+
+pub(crate) fn prepare_remote_update() -> Result<PreparedRemoteUpdate> {
+    prepare_remote_update_at(&current_attached_executable()?)
+}
+
+fn prepare_remote_update_at(executable: &Path) -> Result<PreparedRemoteUpdate> {
+    validate_executable_path(executable)?;
+    let install_dir = executable
+        .parent()
+        .context("the current Attached executable has no parent directory")?;
+    let rollback = tempfile::Builder::new()
+        .prefix(".attached-rollback-")
+        .tempfile_in(install_dir)
+        .with_context(|| {
+            format!(
+                "could not create an update rollback file in {}",
+                install_dir.display()
+            )
+        })?;
+    fs::copy(executable, rollback.path()).with_context(|| {
+        format!(
+            "could not retain the current Attached binary {}",
+            executable.display()
+        )
+    })?;
+    fs::set_permissions(rollback.path(), fs::metadata(executable)?.permissions())?;
+    rollback
+        .as_file()
+        .sync_all()
+        .context("could not sync the retained Attached binary")?;
+
+    let mut prepared = PreparedRemoteUpdate {
+        executable: executable.to_owned(),
+        rollback: Some(rollback),
+        candidate_version: crate::attached_version::current(),
+    };
+    let result = (|| {
+        let output = crate::bounded_process::run(
+            executable,
+            [OsStr::new("update")].as_slice(),
+            REMOTE_UPDATE_TIMEOUT,
+            REMOTE_UPDATE_OUTPUT_LIMIT,
+        )?;
+        ensure!(
+            output.status.success(),
+            "remote `attached update` exited with status {}: {}",
+            output.status,
+            crate::bounded_process::diagnostic(&output.stderr)
+        );
+        validate_executable_path(executable)
+            .context("the updater did not leave a valid Attached executable")?;
+        let candidate_version = crate::attached_version::query(executable)
+            .context("could not verify the updated Attached executable")?;
+        ensure!(
+            candidate_version >= crate::attached_version::current(),
+            "the Attached updater installed older version {candidate_version}"
+        );
+        prepared.candidate_version = candidate_version;
+        sync_parent(executable)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        return match prepared.rollback() {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(rollback.context(error)),
+        };
+    }
+    Ok(prepared)
+}
+
+fn restore_backup(executable: &Path, rollback: tempfile::NamedTempFile) -> Result<()> {
+    rollback
+        .as_file()
+        .sync_all()
+        .context("could not sync the retained Attached binary")?;
+    let rollback = rollback.into_temp_path();
+    fs::rename(&rollback, executable).with_context(|| {
+        format!(
+            "could not restore the previous Attached binary at {}",
+            executable.display()
+        )
+    })?;
+    sync_parent(executable)
+}
+
+fn sync_parent(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("Attached binary has no parent directory")?;
+    fs::File::open(parent)
+        .with_context(|| format!("could not open {} for synchronization", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("could not synchronize {}", parent.display()))
 }
 
 fn run_installer(
@@ -426,6 +566,72 @@ mod tests {
             .to_string();
         assert!(error.contains("installer exited with status"), "{error}");
         assert!(error.contains("17"), "{error}");
+    }
+
+    #[test]
+    fn prepared_remote_update_can_commit_or_restore_the_previous_binary() {
+        for commit in [false, true] {
+            let root = crate::test_support::canonical_tempdir();
+            let executable = root.path().join(ATTACHED_BINARY);
+            let candidate = root.path().join("candidate");
+            script(
+                &candidate,
+                "if [ \"${1-}\" = --version ]; then printf 'attached 9.9.9\\n'; exit 0; fi\nexit 9",
+            );
+            script(
+                &executable,
+                &format!(
+                    "if [ \"${{1-}}\" = update ]; then cp '{}' \"$0.next\"; chmod 700 \"$0.next\"; mv \"$0.next\" \"$0\"; exit 0; fi\nif [ \"${{1-}}\" = --version ]; then printf 'attached {}\\n'; exit 0; fi\nexit 9",
+                    candidate.display(),
+                    env!("CARGO_PKG_VERSION")
+                ),
+            );
+
+            let prepared = prepare_remote_update_at(&executable).unwrap();
+            assert_eq!(prepared.candidate_version(), AttachedVersion::new(9, 9, 9));
+            assert_eq!(
+                crate::attached_version::query(&executable).unwrap(),
+                AttachedVersion::new(9, 9, 9)
+            );
+            if commit {
+                prepared.commit().unwrap();
+                assert_eq!(
+                    crate::attached_version::query(&executable).unwrap(),
+                    AttachedVersion::new(9, 9, 9)
+                );
+            } else {
+                prepared.rollback().unwrap();
+                assert_eq!(
+                    crate::attached_version::query(&executable).unwrap(),
+                    crate::attached_version::current()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn failed_remote_update_restores_the_previous_binary() {
+        let root = crate::test_support::canonical_tempdir();
+        let executable = root.path().join(ATTACHED_BINARY);
+        let broken = root.path().join("broken");
+        script(&broken, "printf broken; exit 19");
+        script(
+            &executable,
+            &format!(
+                "if [ \"${{1-}}\" = update ]; then cp '{}' \"$0.next\"; chmod 700 \"$0.next\"; mv \"$0.next\" \"$0\"; exit 7; fi\nif [ \"${{1-}}\" = --version ]; then printf 'attached {}\\n'; exit 0; fi\nexit 9",
+                broken.display(),
+                env!("CARGO_PKG_VERSION")
+            ),
+        );
+
+        let error = prepare_remote_update_at(&executable)
+            .err()
+            .expect("failed updater was accepted");
+        assert!(error.to_string().contains("status"), "{error:#}");
+        assert_eq!(
+            crate::attached_version::query(&executable).unwrap(),
+            crate::attached_version::current()
+        );
     }
 
     #[test]

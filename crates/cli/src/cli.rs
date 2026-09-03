@@ -98,9 +98,20 @@ enum Command {
         state_dir: Option<PathBuf>,
     },
 
-    /// Update Attached to the latest release.
+    /// Update Attached to the latest release locally or on a synchronized host.
     #[command(visible_alias = "upgrade")]
-    Update,
+    Update {
+        /// Update the host serving `HOST/SESSION`; omit the target to choose with fzf.
+        #[arg(long, value_name = "HOST/SESSION", num_args = 0..=1)]
+        remote: Option<Option<String>>,
+
+        /// Override persistent state location (primarily for testing remote updates).
+        #[arg(long, hide = true)]
+        state_dir: Option<PathBuf>,
+    },
+
+    #[command(name = "__handoff-serve", hide = true)]
+    HandoffServe,
 
     /// Uninstall Attached and permanently delete all managed credentials and local state.
     Uninstall {
@@ -374,8 +385,22 @@ impl Cli {
                     }
                 }
             }
-            Command::Update => {
-                installation::update()?;
+            Command::Update { remote, state_dir } => {
+                if let Some(target) = remote {
+                    let state_dir = resolved_state_dir(state_dir)?;
+                    sync::attached_update::update(&state_dir, target.as_deref(), self.verbose)
+                        .await?;
+                } else {
+                    ensure!(
+                        state_dir.is_none(),
+                        "--state-dir can only be used with --remote"
+                    );
+                    installation::update()?;
+                }
+                Ok(0)
+            }
+            Command::HandoffServe => {
+                server::serve_candidate().await?;
                 Ok(0)
             }
             Command::Uninstall { yes } => {
@@ -461,6 +486,8 @@ mod tests {
             vec!["attached", "attach"],
             vec!["attached", "attach", "office/work"],
             vec!["attached", "update"],
+            vec!["attached", "update", "--remote"],
+            vec!["attached", "update", "--remote", "office/work"],
             vec!["attached", "upgrade"],
             vec!["attached", "uninstall"],
             vec!["attached", "uninstall", "--yes"],
@@ -661,6 +688,10 @@ mod tests {
             assert!(!help.contains(&format!("  {removed}  ")), "{help}");
         }
         assert!(!help.contains(account_clipboard::HELPER_COMMAND), "{help}");
+        assert!(
+            !help.contains(crate::serve_handoff::INTERNAL_COMMAND),
+            "{help}"
+        );
 
         let mut command = Cli::command();
         let export_help = command
