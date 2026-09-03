@@ -367,6 +367,12 @@ async fn run_supervisor(
         session::ensure_active(registry_dir.clone(), runtime.config.herdr_bin.clone())
             .await
             .context("could not ensure an active Herdr session before serving")?;
+        match herdr_version::query_running_sessions(&runtime.config.herdr_bin) {
+            Ok(running_version) => runtime.herdr_version = running_version,
+            Err(_) => warn!(
+                "could not verify running Herdr server versions; publishing the installed binary version"
+            ),
+        }
         let (version, published_versions) = watch::channel(runtime.herdr_version);
         let publication = Arc::new(Mutex::new(
             publisher::Publisher::load(&runtime.config.state_dir, endpoint_identity)
@@ -642,45 +648,79 @@ async fn resolve_session(herdr_bin: PathBuf, name: String) -> Result<Session> {
 
 fn perform_upgrade(
     herdr_bin: &std::path::Path,
+    session: &str,
     requested_version: HerdrVersion,
     version: &watch::Sender<HerdrVersion>,
     updater: Arc<Semaphore>,
 ) -> UpgradeResponse {
+    perform_upgrade_with(
+        herdr_bin,
+        session,
+        requested_version,
+        version,
+        updater,
+        herdr_version::update_session,
+    )
+}
+
+fn perform_upgrade_with<Update>(
+    herdr_bin: &std::path::Path,
+    session: &str,
+    requested_version: HerdrVersion,
+    version: &watch::Sender<HerdrVersion>,
+    updater: Arc<Semaphore>,
+    update: Update,
+) -> UpgradeResponse
+where
+    Update: FnOnce(&std::path::Path, &str, HerdrVersion) -> Result<HerdrVersion>,
+{
     let current = *version.borrow();
     if (
         requested_version.major(),
         requested_version.minor(),
         requested_version.patch(),
-    ) <= (current.major(), current.minor(), current.patch())
+    ) < (current.major(), current.minor(), current.patch())
     {
         return UpgradeResponse::Failed(
-            "remote Herdr is already at or newer than the requested version".to_owned(),
+            "remote Herdr is newer than the requested version".to_owned(),
+        );
+    }
+    if let Ok(installed) = herdr_version::query(herdr_bin)
+        && (installed.major(), installed.minor(), installed.patch())
+            > (
+                requested_version.major(),
+                requested_version.minor(),
+                requested_version.patch(),
+            )
+    {
+        if let Ok(running) = herdr_version::query_running_sessions(herdr_bin) {
+            version.send_replace(running);
+        }
+        return UpgradeResponse::Failed(
+            "remote Herdr is newer than the requested version".to_owned(),
         );
     }
     let Ok(_permit) = updater.try_acquire_owned() else {
         return UpgradeResponse::Busy;
     };
-    match herdr_version::update(herdr_bin) {
+    match update(herdr_bin, session, requested_version) {
         Ok(installed) => {
-            // The executable changed even when its channel did not produce the requested
-            // release, so refresh every consumer before deciding whether attach may proceed.
             version.send_replace(installed);
-            if installed == requested_version {
-                UpgradeResponse::Updated(installed)
-            } else {
-                UpgradeResponse::Failed(
-                    "remote Herdr update did not install the required version".to_owned(),
-                )
-            }
+            UpgradeResponse::Updated(installed)
         }
+        Err(error) if herdr_version::is_rolled_back(&error) => {
+            UpgradeResponse::Failed("remote Herdr update failed and was rolled back".to_owned())
+        }
+        Err(error) if herdr_version::is_package_managed(&error) => UpgradeResponse::Failed(
+            "remote Herdr is package-managed; update it on the serving host".to_owned(),
+        ),
         Err(_error) => {
-            // An updater can fail after replacing the executable. Refresh opportunistically;
-            // failure to query never permits attachment. Child output and the error chain stay
-            // process-local and are deliberately not logged or placed on the wire.
-            if let Ok(installed) = herdr_version::query(herdr_bin) {
-                version.send_replace(installed);
+            if let Ok(running) = herdr_version::query_running_sessions(herdr_bin) {
+                version.send_replace(running);
             }
-            UpgradeResponse::Failed("remote Herdr update failed".to_owned())
+            UpgradeResponse::Failed(
+                "remote Herdr update or live-handoff verification failed".to_owned(),
+            )
         }
     }
 }
@@ -698,16 +738,16 @@ where
     W: AsyncWrite + Unpin,
     Resolve: FnOnce(String) -> ResolveFuture,
     ResolveFuture: std::future::Future<Output = Result<()>>,
-    Update: FnOnce(HerdrVersion) -> UpgradeResponse,
+    Update: FnOnce(String, HerdrVersion) -> UpgradeResponse,
 {
     let request = timeout(framing_timeout, read_upgrade_request(receive, capability))
         .await
         .context("upgrade request frame timed out")??;
     // Authentication is complete before session resolution or update execution.
-    resolve(request.session).await?;
+    resolve(request.session.clone()).await?;
     timeout(
         framing_timeout,
-        write_upgrade_response(send, update(request.requested_version)),
+        write_upgrade_response(send, update(request.session, request.requested_version)),
     )
     .await
     .context("upgrade response frame timed out")?
@@ -733,9 +773,9 @@ async fn serve_upgrade_connection(
                 .await
                 .map(|_| ())
         },
-        |requested_version| {
+        |session, requested_version| {
             tokio::task::block_in_place(|| {
-                perform_upgrade(&herdr_bin, requested_version, &version, updater)
+                perform_upgrade(&herdr_bin, &session, requested_version, &version, updater)
             })
         },
     )
@@ -1119,8 +1159,10 @@ mod tests {
         authenticate_server, read_auth_response, read_upgrade_response, write_auth_request,
         write_upgrade_request,
     };
+    use iroh::{RelayMode, endpoint::BindOpts};
     use std::{
         fs,
+        net::Ipv4Addr,
         os::unix::fs::PermissionsExt,
         sync::atomic::{AtomicUsize, Ordering},
     };
@@ -1130,8 +1172,8 @@ mod tests {
         fs::write(
             &path,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = update ]; then printf updated > '{}/updated'; exit 0; fi\nif [ \"$1\" = --version ]; then printf 'herdr {}\\n'; exit 0; fi\nexit 9\n",
-                root.display(), version
+                "#!/bin/sh\nif [ \"$1\" = update ]; then printf updated > '{}/updated'; exit 0; fi\nif [ \"$1\" = --version ]; then printf 'herdr {}\\n'; exit 0; fi\nif [ \"$1\" = session ] && [ \"$2\" = list ]; then printf '{{\"sessions\":[{{\"name\":\"work\",\"running\":true}}]}}\\n'; exit 0; fi\nif [ \"$1\" = --session ] && [ \"$3\" = status ]; then printf '{{\"running\":true,\"version\":\"{}\"}}\\n'; exit 0; fi\nexit 9\n",
+                root.display(), version, version
             ),
         )
         .unwrap();
@@ -1175,12 +1217,19 @@ mod tests {
             let capability = CapabilitySecret::from_bytes([0x51; 32]);
             let wrong_capability = CapabilitySecret::from_bytes([0x52; 32]);
             let server = Endpoint::builder(presets::N0)
+                .clear_ip_transports()
+                .bind_addr_with_opts(
+                    (Ipv4Addr::LOCALHOST, 0),
+                    BindOpts::default().set_prefix_len(8),
+                )
+                .unwrap()
+                .relay_mode(RelayMode::Disabled)
+                .clear_address_lookup()
                 .alpns(vec![TUNNEL_ALPN.to_vec()])
                 .hooks(ConsumerIdentityAuthorization::new(authorized_identity))
                 .bind()
                 .await
                 .unwrap();
-            server.online().await;
             let server_addr = server.addr();
             let server_endpoint = server.clone();
             let server_capability = capability.clone();
@@ -1236,6 +1285,14 @@ mod tests {
 
             let unauthorized = Endpoint::builder(presets::N0)
                 .secret_key(unauthorized_key)
+                .clear_ip_transports()
+                .bind_addr_with_opts(
+                    (Ipv4Addr::LOCALHOST, 0),
+                    BindOpts::default().set_prefix_len(8),
+                )
+                .unwrap()
+                .relay_mode(RelayMode::Disabled)
+                .clear_address_lookup()
                 .bind()
                 .await
                 .unwrap();
@@ -1245,6 +1302,7 @@ mod tests {
             assert_eq!(capability_attempts.load(Ordering::SeqCst), 0);
             assert_eq!(session_resolutions.load(Ordering::SeqCst), 0);
             drop(unauthorized_connection);
+            unauthorized.close().await;
 
             async fn authenticate(
                 key: iroh::SecretKey,
@@ -1253,6 +1311,14 @@ mod tests {
             ) -> (Endpoint, anyhow::Result<()>) {
                 let endpoint = Endpoint::builder(presets::N0)
                     .secret_key(key)
+                    .clear_ip_transports()
+                    .bind_addr_with_opts(
+                        (Ipv4Addr::LOCALHOST, 0),
+                        BindOpts::default().set_prefix_len(8),
+                    )
+                    .unwrap()
+                    .relay_mode(RelayMode::Disabled)
+                    .clear_address_lookup()
                     .bind()
                     .await
                     .unwrap();
@@ -1274,6 +1340,7 @@ mod tests {
             assert_eq!(events.recv().await.unwrap(), "authorized");
             assert_eq!(capability_attempts.load(Ordering::SeqCst), 1);
             assert_eq!(session_resolutions.load(Ordering::SeqCst), 1);
+            authorized.close().await;
 
             let (wrong, result) =
                 authenticate(authorized_key, server_addr, &wrong_capability).await;
@@ -1281,10 +1348,10 @@ mod tests {
             assert_eq!(events.recv().await.unwrap(), "capability_rejected");
             assert_eq!(capability_attempts.load(Ordering::SeqCst), 2);
             assert_eq!(session_resolutions.load(Ordering::SeqCst), 1);
+            wrong.close().await;
 
             server_task.await.unwrap();
             server.close().await;
-            drop((unauthorized, authorized, wrong));
         })
         .await
         .expect("live Iroh identity authorization scenario timed out");
@@ -1331,6 +1398,7 @@ mod tests {
         assert_eq!(
             perform_upgrade(
                 &executable,
+                "work",
                 HerdrVersion::new(1, 2, 3),
                 &advertised,
                 Arc::new(Semaphore::new(1)),
@@ -1341,19 +1409,37 @@ mod tests {
         assert!(published.has_changed().unwrap());
         assert_eq!(*published.borrow_and_update(), HerdrVersion::new(1, 2, 3));
 
+        assert!(
+            !root.path().join("updated").exists(),
+            "a current binary and live session reran the updater"
+        );
+        assert_eq!(
+            perform_upgrade(
+                &executable,
+                "work",
+                HerdrVersion::new(1, 2, 3),
+                &advertised,
+                Arc::new(Semaphore::new(1)),
+            ),
+            UpgradeResponse::Updated(HerdrVersion::new(1, 2, 3))
+        );
+        assert!(
+            !root.path().join("updated").exists(),
+            "an already-current live session reran the updater"
+        );
+
         let mismatched = fake_herdr(root.path(), "1.2.4");
         let (advertised, mut published) = watch::channel(HerdrVersion::new(1, 2, 2));
         let response = perform_upgrade(
             &mismatched,
+            "work",
             HerdrVersion::new(1, 2, 3),
             &advertised,
             Arc::new(Semaphore::new(1)),
         );
         assert_eq!(
             response,
-            UpgradeResponse::Failed(
-                "remote Herdr update did not install the required version".to_owned()
-            )
+            UpgradeResponse::Failed("remote Herdr is newer than the requested version".to_owned())
         );
         assert_eq!(*advertised.borrow(), HerdrVersion::new(1, 2, 4));
         assert!(published.has_changed().unwrap());
@@ -1361,7 +1447,7 @@ mod tests {
     }
 
     #[test]
-    fn equal_or_older_requested_version_never_executes_remote_update() {
+    fn newer_requested_or_running_versions_never_execute_remote_update() {
         for requested in [HerdrVersion::new(1, 2, 3), HerdrVersion::new(1, 2, 2)] {
             let root = tempfile::tempdir().unwrap();
             let executable = fake_herdr(root.path(), "9.9.9");
@@ -1370,19 +1456,25 @@ mod tests {
             assert_eq!(
                 perform_upgrade(
                     &executable,
+                    "work",
                     requested,
                     &advertised,
                     Arc::new(Semaphore::new(1)),
                 ),
                 UpgradeResponse::Failed(
-                    "remote Herdr is already at or newer than the requested version".to_owned()
+                    "remote Herdr is newer than the requested version".to_owned()
                 )
             );
             assert!(
                 !root.path().join("updated").exists(),
                 "server executed the updater for requested {requested}"
             );
-            assert_eq!(*advertised.borrow(), HerdrVersion::new(1, 2, 3));
+            let expected_advertised = if requested == HerdrVersion::new(1, 2, 3) {
+                HerdrVersion::new(9, 9, 9)
+            } else {
+                HerdrVersion::new(1, 2, 3)
+            };
+            assert_eq!(*advertised.borrow(), expected_advertised);
         }
     }
 
@@ -1396,6 +1488,7 @@ mod tests {
         assert_eq!(
             perform_upgrade(
                 &executable,
+                "work",
                 HerdrVersion::new(1, 2, 3),
                 &advertised,
                 updater,
@@ -1413,22 +1506,26 @@ mod tests {
         fs::write(
             &executable,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = update ]; then printf '%s' '{secret}' >&2; exit 7; fi\nprintf 'herdr 1.2.2\\n'\n"
+                "#!/bin/sh\nif [ \"$1\" = update ]; then printf '%s' '{secret}' >&2; exit 7; fi\nif [ \"$1\" = --version ]; then printf 'herdr 1.2.2\\n'; exit 0; fi\nif [ \"$1\" = session ] && [ \"$2\" = list ]; then printf '{{\"sessions\":[{{\"name\":\"work\",\"running\":true}}]}}\\n'; exit 0; fi\nif [ \"$1\" = --session ] && [ \"$3\" = status ]; then printf '{{\"running\":true,\"version\":\"1.2.2\"}}\\n'; exit 0; fi\nexit 9\n"
             ),
         )
         .unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         let (advertised, _) = watch::channel(HerdrVersion::new(1, 2, 2));
 
-        let response = perform_upgrade(
+        let response = perform_upgrade_with(
             &executable,
+            "work",
             HerdrVersion::new(1, 2, 3),
             &advertised,
             Arc::new(Semaphore::new(1)),
+            |executable, session, requested| {
+                herdr_version::update_session_with_config(executable, session, requested, None)
+            },
         );
         assert_eq!(
             response,
-            UpgradeResponse::Failed("remote Herdr update failed".to_owned())
+            UpgradeResponse::Failed("remote Herdr update failed and was rolled back".to_owned())
         );
         let wire = format!("{response:?}");
         assert!(!wire.contains("wire-secret"), "{wire}");
@@ -1612,7 +1709,7 @@ mod tests {
                     calls.fetch_add(1, Ordering::SeqCst);
                     async { Ok(()) }
                 },
-                |_| {
+                |_, _| {
                     server_calls.fetch_add(1, Ordering::SeqCst);
                     UpgradeResponse::Busy
                 },
@@ -1648,7 +1745,8 @@ mod tests {
                     anyhow::ensure!(session == "work", "wrong session");
                     Ok(())
                 },
-                |version| {
+                |session, version| {
+                    assert_eq!(session, "work");
                     assert_eq!(version, requested);
                     UpgradeResponse::Updated(version)
                 },

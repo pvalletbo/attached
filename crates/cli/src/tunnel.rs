@@ -38,7 +38,9 @@ use crate::{
 
 const AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(5);
 const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
-const UPGRADE_TIMEOUT: Duration = Duration::from_secs(130);
+// One failed Herdr handoff can consume its 240-second deadline and then require a verified
+// rollback, so the requester must outlive both phases.
+const UPGRADE_TIMEOUT: Duration = Duration::from_secs(900);
 const ATTACHED_UPDATE_START_TIMEOUT: Duration = Duration::from_secs(150);
 const ATTACHED_UPDATE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ATTACHED_RECONNECT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -86,6 +88,25 @@ pub async fn request_upgrade(
     let endpoint = bind_client_endpoint(local_identity)
         .await
         .context("could not initialize the local upgrade endpoint")?;
+    let result = request_upgrade_on_endpoint(
+        &endpoint,
+        endpoint_addr,
+        session,
+        capability,
+        requested_version,
+    )
+    .await;
+    endpoint.close().await;
+    result
+}
+
+async fn request_upgrade_on_endpoint(
+    endpoint: &Endpoint,
+    endpoint_addr: iroh::EndpointAddr,
+    session: &str,
+    capability: &CapabilitySecret,
+    requested_version: HerdrVersion,
+) -> Result<HerdrVersion> {
     let result = timeout(UPGRADE_TIMEOUT, async {
         let connection = endpoint.connect(endpoint_addr, UPGRADE_ALPN).await?;
         let (mut send, mut receive) = connection.open_bi().await?;
@@ -95,7 +116,6 @@ pub async fn request_upgrade(
     .await
     .context("remote Herdr upgrade request timed out")
     .and_then(|result| result);
-    endpoint.close().await;
     finish_upgrade_response(finish_upgrade_result(result)?)
 }
 
