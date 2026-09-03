@@ -119,19 +119,31 @@ async fn request_upgrade_on_endpoint(
     finish_upgrade_response(finish_upgrade_result(result)?)
 }
 
-pub async fn request_attached_update(
-    endpoint_addr: iroh::EndpointAddr,
-    local_identity: &iroh::SecretKey,
-    session: &str,
-    capability: &CapabilitySecret,
-) -> Result<AttachedVersion> {
-    let endpoint = bind_client_endpoint(local_identity)
-        .await
-        .context("could not initialize the local Attached update endpoint")?;
-    let result =
-        request_attached_update_on_endpoint(&endpoint, endpoint_addr, session, capability).await;
-    endpoint.close().await;
-    result
+pub(crate) struct AttachedUpdateClient {
+    endpoint: Endpoint,
+}
+
+impl AttachedUpdateClient {
+    pub(crate) async fn bind(local_identity: &iroh::SecretKey) -> Result<Self> {
+        let endpoint = bind_client_endpoint(local_identity)
+            .await
+            .context("could not initialize the local Attached update endpoint")?;
+        Ok(Self { endpoint })
+    }
+
+    pub(crate) async fn request(
+        &self,
+        endpoint_addr: iroh::EndpointAddr,
+        session: &str,
+        capability: &CapabilitySecret,
+    ) -> Result<AttachedVersion> {
+        request_attached_update_on_endpoint(&self.endpoint, endpoint_addr, session, capability)
+            .await
+    }
+
+    pub(crate) async fn close(self) {
+        self.endpoint.close().await;
+    }
 }
 
 async fn request_attached_update_on_endpoint(

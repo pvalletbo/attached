@@ -107,6 +107,10 @@ enum Command {
         #[arg(long, value_name = "HOST/SESSION", num_args = 0..=1)]
         remote: Option<Option<String>>,
 
+        /// Update every synchronized remote host, up to four hosts concurrently.
+        #[arg(long, requires = "remote")]
+        all: bool,
+
         /// Override persistent state location (primarily for testing remote updates).
         #[arg(long, hide = true)]
         state_dir: Option<PathBuf>,
@@ -387,11 +391,20 @@ impl Cli {
                     }
                 }
             }
-            Command::Update { remote, state_dir } => {
+            Command::Update {
+                remote,
+                all,
+                state_dir,
+            } => {
                 if let Some(target) = remote {
+                    validate_remote_update_selection(target.as_deref(), all)?;
                     let state_dir = resolved_state_dir(state_dir)?;
-                    sync::attached_update::update(&state_dir, target.as_deref(), self.verbose)
-                        .await?;
+                    if all {
+                        sync::attached_update::update_all(&state_dir, self.verbose).await?;
+                    } else {
+                        sync::attached_update::update(&state_dir, target.as_deref(), self.verbose)
+                            .await?;
+                    }
                 } else {
                     ensure!(
                         state_dir.is_none(),
@@ -420,6 +433,14 @@ fn refresh_warnings_to_display(
     warnings
         .iter()
         .filter(move |warning| verbosity > 0 || !warning.is_verbose_only())
+}
+
+fn validate_remote_update_selection(target: Option<&str>, all: bool) -> Result<()> {
+    ensure!(
+        !all || target.is_none(),
+        "--all cannot be combined with a remote HOST/SESSION"
+    );
+    Ok(())
 }
 
 fn resolved_state_dir(state_dir: Option<PathBuf>) -> Result<PathBuf> {
@@ -490,6 +511,7 @@ mod tests {
             vec!["attached", "update"],
             vec!["attached", "update", "--remote"],
             vec!["attached", "update", "--remote", "office/work"],
+            vec!["attached", "update", "--remote", "--all"],
             vec!["attached", "upgrade"],
             vec!["attached", "uninstall"],
             vec!["attached", "uninstall", "--yes"],
@@ -500,6 +522,28 @@ mod tests {
         for removed in ["connect", "remote", "session", "admin", "sync"] {
             assert!(Cli::try_parse_from(["attached", removed]).is_err());
         }
+    }
+
+    #[test]
+    fn remote_update_all_requires_remote_mode_and_rejects_a_target() {
+        assert!(Cli::try_parse_from(["attached", "update", "--all"]).is_err());
+
+        let cli = Cli::try_parse_from(["attached", "update", "--remote", "--all"]).unwrap();
+        let Command::Update { remote, all, .. } = cli.command else {
+            unreachable!();
+        };
+        assert_eq!(remote, Some(None));
+        assert!(all);
+
+        let cli = Cli::try_parse_from(["attached", "update", "--remote", "office/work", "--all"])
+            .unwrap();
+        let Command::Update { remote, all, .. } = cli.command else {
+            unreachable!();
+        };
+        assert_eq!(remote, Some(Some("office/work".to_owned())));
+        assert!(all);
+        assert!(validate_remote_update_selection(None, true).is_ok());
+        assert!(validate_remote_update_selection(Some("office/work"), true).is_err());
     }
 
     #[test]
