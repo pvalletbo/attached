@@ -31,8 +31,8 @@ pub fn update() -> Result<()> {
     )
 }
 
-pub fn uninstall(assume_yes: bool) -> Result<()> {
-    let plan = UninstallPlan::discover()?;
+pub fn uninstall(assume_yes: bool, configured_directory: &Path) -> Result<()> {
+    let plan = UninstallPlan::discover(configured_directory)?;
 
     if !assume_yes {
         ensure!(
@@ -277,7 +277,7 @@ struct UninstallPlan {
 }
 
 impl UninstallPlan {
-    fn discover() -> Result<Self> {
+    fn discover(configured_directory: &Path) -> Result<Self> {
         let executable = current_attached_executable()?;
         let home = env::var_os("HOME").context("HOME is not set")?;
         let home = PathBuf::from(home);
@@ -286,7 +286,11 @@ impl UninstallPlan {
 
         Ok(Self {
             executable,
-            data_directories: attached_data_directories(&home, env::var_os("XDG_CONFIG_HOME"))?,
+            data_directories: attached_data_directories(
+                &home,
+                env::var_os("XDG_CONFIG_HOME"),
+                Some(configured_directory),
+            )?,
             installer_files: vec![home.join(".config/fish/conf.d/attached.env.fish")],
         })
     }
@@ -349,6 +353,7 @@ impl UninstallPlan {
 fn attached_data_directories(
     home: &Path,
     xdg_config_home: Option<std::ffi::OsString>,
+    configured_directory: Option<&Path>,
 ) -> Result<Vec<PathBuf>> {
     let state_directory = identity::state_dir_for_home(home)?;
     ensure!(
@@ -366,6 +371,16 @@ fn attached_data_directories(
         let installer_directory = xdg_config_home.join(ATTACHED_BINARY);
         if !directories.contains(&installer_directory) {
             directories.push(installer_directory);
+        }
+    }
+
+    if let Some(configured_directory) = configured_directory {
+        ensure!(
+            configured_directory.is_absolute(),
+            "the configured Attached directory must be an absolute path"
+        );
+        if !directories.iter().any(|path| path == configured_directory) {
+            directories.push(configured_directory.to_owned());
         }
     }
 
@@ -654,6 +669,7 @@ mod tests {
             data_directories: attached_data_directories(
                 &home,
                 Some(root.path().join("xdg").into_os_string()),
+                None,
             )
             .unwrap(),
             installer_files: vec![fish_configuration.clone()],
@@ -778,13 +794,32 @@ mod tests {
     }
 
     #[test]
+    fn uninstall_includes_the_configured_directory_without_duplicates() {
+        let root = crate::test_support::canonical_tempdir();
+        let home = root.path().join("home");
+        let configured = root.path().join("configured");
+
+        let directories = attached_data_directories(&home, None, Some(&configured)).unwrap();
+        assert_eq!(
+            directories,
+            vec![home.join(".config/attached"), configured.clone()]
+        );
+
+        let default = home.join(".config/attached");
+        assert_eq!(
+            attached_data_directories(&home, None, Some(&default)).unwrap(),
+            vec![default]
+        );
+    }
+
+    #[test]
     fn lifecycle_commands_reject_renamed_executables_and_relative_config_roots() {
         let root = crate::test_support::canonical_tempdir();
         let renamed = root.path().join("renamed");
         fs::write(&renamed, b"binary").unwrap();
         assert!(validate_executable_path(&renamed).is_err());
 
-        let error = attached_data_directories(root.path(), Some("relative".into()))
+        let error = attached_data_directories(root.path(), Some("relative".into()), None)
             .unwrap_err()
             .to_string();
         assert!(error.contains("XDG_CONFIG_HOME"), "{error}");
