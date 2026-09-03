@@ -3,7 +3,7 @@ use std::{
     io::Read,
     os::unix::process::CommandExt,
     path::Path,
-    process::{Command, ExitStatus, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -16,6 +16,12 @@ pub struct BoundedOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
 }
+
+// Linux can briefly reject execution with ETXTBSY immediately after an updater atomically
+// replaces a binary. Keep the retry window short and bounded so a genuinely writable executable
+// still fails instead of consuming the command's much longer runtime limit.
+const EXECUTABLE_BUSY_RETRY_LIMIT: usize = 100;
+const EXECUTABLE_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 pub fn run(
     executable: &Path,
@@ -38,8 +44,7 @@ pub fn run_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
-    let mut child = command
-        .spawn()
+    let mut child = spawn_with_executable_busy_retry(&mut command)
         .with_context(|| format!("failed to run {command_display}"))?;
     let stdout = child
         .stdout
@@ -90,6 +95,34 @@ pub fn run_command(
         stdout,
         stderr,
     })
+}
+
+fn spawn_with_executable_busy_retry(command: &mut Command) -> std::io::Result<Child> {
+    retry_executable_busy(
+        || command.spawn(),
+        EXECUTABLE_BUSY_RETRY_LIMIT,
+        EXECUTABLE_BUSY_RETRY_DELAY,
+    )
+}
+
+fn retry_executable_busy<T>(
+    mut operation: impl FnMut() -> std::io::Result<T>,
+    retry_limit: usize,
+    retry_delay: Duration,
+) -> std::io::Result<T> {
+    let mut retries = 0;
+    loop {
+        match operation() {
+            Err(error)
+                if error.raw_os_error() == Some(rustix::io::Errno::TXTBSY.raw_os_error())
+                    && retries < retry_limit =>
+            {
+                retries += 1;
+                thread::sleep(retry_delay);
+            }
+            result => return result,
+        }
+    }
 }
 
 fn bounded_reader<R>(reader: R, capture_limit: u64) -> thread::JoinHandle<std::io::Result<Vec<u8>>>
@@ -147,4 +180,58 @@ pub fn diagnostic(bytes: &[u8]) -> String {
         text.push('…');
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn executable_busy_retries_are_selective_and_bounded() {
+        let busy = rustix::io::Errno::TXTBSY.raw_os_error();
+        let mut attempts = 0;
+        let value = retry_executable_busy(
+            || {
+                attempts += 1;
+                if attempts <= 2 {
+                    Err(std::io::Error::from_raw_os_error(busy))
+                } else {
+                    Ok(17)
+                }
+            },
+            2,
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(value, 17);
+        assert_eq!(attempts, 3);
+
+        attempts = 0;
+        let error = retry_executable_busy::<()>(
+            || {
+                attempts += 1;
+                Err(std::io::Error::from_raw_os_error(busy))
+            },
+            2,
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(busy));
+        assert_eq!(attempts, 3);
+
+        attempts = 0;
+        let error = retry_executable_busy::<()>(
+            || {
+                attempts += 1;
+                Err(std::io::Error::from_raw_os_error(
+                    rustix::io::Errno::ACCESS.raw_os_error(),
+                ))
+            },
+            2,
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(attempts, 1);
+    }
 }
