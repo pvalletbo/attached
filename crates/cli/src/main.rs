@@ -6,6 +6,7 @@ mod account_clipboard;
 mod attached_version;
 mod bounded_process;
 mod cli;
+mod config;
 mod diagnostics;
 mod download_account;
 mod endpoint_registry;

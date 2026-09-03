@@ -9,8 +9,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use zeroize::Zeroizing;
 
 use crate::{
-    account_clipboard, download_account, herdr_version, identity, installation, local_encryption,
-    publish_account, secure_state, server, session,
+    account_clipboard,
+    config::{self, PasswordSource},
+    download_account, herdr_version, installation, local_encryption, publish_account, secure_state,
+    server, session,
     session_picker::{self, SessionSelection},
     sync,
 };
@@ -18,7 +20,8 @@ use crate::{
 #[derive(Parser)]
 #[command(
     version,
-    about = "Discover and attach to synchronized Herdr sessions over Iroh"
+    about = "Discover and attach to synchronized Herdr sessions over Iroh",
+    after_long_help = "CONFIGURATION:\n    Attached reads $HOME/.config/attached/config.toml when it exists. Supported TOML settings:\n\n        password_source = \"password\" # or \"1password\"\n        config_directory = \"/absolute/path\" # defaults to $HOME/.config/attached\n\n    --use-1password overrides password_source for the current invocation."
 )]
 pub struct Cli {
     /// Increase diagnostic verbosity (`-v` for lifecycle, `-vv` for debug details).
@@ -207,12 +210,16 @@ impl Cli {
 
     #[tracing::instrument(name = "cli_run", level = "debug", skip_all)]
     pub async fn run(self) -> Result<i32> {
-        local_encryption::configure_use_one_password(self.use_1password);
+        let configuration =
+            config::Config::load().context("could not load Attached configuration")?;
+        local_encryption::configure_use_one_password(
+            self.use_1password || configuration.password_source() == PasswordSource::OnePassword,
+        );
         match self.command {
             Command::Account { command } => {
                 match command {
                     AccountCommand::Create { service, state_dir } => {
-                        let state_dir = resolved_state_dir(state_dir)?;
+                        let state_dir = resolved_state_dir(state_dir, &configuration)?;
                         sync::account::create(&state_dir, &service).await?;
                         eprintln!(
                             "Account created and saved in encrypted local state; no portable account bundle was written."
@@ -229,7 +236,7 @@ impl Cli {
                         bundle_stdin,
                         state_dir,
                     } => {
-                        let state_dir = resolved_state_dir(state_dir)?;
+                        let state_dir = resolved_state_dir(state_dir, &configuration)?;
                         download_account::install(
                             &state_dir,
                             bundle_file.as_deref(),
@@ -241,7 +248,7 @@ impl Cli {
                         output,
                         state_dir,
                     } => {
-                        let state_dir = resolved_state_dir(state_dir)?;
+                        let state_dir = resolved_state_dir(state_dir, &configuration)?;
                         let scope = ApiKeyScope::from(key_type);
                         let bundle = Zeroizing::new(sync::account::export(&state_dir, scope)?);
                         if let Some(output) = output {
@@ -273,7 +280,7 @@ impl Cli {
                 bundle_file,
                 state_dir,
             } => {
-                let state_dir = resolved_state_dir(state_dir)?;
+                let state_dir = resolved_state_dir(state_dir, &configuration)?;
                 publish_account::ensure_configured(&state_dir, bundle_file.as_deref())?;
                 server::serve(state_dir, herdr_bin, host_label).await?;
                 Ok(0)
@@ -283,7 +290,7 @@ impl Cli {
                     herdr_bin,
                     state_dir,
                 } => {
-                    let state_dir = resolved_state_dir(state_dir)?;
+                    let state_dir = resolved_state_dir(state_dir, &configuration)?;
                     sync::state::load_account(&state_dir, ApiKeyScope::Download)
                         .context("`sessions list` requires a download account bundle")?;
                     let local_version = herdr_version::query(&herdr_bin).context(
@@ -309,7 +316,7 @@ impl Cli {
                 upgrade_remote,
                 state_dir,
             } => {
-                let state_dir = resolved_state_dir(state_dir)?;
+                let state_dir = resolved_state_dir(state_dir, &configuration)?;
                 let local_sessions = if target.is_none() {
                     match session::discover_active(herdr_bin.clone()).await {
                         Ok(sessions) => sessions,
@@ -389,7 +396,7 @@ impl Cli {
             }
             Command::Update { remote, state_dir } => {
                 if let Some(target) = remote {
-                    let state_dir = resolved_state_dir(state_dir)?;
+                    let state_dir = resolved_state_dir(state_dir, &configuration)?;
                     sync::attached_update::update(&state_dir, target.as_deref(), self.verbose)
                         .await?;
                 } else {
@@ -406,7 +413,7 @@ impl Cli {
                 Ok(0)
             }
             Command::Uninstall { yes } => {
-                installation::uninstall(yes)?;
+                installation::uninstall(yes, configuration.config_directory())?;
                 Ok(0)
             }
         }
@@ -422,8 +429,11 @@ fn refresh_warnings_to_display(
         .filter(move |warning| verbosity > 0 || !warning.is_verbose_only())
 }
 
-fn resolved_state_dir(state_dir: Option<PathBuf>) -> Result<PathBuf> {
-    let path = state_dir.map_or_else(identity::default_state_dir, Ok)?;
+fn resolved_state_dir(
+    state_dir: Option<PathBuf>,
+    configuration: &config::Config,
+) -> Result<PathBuf> {
+    let path = state_dir.unwrap_or_else(|| configuration.config_directory().to_owned());
     secure_state::prepare_private_dir(&path)?;
     Ok(path)
 }
@@ -756,6 +766,8 @@ mod tests {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("--use-1password"), "{help}");
         assert!(help.contains("generate and store"), "{help}");
+        assert!(help.contains("password_source = \"password\""), "{help}");
+        assert!(help.contains("config_directory"), "{help}");
     }
 
     #[test]
