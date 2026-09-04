@@ -7,6 +7,7 @@ use std::{
 use anyhow::{Context as _, Result, ensure};
 use attached_session_sync_protocol::{
     account::{ApiKeyScope, RecordId},
+    api::LiveRecordIndexEntry,
     canonical::HerdrVersion as SessionAccessHerdrVersion,
     crypto::{
         Envelope as CryptoEnvelope, VerificationContext,
@@ -14,12 +15,15 @@ use attached_session_sync_protocol::{
     },
 };
 use attached_tunnel_protocol::HerdrVersion;
+use futures_util::{StreamExt as _, TryStreamExt as _, stream};
 
 use super::{
-    http::SyncHttpClient,
+    http::{FetchedRecord, SyncHttpClient},
     state,
     state_catalog::{self, CatalogRecord, SyncedSession},
 };
+
+const RECORD_FETCH_CONCURRENCY: usize = 8;
 
 #[derive(Debug)]
 pub struct RefreshResult {
@@ -134,6 +138,7 @@ async fn refresh_sessions_with_registry_at(
         .map(|record| (record.record_id, record))
         .collect::<BTreeMap<_, _>>();
     let mut accepted = Vec::with_capacity(index.records.len());
+    let mut changed = Vec::new();
     for indexed in index.records {
         let previous = existing.remove(&indexed.record_id);
         if let Some(previous) = previous
@@ -155,17 +160,16 @@ async fn refresh_sessions_with_registry_at(
             accepted.push(previous);
             continue;
         }
+        changed.push(indexed);
+    }
 
-        let fetched = client
-            .get_record(&account, indexed.record_id)
-            .await
-            .with_context(|| format!("could not fetch synchronized record {}", indexed.record_id))?
-            .with_context(|| {
-                format!(
-                    "synchronized record {} changed while refreshing",
-                    indexed.record_id
-                )
-            })?;
+    for (indexed, fetched) in fetch_changed_records(&client, &account, changed).await? {
+        let fetched = fetched.with_context(|| {
+            format!(
+                "synchronized record {} changed while refreshing",
+                indexed.record_id
+            )
+        })?;
         ensure!(
             fetched.revision == indexed.revision,
             "synchronized record {} changed while refreshing",
@@ -225,6 +229,26 @@ async fn refresh_sessions_with_registry_at(
     Ok(finish_refresh(listing, warnings))
 }
 
+async fn fetch_changed_records(
+    client: &SyncHttpClient,
+    account: &state::AccountCredentials,
+    records: Vec<LiveRecordIndexEntry>,
+) -> Result<Vec<(LiveRecordIndexEntry, Option<FetchedRecord>)>> {
+    stream::iter(records)
+        .map(|indexed| async move {
+            let fetched = client
+                .get_record(account, indexed.record_id)
+                .await
+                .with_context(|| {
+                    format!("could not fetch synchronized record {}", indexed.record_id)
+                })?;
+            Ok((indexed, fetched))
+        })
+        .buffered(RECORD_FETCH_CONCURRENCY)
+        .try_collect()
+        .await
+}
+
 fn finish_refresh(
     listing: state_catalog::SessionListing,
     mut warnings: Vec<RefreshWarning>,
@@ -282,6 +306,28 @@ mod tests {
         0x02, 0xb6,
     ];
 
+    async fn read_request(stream: &mut tokio::net::TcpStream) -> anyhow::Result<Vec<u8>> {
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0_u8; 1024];
+            let read = stream.read(&mut chunk).await?;
+            anyhow::ensure!(read != 0, "HTTP request ended before its headers");
+            request.extend_from_slice(&chunk[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                return Ok(request);
+            }
+            anyhow::ensure!(request.len() <= 8192, "HTTP request headers too large");
+        }
+    }
+
+    async fn respond_not_found(mut stream: tokio::net::TcpStream) -> anyhow::Result<()> {
+        stream
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await?;
+        stream.shutdown().await?;
+        Ok(())
+    }
+
     async fn serve_catalog(
         listener: tokio::net::TcpListener,
         index_path: String,
@@ -291,17 +337,7 @@ mod tests {
     ) -> anyhow::Result<()> {
         for _ in 0..request_count {
             let (mut stream, _) = listener.accept().await?;
-            let mut request = Vec::new();
-            loop {
-                let mut chunk = [0_u8; 1024];
-                let read = stream.read(&mut chunk).await?;
-                anyhow::ensure!(read != 0, "HTTP request ended before its headers");
-                request.extend_from_slice(&chunk[..read]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
-                anyhow::ensure!(request.len() <= 8192, "HTTP request headers too large");
-            }
+            let request = read_request(&mut stream).await?;
             let request = std::str::from_utf8(&request)?;
             let path = request
                 .lines()
@@ -328,6 +364,54 @@ mod tests {
             stream.shutdown().await?;
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn changed_record_fetches_are_concurrent_and_bounded() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let root = crate::test_support::canonical_tempdir();
+            let state_dir = root.path().join("state");
+            state::test_support::create_account(&state_dir, &origin).unwrap();
+            let account = state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
+            let records = (0..=RECORD_FETCH_CONCURRENCY)
+                .map(|index| LiveRecordIndexEntry {
+                    record_id: RecordId::from_bytes([index as u8 + 1; 16]),
+                    revision: 1,
+                })
+                .collect::<Vec<_>>();
+
+            let server = tokio::spawn(async move {
+                let mut pending = Vec::new();
+                for _ in 0..RECORD_FETCH_CONCURRENCY {
+                    let (mut stream, _) = listener.accept().await?;
+                    let _ = read_request(&mut stream).await?;
+                    pending.push(stream);
+                }
+                anyhow::ensure!(
+                    tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                        .await
+                        .is_err(),
+                    "refresh exceeded its record-fetch concurrency bound"
+                );
+                for stream in pending {
+                    respond_not_found(stream).await?;
+                }
+                let (mut final_stream, _) = listener.accept().await?;
+                let _ = read_request(&mut final_stream).await?;
+                respond_not_found(final_stream).await
+            });
+
+            let fetched = fetch_changed_records(&SyncHttpClient::new().unwrap(), &account, records)
+                .await
+                .unwrap();
+            assert_eq!(fetched.len(), RECORD_FETCH_CONCURRENCY + 1);
+            assert!(fetched.iter().all(|(_, record)| record.is_none()));
+            server.await.unwrap().unwrap();
+        })
+        .await
+        .expect("concurrent record-fetch scenario timed out");
     }
 
     #[tokio::test]
