@@ -7,6 +7,7 @@ use std::{
 use anyhow::{Context as _, Result, ensure};
 use attached_session_sync_protocol::{
     account::{ApiKeyScope, RecordId},
+    api::LiveRecordIndexEntry,
     canonical::HerdrVersion as SessionAccessHerdrVersion,
     crypto::{
         Envelope as CryptoEnvelope, VerificationContext,
@@ -16,7 +17,7 @@ use attached_session_sync_protocol::{
 use attached_tunnel_protocol::HerdrVersion;
 
 use super::{
-    http::SyncHttpClient,
+    http::{FetchedRecord, SyncHttpClient},
     state,
     state_catalog::{self, CatalogRecord, SyncedSession},
 };
@@ -31,6 +32,10 @@ pub struct RefreshResult {
 pub enum RefreshWarning {
     CatalogRebuilt(anyhow::Error),
     RecordDiscarded {
+        record_id: RecordId,
+        error: anyhow::Error,
+    },
+    RecordUnavailable {
         record_id: RecordId,
         error: anyhow::Error,
     },
@@ -53,6 +58,10 @@ impl fmt::Display for RefreshWarning {
             Self::RecordDiscarded { record_id, error } => write!(
                 formatter,
                 "discarded synchronized record {record_id} from the local catalog: {error}"
+            ),
+            Self::RecordUnavailable { record_id, error } => write!(
+                formatter,
+                "synchronized record {record_id} is temporarily unavailable: {error:#}; retry discovery"
             ),
             Self::EndpointRegistryUnavailable => formatter.write_str(
                 "could not inspect the local endpoint registry; remote sessions were retained",
@@ -156,21 +165,23 @@ async fn refresh_sessions_with_registry_at(
             continue;
         }
 
-        let fetched = client
-            .get_record(&account, indexed.record_id)
-            .await
-            .with_context(|| format!("could not fetch synchronized record {}", indexed.record_id))?
-            .with_context(|| {
-                format!(
-                    "synchronized record {} changed while refreshing",
-                    indexed.record_id
-                )
-            })?;
-        ensure!(
-            fetched.revision == indexed.revision,
-            "synchronized record {} changed while refreshing",
-            indexed.record_id
-        );
+        let fetched = match fetch_consistent_record(&client, &account, indexed).await {
+            Ok(Some(fetched)) => fetched,
+            result => {
+                let error = match result {
+                    Ok(None) => anyhow::anyhow!("record was removed during refresh"),
+                    Err(error) => error,
+                    Ok(Some(_)) => unreachable!(),
+                };
+                tracing::debug!(record_id = %indexed.record_id, outcome = "unavailable",
+                    "skipped unavailable synchronized record during refresh");
+                warnings.push(RefreshWarning::RecordUnavailable {
+                    record_id: indexed.record_id,
+                    error,
+                });
+                continue;
+            }
+        };
         let envelope = CryptoEnvelope::new(fetched.envelope.nonce, fetched.envelope.ciphertext)
             .with_context(|| {
                 format!(
@@ -223,6 +234,55 @@ async fn refresh_sessions_with_registry_at(
     let listing =
         state_catalog::sessions_excluding_local_endpoints(state_dir, &account, now, registry_dir)?;
     Ok(finish_refresh(listing, warnings))
+}
+
+const MAX_RECORD_FETCH_ATTEMPTS: usize = 3;
+
+// The index is not a snapshot. A newer GET may be used only after a second
+// index observation confirms that exact revision. Never move the revision
+// floor backwards, and still authenticate/decrypt the accepted envelope at the
+// caller. Continuous publication costs at most three GETs and three rechecks.
+#[tracing::instrument(name = "reconcile_sync_record", level = "debug", skip_all)]
+async fn fetch_consistent_record(
+    client: &SyncHttpClient,
+    account: &state::AccountCredentials,
+    mut indexed: LiveRecordIndexEntry,
+) -> Result<Option<FetchedRecord>> {
+    for attempt in 1..=MAX_RECORD_FETCH_ATTEMPTS {
+        let Some(fetched) = client.get_record(account, indexed.record_id).await? else {
+            return Ok(None);
+        };
+        ensure!(
+            fetched.revision >= indexed.revision,
+            "record revision moved backwards during refresh"
+        );
+        if fetched.revision == indexed.revision {
+            return Ok(Some(fetched));
+        }
+        tracing::debug!(record_id = %indexed.record_id, attempt,
+            indexed_revision = indexed.revision, fetched_revision = fetched.revision,
+            "publication raced catalog refresh; rechecking index");
+        let index = client
+            .list_records(account)
+            .await
+            .context("could not recheck the synchronized record index")?;
+        let Some(current) = index
+            .records
+            .into_iter()
+            .find(|entry| entry.record_id == indexed.record_id)
+        else {
+            return Ok(None);
+        };
+        ensure!(
+            current.revision >= fetched.revision,
+            "record index moved backwards during refresh"
+        );
+        if current.revision == fetched.revision {
+            return Ok(Some(fetched));
+        }
+        indexed = current;
+    }
+    anyhow::bail!("record kept changing after {MAX_RECORD_FETCH_ATTEMPTS} fetch attempts")
 }
 
 fn finish_refresh(
@@ -328,6 +388,199 @@ mod tests {
             stream.shutdown().await?;
         }
         Ok(())
+    }
+
+    async fn serve_sequence(
+        listener: tokio::net::TcpListener,
+        responses: Vec<(String, u16, Option<u64>, Vec<u8>)>,
+    ) {
+        for (expected_path, status, revision, body) in responses {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let mut chunk = [0; 1024];
+                let n = stream.read(&mut chunk).await.unwrap();
+                assert!(n > 0 && request.len() < 8192);
+                request.extend_from_slice(&chunk[..n]);
+            }
+            let request = std::str::from_utf8(&request).unwrap();
+            assert_eq!(
+                request.split_whitespace().nth(1),
+                Some(expected_path.as_str())
+            );
+            let etag = revision
+                .map(|revision| format!("ETag: \"{revision}\"\r\n"))
+                .unwrap_or_default();
+            let header = format!(
+                "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\n{etag}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(header.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+            stream.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn publication_between_index_and_fetch_is_reconciled() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let root = crate::test_support::canonical_tempdir();
+            let state_dir = root.path().join("state");
+            let registry_dir = root.path().join("registry");
+            state::test_support::create_account(
+                &state_dir,
+                &format!("http://{}", listener.local_addr().unwrap()),
+            )
+            .unwrap();
+            let account = state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
+            let now = super::super::utc_now_seconds();
+            let id = RecordId::from_bytes([42; 16]);
+            let descriptor = SessionAccessDescriptor::new(
+                "publisher".into(),
+                now - Duration::from_secs(1),
+                now + Duration::from_secs(300),
+                ENDPOINT.into(),
+                CapabilitySecret::from_bytes([42; 32]),
+                SessionAccessAttachedVersion::new(0, 2, 8),
+                SessionAccessVersion::new(3, 2, 1),
+                vec!["work".into()],
+            )
+            .unwrap();
+            let (nonce, ciphertext) = seal_session_access_descriptor(
+                &descriptor,
+                account.account_root_key(),
+                account.account_id().as_bytes(),
+                id.as_bytes(),
+            )
+            .unwrap()
+            .into_parts();
+            let envelope = serde_json::to_vec(&Envelope::new(nonce, ciphertext).unwrap()).unwrap();
+            let index_path = format!("/v1/accounts/{}/records", account.account_id());
+            let record_path = format!("{index_path}/{id}");
+            let index = |revision| {
+                serde_json::to_vec(
+                    &LiveRecordIndex::new(vec![LiveRecordIndexEntry {
+                        record_id: id,
+                        revision,
+                    }])
+                    .unwrap(),
+                )
+                .unwrap()
+            };
+            let server = tokio::spawn(serve_sequence(
+                listener,
+                vec![
+                    (index_path.clone(), 200, None, index(1)),
+                    (record_path, 200, Some(2), envelope),
+                    (index_path, 200, None, index(2)),
+                ],
+            ));
+            let refreshed = refresh_sessions_with_registry_at(
+                &state_dir,
+                HerdrVersion::new(3, 2, 1),
+                &registry_dir,
+                now,
+            )
+            .await
+            .unwrap();
+            assert_eq!(refreshed.sessions.len(), 1);
+            assert_eq!(refreshed.sessions[0].target, "publisher/work");
+            assert_eq!(
+                state_catalog::load(&state_dir, &account).unwrap().records[0].service_revision,
+                2
+            );
+            server.await.unwrap();
+        })
+        .await
+        .expect("publication race fixture timed out");
+    }
+
+    #[tokio::test]
+    async fn unstable_deleted_and_invalid_records_do_not_hide_other_hosts() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for scenario in ["churn", "deleted", "reindexed-deletion", "rollback", "index-rollback", "invalid", "expired", "pruned-replay"] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let root = crate::test_support::canonical_tempdir();
+                let state_dir = root.path().join("state");
+                state::test_support::create_account(&state_dir, &format!("http://{}", listener.local_addr().unwrap())).unwrap();
+                let account = state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
+                let now = super::super::utc_now_seconds();
+                let changing = RecordId::from_bytes([42; 16]);
+                let stable = RecordId::from_bytes([43; 16]);
+                let sealed = |id: RecordId, expired: bool| {
+                    let descriptor = SessionAccessDescriptor::new(
+                        if id == stable { "stable" } else { "changing" }.into(),
+                        now - Duration::from_secs(120),
+                        if expired { now - Duration::from_secs(1) } else { now + Duration::from_secs(300) },
+                        ENDPOINT.into(), CapabilitySecret::from_bytes([42; 32]),
+                        SessionAccessAttachedVersion::new(0, 2, 8), SessionAccessVersion::new(3, 2, 1), vec!["work".into()],
+                    ).unwrap();
+                    let (nonce, ciphertext) = seal_session_access_descriptor(
+                        &descriptor, account.account_root_key(), account.account_id().as_bytes(), id.as_bytes(),
+                    ).unwrap().into_parts();
+                    Envelope::new(nonce, ciphertext).unwrap()
+                };
+                let mut envelope = sealed(changing, scenario == "expired");
+                if scenario == "pruned-replay" {
+                    let context = VerificationContext {
+                        account_id: *account.account_id().as_bytes(), record_id: *changing.as_bytes(), now,
+                        local_version: SessionAccessVersion::new(3, 2, 1),
+                    };
+                    let opened = open_session_access_descriptor_cursorless_for_native_upgrade(
+                        &CryptoEnvelope::new(envelope.nonce, envelope.ciphertext.clone()).unwrap(), account.account_root_key(), &context,
+                    ).unwrap();
+                    let mut catalog = state_catalog::Catalog::empty(&account);
+                    catalog.records.push(CatalogRecord::from_opened(changing, 2, &opened));
+                    state_catalog::save(&state_dir, &account, &catalog).unwrap();
+                    assert!(state_catalog::remove_if_revision(&state_dir, &account, changing, 2).unwrap());
+                }
+                if scenario == "invalid" {
+                    envelope.ciphertext[0] ^= 1;
+                }
+                let body = serde_json::to_vec(&envelope).unwrap();
+                let index_path = format!("/v1/accounts/{}/records", account.account_id());
+                let record_path = format!("{index_path}/{changing}");
+                let index = |revision: Option<u64>| {
+                    let mut entries = vec![LiveRecordIndexEntry { record_id: stable, revision: 1 }];
+                    if let Some(revision) = revision {
+                        entries.push(LiveRecordIndexEntry { record_id: changing, revision });
+                    }
+                    entries.sort_by_key(|entry| entry.record_id);
+                    serde_json::to_vec(&LiveRecordIndex::new(entries).unwrap()).unwrap()
+                };
+                let mut responses = vec![(index_path.clone(), 200, None, index(Some(if scenario == "rollback" { 3 } else { 1 })))];
+                if scenario == "deleted" {
+                    responses.push((record_path.clone(), 404, None, Vec::new()));
+                } else if scenario == "churn" {
+                    for attempt in 0..MAX_RECORD_FETCH_ATTEMPTS {
+                        responses.push((record_path.clone(), 200, Some(2 + attempt as u64 * 2), body.clone()));
+                        responses.push((index_path.clone(), 200, None, index(Some(3 + attempt as u64 * 2))));
+                    }
+                } else {
+                    responses.push((record_path.clone(), 200, Some(2), body));
+                    if scenario != "rollback" {
+                        responses.push((index_path.clone(), 200, None, index(match scenario {
+                            "reindexed-deletion" => None,
+                            "index-rollback" => Some(1),
+                            _ => Some(2),
+                        })));
+                    }
+                }
+                responses.push((format!("{index_path}/{stable}"), 200, Some(1), serde_json::to_vec(&sealed(stable, false)).unwrap()));
+                let server = tokio::spawn(serve_sequence(listener, responses));
+                let refreshed = refresh_sessions_with_registry_at(
+                    &state_dir, HerdrVersion::new(3, 2, 1), &root.path().join("registry"), now,
+                ).await.unwrap();
+                assert_eq!(refreshed.sessions.len(), 1, "{scenario}: {:?}", refreshed.sessions);
+                assert_eq!(refreshed.sessions[0].target, "stable/work", "{scenario}");
+                assert!(state_catalog::load(&state_dir, &account).unwrap().records.iter().all(|record| record.record_id == stable), "{scenario}");
+                if !matches!(scenario, "invalid" | "expired" | "pruned-replay") {
+                    assert!(refreshed.warnings.iter().any(|warning| matches!(warning, RefreshWarning::RecordUnavailable { record_id, .. } if *record_id == changing)), "{scenario}");
+                }
+                server.await.unwrap();
+            }
+        }).await.expect("bounded reconciliation scenarios timed out");
     }
 
     #[tokio::test]
