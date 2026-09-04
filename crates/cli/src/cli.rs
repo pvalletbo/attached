@@ -347,16 +347,20 @@ impl Cli {
                     }
                 };
                 let synchronized_sessions = if has_download_account {
-                    let local_version = herdr_version::query(&herdr_bin).context(
-                        "could not determine the local Herdr version; catalog refresh and attachment were not started",
-                    )?;
-                    let refreshed = sync::refresh::refresh_sessions(&state_dir, local_version)
-                        .await
-                        .context("could not refresh synchronized sessions")?;
-                    for warning in refresh_warnings_to_display(&refreshed.warnings, self.verbose) {
-                        eprintln!("Warning: {warning}");
-                    }
-                    refreshed.sessions
+                    let refreshed = async {
+                        let local_version = herdr_version::query(&herdr_bin).context(
+                            "could not determine the local Herdr version; remote discovery was not started",
+                        )?;
+                        sync::refresh::refresh_sessions(&state_dir, local_version)
+                            .await
+                            .context("could not refresh synchronized sessions")
+                    }.await;
+                    attach_refresh_result(
+                        refreshed,
+                        target.is_none(),
+                        self.verbose,
+                        &mut std::io::stderr(),
+                    )?
                 } else {
                     Vec::new()
                 };
@@ -418,6 +422,36 @@ impl Cli {
             }
         }
     }
+}
+
+fn attach_refresh_result(
+    refreshed: Result<sync::refresh::RefreshResult>,
+    interactive: bool,
+    verbosity: u8,
+    output: &mut impl std::io::Write,
+) -> Result<Vec<sync::state_catalog::SyncedSession>> {
+    let refreshed = match refreshed {
+        Ok(refreshed) => refreshed,
+        Err(error) if interactive => {
+            writeln!(
+                output,
+                "Warning: remote discovery failed: {error:#}. Showing local sessions only; check synchronization connectivity and credentials, then retry `attached attach`."
+            )?;
+            tracing::debug!(
+                operation = "attach_discovery",
+                stage = "remote",
+                outcome = "degraded",
+                "continuing with local session selection"
+            );
+            // Do not silently reuse cached descriptors or extend their validity.
+            return Ok(Vec::new());
+        }
+        Err(error) => return Err(error),
+    };
+    for warning in refresh_warnings_to_display(&refreshed.warnings, verbosity) {
+        writeln!(output, "Warning: {warning}")?;
+    }
+    Ok(refreshed.sessions)
 }
 
 fn refresh_warnings_to_display(
@@ -768,6 +802,50 @@ mod tests {
         assert!(help.contains("generate and store"), "{help}");
         assert!(help.contains("password_source = \"password\""), "{help}");
         assert!(help.contains("config_directory"), "{help}");
+    }
+
+    #[tokio::test]
+    async fn sync_outage_degrades_only_interactive_attachment_and_explains_the_cause() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let root = crate::test_support::canonical_tempdir();
+            let state_dir = root.path().join("state");
+            sync::state::test_support::create_account(
+                &state_dir, &format!("http://{}", listener.local_addr().unwrap()),
+            ).unwrap();
+            assert!(sync::state::has_download_account(&state_dir).unwrap());
+            let server = tokio::spawn(async move {
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        let mut chunk = [0; 1024];
+                        let n = stream.read(&mut chunk).await.unwrap();
+                        assert!(n > 0 && request.len() < 8192);
+                        request.extend_from_slice(&chunk[..n]);
+                    }
+                    stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                }
+            });
+            for interactive in [true, false] {
+                let refreshed = sync::refresh::refresh_sessions(&state_dir, attached_tunnel_protocol::HerdrVersion::new(3, 2, 1)).await
+                    .context("could not refresh synchronized sessions");
+                let mut warnings = Vec::new();
+                let result = attach_refresh_result(refreshed, interactive, 0, &mut warnings);
+                if interactive {
+                    assert!(result.unwrap().is_empty(), "no stale remote cache fallback");
+                    let warnings = String::from_utf8(warnings).unwrap();
+                    assert!(warnings.contains("503"), "{warnings}");
+                    assert!(warnings.contains("local sessions only"), "{warnings}");
+                    assert!(warnings.contains("retry"), "{warnings}");
+                } else {
+                    assert!(format!("{:#}", result.unwrap_err()).contains("503"));
+                    assert!(warnings.is_empty(), "explicit remote attachment must fail");
+                }
+            }
+            server.await.unwrap();
+        }).await.expect("outage fixture timed out");
     }
 
     #[test]
