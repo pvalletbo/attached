@@ -180,7 +180,6 @@ struct UpdateResources {
 struct PreparedHandoff {
     operation_id: UpdateOperationId,
     version: AttachedVersion,
-    confirmation_deadline: Instant,
     update: Option<installation::PreparedRemoteUpdate>,
     candidate: CandidateProcess,
     _permit: OwnedSemaphorePermit,
@@ -452,33 +451,11 @@ async fn run_supervisor(
 }
 
 async fn coordinate_handoff(mut handoff: PreparedHandoff) -> Result<HandoffResolution> {
-    let deadline = handoff.confirmation_deadline;
-    let precommit = async {
-        handoff.candidate.send(&ParentCommand::Activate).await?;
-        match timeout_at(deadline, handoff.candidate.next_event())
-            .await
-            .context("updated Attached candidate readiness timed out")??
-        {
-            CandidateEvent::Ready { version } if version == handoff.version => {}
-            CandidateEvent::Failed { reason } => {
-                bail!("updated Attached candidate failed: {reason}")
-            }
-            event => bail!("updated Attached candidate sent unexpected readiness event {event:?}"),
-        }
-        match timeout_at(deadline, handoff.candidate.next_event())
-            .await
-            .context("consumer did not reach the updated Attached candidate")??
-        {
-            CandidateEvent::ConsumerConnected => {}
-            CandidateEvent::Failed { reason } => {
-                bail!("updated Attached candidate failed: {reason}")
-            }
-            event => {
-                bail!("updated Attached candidate sent unexpected confirmation event {event:?}")
-            }
-        }
-        handoff.candidate.send(&ParentCommand::Commit).await
-    }
+    let precommit = confirm_attached_candidate(
+        &mut handoff.candidate,
+        handoff.version,
+        CANDIDATE_CONFIRM_TIMEOUT,
+    )
     .await;
 
     if let Err(error) = precommit {
@@ -541,6 +518,41 @@ async fn coordinate_handoff(mut handoff: PreparedHandoff) -> Result<HandoffResol
         "updated Attached server exited with {status}"
     );
     Ok(HandoffResolution::Retired)
+}
+
+async fn confirm_attached_candidate(
+    candidate: &mut CandidateProcess,
+    expected_version: AttachedVersion,
+    confirmation_timeout: Duration,
+) -> Result<()> {
+    // Preparation finishes while the old endpoint is still serving. This function is called only
+    // after that endpoint has been drained and closed, so start the confirmation budget here to
+    // prevent shutdown latency from causing an early rollback.
+    let deadline = Instant::now() + confirmation_timeout;
+    candidate.send(&ParentCommand::Activate).await?;
+    match timeout_at(deadline, candidate.next_event())
+        .await
+        .context("updated Attached candidate readiness timed out")??
+    {
+        CandidateEvent::Ready { version } if version == expected_version => {}
+        CandidateEvent::Failed { reason } => {
+            bail!("updated Attached candidate failed: {reason}")
+        }
+        event => bail!("updated Attached candidate sent unexpected readiness event {event:?}"),
+    }
+    match timeout_at(deadline, candidate.next_event())
+        .await
+        .context("consumer did not reach the updated Attached candidate")??
+    {
+        CandidateEvent::ConsumerConnected => {}
+        CandidateEvent::Failed { reason } => {
+            bail!("updated Attached candidate failed: {reason}")
+        }
+        event => {
+            bail!("updated Attached candidate sent unexpected confirmation event {event:?}")
+        }
+    }
+    candidate.send(&ParentCommand::Commit).await
 }
 
 fn new_operation_id() -> Result<UpdateOperationId> {
@@ -814,7 +826,6 @@ async fn prepare_attached_handoff(
     Ok(PreparedAttachedUpdate::Handoff(Box::new(PreparedHandoff {
         operation_id,
         version,
-        confirmation_deadline: Instant::now() + CANDIDATE_CONFIRM_TIMEOUT,
         update: Some(update),
         candidate,
         _permit: permit,
@@ -1532,6 +1543,46 @@ mod tests {
         assert!(!wire.contains("example.test"), "{wire}");
         assert!(!wire.contains("/srv/private"), "{wire}");
         assert!(!wire.contains("secret-herdr"), "{wire}");
+    }
+
+    #[tokio::test]
+    async fn candidate_confirmation_budget_begins_at_cutover() {
+        tokio::time::timeout(Duration::from_secs(8), async {
+            let root = crate::test_support::canonical_tempdir();
+            let executable = root.path().join("candidate");
+            fs::write(
+                &executable,
+                "#!/bin/sh\nset -eu\nIFS= read -r config\nprintf '%s\\n' '{\"type\":\"prepared\",\"version\":{\"major\":0,\"minor\":4,\"patch\":0}}'\nIFS= read -r activate\nsleep 1\nprintf '%s\\n' '{\"type\":\"ready\",\"version\":{\"major\":0,\"minor\":4,\"patch\":0}}' '{\"type\":\"consumer_connected\"}'\nIFS= read -r commit\n",
+            )
+            .unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+            let version = AttachedVersion::new(0, 4, 0);
+            let config = CandidateConfig {
+                serve: ServeConfig {
+                    state_dir: root.path().join("state"),
+                    herdr_bin: PathBuf::from("herdr"),
+                    host_label: "office".to_owned(),
+                },
+                operation_id: UpdateOperationId::from_bytes([0x30; 16]),
+                session: "work".to_owned(),
+                expected_version: version,
+                expected_endpoint_identity: [0x51; 32],
+                capability: [0x61; 32],
+                master_key: [0x71; 32],
+                bind_sockets: Vec::new(),
+            };
+            let mut candidate = CandidateProcess::spawn(&executable, &config).await.unwrap();
+
+            // Simulate slow response acknowledgement and old-endpoint shutdown taking longer than
+            // the candidate confirmation budget. That pre-cutover work must not consume the budget.
+            tokio::time::sleep(Duration::from_millis(2_200)).await;
+            confirm_attached_candidate(&mut candidate, version, Duration::from_secs(2))
+                .await
+                .unwrap();
+            assert!(candidate.supervise().await.unwrap().success());
+        })
+        .await
+        .expect("candidate confirmation scenario timed out");
     }
 
     #[tokio::test]
