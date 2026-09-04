@@ -230,6 +230,7 @@ fn run_installer(
         .context("could not create a temporary file for the Attached installer")?;
     let download_status = Command::new(curl_executable)
         .args([
+            "--disable",
             "--proto",
             "=https",
             "--proto-redir",
@@ -534,6 +535,11 @@ mod tests {
             install_dir.to_str().unwrap()
         );
         let arguments = fs::read_to_string(curl_arguments).unwrap();
+        assert_eq!(
+            arguments.lines().next(),
+            Some("--disable"),
+            "curl only skips its configuration when --disable is the first argument"
+        );
         for expected in [
             "--proto",
             "=https",
