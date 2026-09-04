@@ -125,6 +125,37 @@ fn retry_executable_busy<T>(
     }
 }
 
+pub(crate) async fn retry_executable_busy_async<T>(
+    operation: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    retry_executable_busy_async_with(
+        operation,
+        EXECUTABLE_BUSY_RETRY_LIMIT,
+        EXECUTABLE_BUSY_RETRY_DELAY,
+    )
+    .await
+}
+
+async fn retry_executable_busy_async_with<T>(
+    mut operation: impl FnMut() -> std::io::Result<T>,
+    retry_limit: usize,
+    retry_delay: Duration,
+) -> std::io::Result<T> {
+    let mut retries = 0;
+    loop {
+        match operation() {
+            Err(error)
+                if error.raw_os_error() == Some(rustix::io::Errno::TXTBSY.raw_os_error())
+                    && retries < retry_limit =>
+            {
+                retries += 1;
+                tokio::time::sleep(retry_delay).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 fn bounded_reader<R>(reader: R, capture_limit: u64) -> thread::JoinHandle<std::io::Result<Vec<u8>>>
 where
     R: Read + Send + 'static,
@@ -230,6 +261,58 @@ mod tests {
             2,
             Duration::ZERO,
         )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn asynchronous_executable_busy_retries_are_selective_and_bounded() {
+        let busy = rustix::io::Errno::TXTBSY.raw_os_error();
+        let mut attempts = 0;
+        let value = retry_executable_busy_async_with(
+            || {
+                attempts += 1;
+                if attempts <= 2 {
+                    Err(std::io::Error::from_raw_os_error(busy))
+                } else {
+                    Ok(17)
+                }
+            },
+            2,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        assert_eq!(value, 17);
+        assert_eq!(attempts, 3);
+
+        attempts = 0;
+        let error = retry_executable_busy_async_with::<()>(
+            || {
+                attempts += 1;
+                Err(std::io::Error::from_raw_os_error(busy))
+            },
+            2,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(busy));
+        assert_eq!(attempts, 3);
+
+        attempts = 0;
+        let error = retry_executable_busy_async_with::<()>(
+            || {
+                attempts += 1;
+                Err(std::io::Error::from_raw_os_error(
+                    rustix::io::Errno::ACCESS.raw_os_error(),
+                ))
+            },
+            2,
+            Duration::ZERO,
+        )
+        .await
         .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert_eq!(attempts, 1);
