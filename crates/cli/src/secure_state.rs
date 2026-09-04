@@ -110,38 +110,9 @@ fn acquire_lock_until(
 
 fn open_validated_lock(directory: &StateDir, lock_name: &str) -> Result<File> {
     validate_name(lock_name, "state lock")?;
-    let (lock, created) = match openat_file(
-        &directory.directory,
-        lock_name,
-        OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::RUSR | Mode::WUSR,
-    ) {
-        Ok(file) => (file, true),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (
-            openat_file(
-                &directory.directory,
-                lock_name,
-                OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .with_context(|| format!("failed to reopen state lock {lock_name}"))?,
-            false,
-        ),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to create state lock {lock_name}"));
-        }
-    };
-    if created {
-        protect_file(&lock).with_context(|| format!("failed to protect state lock {lock_name}"))?;
-    }
-    validate_file(&lock, lock_name, 0o600)?;
-    if created {
-        directory
-            .directory
-            .sync_all()
-            .context("failed to sync state directory after creating lock")?;
-    }
-    Ok(lock)
+    directory
+        .open_private_lock_file(lock_name, true)?
+        .with_context(|| format!("state lock {lock_name} is missing"))
 }
 
 fn verify_locked_path(
@@ -150,8 +121,7 @@ fn verify_locked_path(
     lock_name: &str,
     lock: &File,
 ) -> Result<()> {
-    validate_private_dir(&directory.directory, state_dir)?;
-    verify_path_identity(&directory.directory, lock_name, lock)
+    directory.verify_locked_file(state_dir, lock_name, lock)
 }
 
 pub fn prepare_private_dir(path: &Path) -> Result<()> {
@@ -268,35 +238,6 @@ impl StateDir {
     pub(crate) fn verify_locked_file(&self, path: &Path, name: &str, file: &File) -> Result<()> {
         validate_private_dir(&self.directory, path)?;
         verify_path_identity(&self.directory, name, file)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn read_optional_bounded(
-        &self,
-        name: &str,
-        limit: usize,
-    ) -> Result<Option<Vec<u8>>> {
-        validate_name(name, "state file")?;
-        let file = match openat_file(
-            &self.directory,
-            name,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        ) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(error).with_context(|| format!("failed to open state file {name}"));
-            }
-        };
-        let bytes = read_bounded_file(file, name, limit)?;
-        Ok(Some(bytes))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn read_bounded(&self, name: &str, limit: usize) -> Result<Vec<u8>> {
-        self.read_optional_bounded(name, limit)?
-            .with_context(|| format!("state file {name} is missing"))
     }
 
     pub(crate) fn read_secret_optional_bounded(
@@ -498,40 +439,20 @@ fn openat_directory(parent: &File, name: &[u8]) -> std::io::Result<File> {
     .map_err(std::io::Error::from)
 }
 
-#[cfg(test)]
-fn read_bounded_file(file: File, name: &str, limit: usize) -> Result<Vec<u8>> {
+fn read_secret_bounded_file(file: File, name: &str, limit: usize) -> Result<Zeroizing<Vec<u8>>> {
     validate_file(&file, name, 0o600)?;
     ensure!(
         file.metadata()?.len() <= limit as u64,
         "state file {name} exceeds {limit} bytes"
     );
-    read_bounded_contents(file, name, limit)
+    read_secret_bounded_contents(file, name, limit)
 }
 
-#[cfg(test)]
-fn read_bounded_contents(mut file: File, name: &str, limit: usize) -> Result<Vec<u8>> {
-    let mut bytes = Vec::with_capacity(limit.min(8192));
-    Read::by_ref(&mut file)
-        .take(limit as u64 + 1)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("failed to read state file {name}"))?;
-    ensure!(
-        bytes.len() <= limit,
-        "state file {name} exceeds {limit} bytes"
-    );
-    Ok(bytes)
-}
-
-fn read_secret_bounded_file(
+fn read_secret_bounded_contents(
     mut file: File,
     name: &str,
     limit: usize,
 ) -> Result<Zeroizing<Vec<u8>>> {
-    validate_file(&file, name, 0o600)?;
-    ensure!(
-        file.metadata()?.len() <= limit as u64,
-        "state file {name} exceeds {limit} bytes"
-    );
     let mut bytes = Zeroizing::new(Vec::with_capacity(limit.min(8192)));
     Read::by_ref(&mut file)
         .take(limit as u64 + 1)
@@ -680,8 +601,8 @@ mod tests {
         with_locked_inner(StateDir::open(state_dir)?, state_dir, lock_name, operation)
     }
 
-    fn read_bounded(state_dir: &Path, name: &str, limit: usize) -> Result<Vec<u8>> {
-        StateDir::open(state_dir)?.read_bounded(name, limit)
+    fn read_bounded(state_dir: &Path, name: &str, limit: usize) -> Result<Zeroizing<Vec<u8>>> {
+        StateDir::open(state_dir)?.read_secret_bounded(name, limit)
     }
 
     fn atomic_replace(state_dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
@@ -831,7 +752,7 @@ mod tests {
             .unwrap();
         writer.write_all(b"5").unwrap();
 
-        let result = read_bounded_contents(file, "data", 4);
+        let result = read_secret_bounded_contents(file, "data", 4);
         assert!(result.unwrap_err().to_string().contains("exceeds 4 bytes"));
     }
 
@@ -851,6 +772,66 @@ mod tests {
 
         assert_zeroizing(&bytes);
         assert_eq!(bytes.as_slice(), b"synthetic-secret");
+    }
+
+    #[test]
+    fn secret_reads_distinguish_missing_empty_exact_limit_and_oversized_files() {
+        let root = crate::test_support::canonical_tempdir();
+        let directory = StateDir::open(&root.path().join("state")).unwrap();
+        assert!(
+            directory
+                .read_secret_optional_bounded("missing", 0)
+                .unwrap()
+                .is_none()
+        );
+        assert!(directory.read_secret_bounded("missing", 0).is_err());
+        directory.create_noclobber("empty", b"").unwrap();
+        assert!(
+            directory
+                .read_secret_bounded("empty", 0)
+                .unwrap()
+                .is_empty()
+        );
+        directory.create_noclobber("secret", b"1234").unwrap();
+        assert_eq!(
+            directory
+                .read_secret_bounded("secret", 4)
+                .unwrap()
+                .as_slice(),
+            b"1234"
+        );
+        assert!(directory.read_secret_bounded("secret", 3).is_err());
+    }
+
+    #[test]
+    fn state_and_registry_locks_share_a_private_stable_inode() {
+        let root = crate::test_support::canonical_tempdir();
+        let state = root.path().join("state");
+        let directory = StateDir::open(&state).unwrap();
+        assert!(
+            directory
+                .open_private_lock_file("shared.lock", false)
+                .unwrap()
+                .is_none()
+        );
+        let lock = open_validated_lock(&directory, "shared.lock").unwrap();
+        let reopened = directory
+            .open_private_lock_file("shared.lock", false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            lock.metadata().unwrap().ino(),
+            reopened.metadata().unwrap().ino()
+        );
+        assert_eq!(lock.metadata().unwrap().mode() & 0o7777, 0o600);
+        FileExt::lock(&lock).unwrap();
+        assert!(matches!(
+            FileExt::try_lock(&reopened),
+            Err(fs4::TryLockError::WouldBlock)
+        ));
+        assert!(acquire_lock_until(&directory, &state, "shared.lock", Instant::now()).is_err());
+        FileExt::unlock(&lock).unwrap();
+        assert!(acquire_lock_until(&directory, &state, "shared.lock", Instant::now()).is_ok());
     }
 
     #[test]
@@ -948,7 +929,12 @@ mod tests {
             fs::create_dir(&state).unwrap();
             fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
             transaction.atomic_replace("registry.json", b"pinned")?;
-            assert_eq!(transaction.read_bounded("registry.json", 32)?, b"pinned");
+            assert_eq!(
+                transaction
+                    .read_secret_bounded("registry.json", 32)?
+                    .as_slice(),
+                b"pinned"
+            );
             assert!(!state.join("registry.json").exists());
             assert_eq!(
                 fs::read(locked_state.join("registry.json")).unwrap(),
@@ -1004,7 +990,7 @@ mod tests {
 
     #[test]
     fn unsafe_lock_file_types_modes_and_links_are_rejected() {
-        for setup in 0..3 {
+        for setup in 0..4 {
             let root = crate::test_support::canonical_tempdir();
             let state = root.path().join("state");
             prepare_private_dir(&state).unwrap();
@@ -1015,12 +1001,24 @@ mod tests {
                     fs::write(&lock, b"").unwrap();
                     fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).unwrap();
                 }
-                _ => {
+                2 => {
                     fs::write(&lock, b"").unwrap();
                     fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
                     fs::hard_link(&lock, state.join("lock-copy")).unwrap();
                 }
+                _ => std::os::unix::fs::symlink("target", &lock).unwrap(),
             }
+            let directory = StateDir::open(&state).unwrap();
+            assert!(
+                directory
+                    .open_private_lock_file("registry.lock", false)
+                    .is_err()
+            );
+            assert!(
+                directory
+                    .open_private_lock_file("registry.lock", true)
+                    .is_err()
+            );
             assert!(with_locked(&state, "registry.lock", |_| Ok(())).is_err());
         }
     }

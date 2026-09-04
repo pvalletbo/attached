@@ -180,7 +180,7 @@ struct UpdateResources {
 struct PreparedHandoff {
     operation_id: UpdateOperationId,
     version: AttachedVersion,
-    update: Option<installation::PreparedRemoteUpdate>,
+    update: installation::PreparedRemoteUpdate,
     candidate: CandidateProcess,
     _permit: OwnedSemaphorePermit,
 }
@@ -467,8 +467,6 @@ async fn coordinate_handoff(mut handoff: PreparedHandoff) -> Result<HandoffResol
         handoff.candidate.abort().await;
         handoff
             .update
-            .take()
-            .context("Attached update rollback binary is unavailable")?
             .rollback()
             .context("could not restore the previous Attached binary")?;
         return Ok(HandoffResolution::RolledBack(RollbackRecord {
@@ -495,12 +493,7 @@ async fn coordinate_handoff(mut handoff: PreparedHandoff) -> Result<HandoffResol
             "candidate committed before client acknowledgement was observed"
         ),
     }
-    if let Err(error) = handoff
-        .update
-        .take()
-        .context("Attached update commit binary is unavailable")?
-        .commit()
-    {
+    if let Err(error) = handoff.update.commit() {
         warn!(
             operation_id = %handoff.operation_id,
             error = %error,
@@ -687,23 +680,13 @@ where
     Update: FnOnce(&std::path::Path, &str, HerdrVersion) -> Result<HerdrVersion>,
 {
     let current = *version.borrow();
-    if (
-        requested_version.major(),
-        requested_version.minor(),
-        requested_version.patch(),
-    ) < (current.major(), current.minor(), current.patch())
-    {
+    if requested_version < current {
         return UpgradeResponse::Failed(
             "remote Herdr is newer than the requested version".to_owned(),
         );
     }
     if let Ok(installed) = herdr_version::query(herdr_bin)
-        && (installed.major(), installed.minor(), installed.patch())
-            > (
-                requested_version.major(),
-                requested_version.minor(),
-                requested_version.patch(),
-            )
+        && installed > requested_version
     {
         if let Ok(running) = herdr_version::query_running_sessions(herdr_bin) {
             version.send_replace(running);
@@ -826,7 +809,7 @@ async fn prepare_attached_handoff(
     Ok(PreparedAttachedUpdate::Handoff(Box::new(PreparedHandoff {
         operation_id,
         version,
-        update: Some(update),
+        update,
         candidate,
         _permit: permit,
     })))
@@ -834,11 +817,7 @@ async fn prepare_attached_handoff(
 
 async fn abort_prepared_handoff(mut handoff: PreparedHandoff) -> Result<()> {
     handoff.candidate.abort().await;
-    handoff
-        .update
-        .take()
-        .context("Attached update rollback binary is unavailable")?
-        .rollback()
+    handoff.update.rollback()
 }
 
 async fn candidate_confirmation_response(

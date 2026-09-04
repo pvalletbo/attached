@@ -31,6 +31,32 @@ where
 }
 
 #[test]
+fn herdr_version_ordering_is_numeric_and_preserves_the_wire_format() {
+    let ordered = [
+        HerdrVersion::new(0, 0, 0),
+        HerdrVersion::new(1, 2, 3),
+        HerdrVersion::new(1, 2, 10),
+        HerdrVersion::new(1, 2, u32::MAX),
+        HerdrVersion::new(1, 3, 0),
+        HerdrVersion::new(1, u32::MAX, u32::MAX),
+        HerdrVersion::new(2, 0, 0),
+        HerdrVersion::new(u32::MAX, u32::MAX, u32::MAX),
+    ];
+    for (left_index, left) in ordered.iter().enumerate() {
+        for (right_index, right) in ordered.iter().enumerate() {
+            assert_eq!(left.cmp(right), left_index.cmp(&right_index));
+        }
+        let bytes = postcard::to_stdvec(left).unwrap();
+        assert_eq!(
+            bytes,
+            postcard::to_stdvec(&(left.major(), left.minor(), left.patch())).unwrap()
+        );
+        assert_eq!(postcard::from_bytes::<HerdrVersion>(&bytes).unwrap(), *left);
+    }
+    assert_eq!(postcard::to_stdvec(&ordered[1]).unwrap(), [1, 2, 3]);
+}
+
+#[test]
 fn native_compatibility_requires_exact_version_equality() {
     let local = HerdrVersion::new(1, 2, 3);
     assert!(ensure_herdr_compatible(local, local).is_ok());
