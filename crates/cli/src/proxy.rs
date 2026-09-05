@@ -58,6 +58,10 @@ where
 }
 
 #[cfg(test)]
+#[path = "proxy_tests.rs"]
+mod resilience_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
