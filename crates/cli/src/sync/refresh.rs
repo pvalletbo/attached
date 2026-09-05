@@ -15,12 +15,15 @@ use attached_session_sync_protocol::{
     },
 };
 use attached_tunnel_protocol::HerdrVersion;
+use futures_util::{StreamExt as _, stream};
 
 use super::{
     http::{FetchedRecord, SyncHttpClient},
     state,
     state_catalog::{self, CatalogRecord, SyncedSession},
 };
+
+const RECORD_FETCH_CONCURRENCY: usize = 8;
 
 #[derive(Debug)]
 pub struct RefreshResult {
@@ -143,6 +146,7 @@ async fn refresh_sessions_with_registry_at(
         .map(|record| (record.record_id, record))
         .collect::<BTreeMap<_, _>>();
     let mut accepted = Vec::with_capacity(index.records.len());
+    let mut changed = Vec::new();
     for indexed in index.records {
         let previous = existing.remove(&indexed.record_id);
         if let Some(previous) = previous
@@ -164,8 +168,11 @@ async fn refresh_sessions_with_registry_at(
             accepted.push(previous);
             continue;
         }
+        changed.push(indexed);
+    }
 
-        let fetched = match fetch_consistent_record(&client, &account, indexed).await {
+    for (indexed, fetched) in fetch_changed_records(&client, &account, changed).await {
+        let fetched = match fetched {
             Ok(Some(fetched)) => fetched,
             result => {
                 let error = match result {
@@ -285,6 +292,24 @@ async fn fetch_consistent_record(
     anyhow::bail!("record kept changing after {MAX_RECORD_FETCH_ATTEMPTS} fetch attempts")
 }
 
+async fn fetch_changed_records(
+    client: &SyncHttpClient,
+    account: &state::AccountCredentials,
+    records: Vec<LiveRecordIndexEntry>,
+) -> Vec<(LiveRecordIndexEntry, Result<Option<FetchedRecord>>)> {
+    stream::iter(records)
+        .map(|indexed| async move {
+            let fetched = fetch_consistent_record(client, account, indexed).await;
+            (indexed, fetched)
+        })
+        // Bound whole reconciliation operations, including their index rechecks.
+        // Keep results ordered and errors per-record: a failed host must not
+        // cancel other hosts or restore the old fail-whole-refresh behavior.
+        .buffered(RECORD_FETCH_CONCURRENCY)
+        .collect()
+        .await
+}
+
 fn finish_refresh(
     listing: state_catalog::SessionListing,
     mut warnings: Vec<RefreshWarning>,
@@ -342,6 +367,28 @@ mod tests {
         0x02, 0xb6,
     ];
 
+    async fn read_request(stream: &mut tokio::net::TcpStream) -> anyhow::Result<Vec<u8>> {
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0_u8; 1024];
+            let read = stream.read(&mut chunk).await?;
+            anyhow::ensure!(read != 0, "HTTP request ended before its headers");
+            request.extend_from_slice(&chunk[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                return Ok(request);
+            }
+            anyhow::ensure!(request.len() <= 8192, "HTTP request headers too large");
+        }
+    }
+
+    async fn respond_not_found(mut stream: tokio::net::TcpStream) -> anyhow::Result<()> {
+        stream
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await?;
+        stream.shutdown().await?;
+        Ok(())
+    }
+
     async fn serve_catalog(
         listener: tokio::net::TcpListener,
         index_path: String,
@@ -351,17 +398,7 @@ mod tests {
     ) -> anyhow::Result<()> {
         for _ in 0..request_count {
             let (mut stream, _) = listener.accept().await?;
-            let mut request = Vec::new();
-            loop {
-                let mut chunk = [0_u8; 1024];
-                let read = stream.read(&mut chunk).await?;
-                anyhow::ensure!(read != 0, "HTTP request ended before its headers");
-                request.extend_from_slice(&chunk[..read]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
-                anyhow::ensure!(request.len() <= 8192, "HTTP request headers too large");
-            }
+            let request = read_request(&mut stream).await?;
             let request = std::str::from_utf8(&request)?;
             let path = request
                 .lines()
@@ -394,20 +431,25 @@ mod tests {
         listener: tokio::net::TcpListener,
         responses: Vec<(String, u16, Option<u64>, Vec<u8>)>,
     ) {
-        for (expected_path, status, revision, body) in responses {
+        // Each route retains its scripted revision order, while independent
+        // hosts may now arrive in either order.
+        let request_count = responses.len();
+        let mut by_path = BTreeMap::<_, std::collections::VecDeque<_>>::new();
+        for (path, status, revision, body) in responses {
+            by_path
+                .entry(path)
+                .or_default()
+                .push_back((status, revision, body));
+        }
+        for _ in 0..request_count {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
-                let mut chunk = [0; 1024];
-                let n = stream.read(&mut chunk).await.unwrap();
-                assert!(n > 0 && request.len() < 8192);
-                request.extend_from_slice(&chunk[..n]);
-            }
+            let request = read_request(&mut stream).await.unwrap();
             let request = std::str::from_utf8(&request).unwrap();
-            assert_eq!(
-                request.split_whitespace().nth(1),
-                Some(expected_path.as_str())
-            );
+            let path = request.split_whitespace().nth(1).unwrap();
+            let (status, revision, body) = by_path
+                .get_mut(path)
+                .and_then(|responses| responses.pop_front())
+                .unwrap_or_else(|| panic!("unexpected HTTP request {path}"));
             let etag = revision
                 .map(|revision| format!("ETag: \"{revision}\"\r\n"))
                 .unwrap_or_default();
@@ -499,7 +541,7 @@ mod tests {
     #[tokio::test]
     async fn unstable_deleted_and_invalid_records_do_not_hide_other_hosts() {
         tokio::time::timeout(Duration::from_secs(10), async {
-            for scenario in ["churn", "deleted", "reindexed-deletion", "rollback", "index-rollback", "invalid", "expired", "pruned-replay"] {
+            for scenario in ["churn", "deleted", "http-error", "reindexed-deletion", "rollback", "index-rollback", "invalid", "expired", "pruned-replay"] {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let root = crate::test_support::canonical_tempdir();
                 let state_dir = root.path().join("state");
@@ -550,8 +592,8 @@ mod tests {
                     serde_json::to_vec(&LiveRecordIndex::new(entries).unwrap()).unwrap()
                 };
                 let mut responses = vec![(index_path.clone(), 200, None, index(Some(if scenario == "rollback" { 3 } else { 1 })))];
-                if scenario == "deleted" {
-                    responses.push((record_path.clone(), 404, None, Vec::new()));
+                if matches!(scenario, "deleted" | "http-error") {
+                    responses.push((record_path.clone(), if scenario == "deleted" { 404 } else { 503 }, None, Vec::new()));
                 } else if scenario == "churn" {
                     for attempt in 0..MAX_RECORD_FETCH_ATTEMPTS {
                         responses.push((record_path.clone(), 200, Some(2 + attempt as u64 * 2), body.clone()));
@@ -581,6 +623,123 @@ mod tests {
                 server.await.unwrap();
             }
         }).await.expect("bounded reconciliation scenarios timed out");
+    }
+
+    #[tokio::test]
+    async fn changed_record_fetches_are_concurrent_and_bounded() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let root = crate::test_support::canonical_tempdir();
+            let state_dir = root.path().join("state");
+            state::test_support::create_account(&state_dir, &origin).unwrap();
+            let account = state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
+            let records = (0..=RECORD_FETCH_CONCURRENCY)
+                .map(|index| LiveRecordIndexEntry {
+                    record_id: RecordId::from_bytes([index as u8 + 1; 16]),
+                    revision: 1,
+                })
+                .collect::<Vec<_>>();
+
+            let server = tokio::spawn(async move {
+                let mut pending = Vec::new();
+                for _ in 0..RECORD_FETCH_CONCURRENCY {
+                    let (mut stream, _) = listener.accept().await?;
+                    let _ = read_request(&mut stream).await?;
+                    pending.push(stream);
+                }
+                anyhow::ensure!(
+                    tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                        .await
+                        .is_err(),
+                    "refresh exceeded its record-fetch concurrency bound"
+                );
+                for stream in pending {
+                    respond_not_found(stream).await?;
+                }
+                let (mut final_stream, _) = listener.accept().await?;
+                let _ = read_request(&mut final_stream).await?;
+                respond_not_found(final_stream).await
+            });
+
+            let fetched =
+                fetch_changed_records(&SyncHttpClient::new().unwrap(), &account, records).await;
+            assert_eq!(fetched.len(), RECORD_FETCH_CONCURRENCY + 1);
+            assert!(fetched.iter().all(|(_, record)| matches!(record, Ok(None))));
+            server.await.unwrap().unwrap();
+        })
+        .await
+        .expect("concurrent record-fetch scenario timed out");
+    }
+
+    #[tokio::test]
+    async fn concurrent_reconciliation_bounds_index_rechecks_and_preserves_order() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let root = crate::test_support::canonical_tempdir();
+            let state_dir = root.path().join("state");
+            state::test_support::create_account(
+                &state_dir, &format!("http://{}", listener.local_addr().unwrap()),
+            ).unwrap();
+            let account = state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
+            let records = (0..=RECORD_FETCH_CONCURRENCY).map(|index| LiveRecordIndexEntry {
+                record_id: RecordId::from_bytes([index as u8 + 1; 16]),
+                revision: 1,
+            }).collect::<Vec<_>>();
+            let reindex = serde_json::to_vec(&LiveRecordIndex::new(records.iter().map(|entry| {
+                LiveRecordIndexEntry { record_id: entry.record_id, revision: 3 }
+            }).collect()).unwrap()).unwrap();
+            let envelope = serde_json::to_vec(&Envelope::new([0; 24], vec![0; 32]).unwrap()).unwrap();
+            let index_path = format!("/v1/accounts/{}/records", account.account_id());
+            let final_path = format!("{index_path}/{}", records.last().unwrap().record_id);
+            let server = tokio::spawn(async move {
+                // Hold eight requests at each stage: GET=2, reindex=3, GET=3.
+                // A ninth operation must not start until a whole reconciliation
+                // finishes, and the rechecks themselves must remain bounded.
+                for stage in 0..3 {
+                    let mut pending = Vec::new();
+                    for _ in 0..RECORD_FETCH_CONCURRENCY {
+                        let (mut socket, _) = listener.accept().await.unwrap();
+                        let request = read_request(&mut socket).await.unwrap();
+                        let request = std::str::from_utf8(&request).unwrap();
+                        let path = request.split_whitespace().nth(1).unwrap();
+                        if stage == 1 {
+                            assert_eq!(path, index_path);
+                        } else {
+                            assert!(path.starts_with(&format!("{index_path}/")));
+                            assert_ne!(path, final_path);
+                        }
+                        pending.push(socket);
+                    }
+                    assert!(tokio::time::timeout(Duration::from_millis(50), listener.accept()).await.is_err(),
+                        "reconciliation exceeded concurrency bound at stage {stage}");
+                    // Complete in reverse order to exercise deterministic output.
+                    for mut socket in pending.into_iter().rev() {
+                        let (body, etag) = match stage {
+                            0 => (&envelope, "ETag: \"2\"\r\n"),
+                            1 => (&reindex, ""),
+                            _ => (&envelope, "ETag: \"3\"\r\n"),
+                        };
+                        let header = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{etag}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                        socket.write_all(header.as_bytes()).await.unwrap();
+                        socket.write_all(body).await.unwrap();
+                        socket.shutdown().await.unwrap();
+                    }
+                }
+                serve_sequence(listener, vec![
+                    (final_path.clone(), 200, Some(2), envelope.clone()),
+                    (index_path, 200, None, reindex),
+                    (final_path, 200, Some(3), envelope),
+                ]).await;
+            });
+            let fetched = fetch_changed_records(&SyncHttpClient::new().unwrap(), &account, records).await;
+            assert_eq!(fetched.len(), RECORD_FETCH_CONCURRENCY + 1);
+            for (position, (entry, record)) in fetched.into_iter().enumerate() {
+                assert_eq!(entry.record_id, RecordId::from_bytes([position as u8 + 1; 16]));
+                assert_eq!(record.unwrap().unwrap().revision, 3);
+            }
+            server.await.unwrap();
+        }).await.expect("concurrent revision reconciliation timed out");
     }
 
     #[tokio::test]
