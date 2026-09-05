@@ -19,6 +19,7 @@ on:
       - deny.toml
       - rust-toolchain.toml
       - crates/cli/**
+      - integrations/raycast/**
       - crates/session-sync-protocol/**
       - crates/session-sync-worker/**
       - crates/tunnel-protocol/**
@@ -51,6 +52,7 @@ jobs:
       core: ${{ steps.filter.outputs.core }}
       worker: ${{ steps.filter.outputs.worker }}
       web: ${{ steps.filter.outputs.web }}
+      raycast: ${{ steps.filter.outputs.raycast }}
     steps:
       - name: Select affected CI jobs
         id: filter
@@ -91,6 +93,44 @@ jobs:
               - 'crates/tunnel-protocol/**'
               - 'experimental/crates/**'
               - 'experimental/web-client/**'
+            raycast:
+              - '.github/workflows/ci.yml'
+              - 'integrations/raycast/**'
+
+  raycast:
+    name: Raycast extension quality gates
+    needs: changes
+    if: >-
+      always() && !cancelled() &&
+      (github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.draft == false &&
+      needs.changes.outputs.raycast == 'true'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: integrations/raycast
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.22.2
+          cache: npm
+          cache-dependency-path: integrations/raycast/package-lock.json
+      - name: Install extension dependencies
+        run: npm ci
+      - name: Test extension behavior
+        run: npm test
+      - name: Check extension types
+        run: npm run typecheck
+      - name: Lint extension sources
+        run: npm run lint
+      - name: Build extension
+        run: npm run build
 
   rust:
     name: Core Rust quality gates

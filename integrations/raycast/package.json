@@ -1,0 +1,80 @@
+{
+  "$schema": "https://www.raycast.com/schemas/extension.json",
+  "name": "attached-sessions",
+  "title": "Attached Sessions",
+  "description": "Search synchronized Attached sessions and connect to one in Terminal.",
+  "icon": "attached.png",
+  "author": "pvalletbo",
+  "categories": [
+    "Developer Tools"
+  ],
+  "keywords": [
+    "attached",
+    "herdr",
+    "remote",
+    "session",
+    "terminal"
+  ],
+  "platforms": [
+    "macOS"
+  ],
+  "license": "MIT",
+  "commands": [
+    {
+      "name": "search-sessions",
+      "title": "Search Sessions",
+      "subtitle": "Attached",
+      "description": "Search synchronized Attached sessions and connect in Terminal.",
+      "mode": "view"
+    }
+  ],
+  "preferences": [
+    {
+      "name": "encryptionPasswordProvider",
+      "type": "dropdown",
+      "required": true,
+      "title": "Encryption Password Provider",
+      "description": "Use the provider that protects this Mac's Attached state. Changing it does not migrate existing state.",
+      "default": "password",
+      "data": [
+        {
+          "title": "Encryption Password",
+          "value": "password"
+        },
+        {
+          "title": "1Password CLI",
+          "value": "1password"
+        }
+      ]
+    },
+    {
+      "name": "attachedExecutablePath",
+      "type": "textfield",
+      "required": false,
+      "title": "Attached Executable Path",
+      "description": "Optional absolute path to attached. Leave empty to search ~/.local/bin, ~/.cargo/bin, Homebrew, and /usr/local/bin.",
+      "placeholder": "/Users/you/.local/bin/attached",
+      "default": ""
+    }
+  ],
+  "dependencies": {
+    "@raycast/api": "^1.104.25"
+  },
+  "devDependencies": {
+    "@raycast/eslint-config": "^2.2.0",
+    "@types/node": "22.19.17",
+    "@types/react": "19.0.10",
+    "eslint": "^9.39.4",
+    "prettier": "^3.8.1",
+    "typescript": "^5.9.2",
+    "vitest": "^4.1.11"
+  },
+  "scripts": {
+    "build": "ray build -e dist",
+    "dev": "ray develop",
+    "fix-lint": "eslint src --fix && prettier --write src package.json tsconfig.json eslint.config.js .prettierrc",
+    "lint": "eslint src --max-warnings=0 && prettier --check src package.json tsconfig.json eslint.config.js .prettierrc",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  }
+}
