@@ -5,7 +5,8 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use attached_session_sync_protocol::account::ApiKeyScope;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::Shell;
 use zeroize::Zeroizing;
 
 use crate::{
@@ -118,6 +119,13 @@ enum Command {
     #[command(name = "__handoff-serve", hide = true)]
     HandoffServe,
 
+    /// Generate a completion script for a supported shell.
+    Completions {
+        /// Shell whose completion script should be generated.
+        #[arg(value_enum)]
+        shell: Shell,
+    },
+
     /// Uninstall Attached and permanently delete all managed credentials and local state.
     Uninstall {
         /// Skip the confirmation prompt.
@@ -199,6 +207,15 @@ impl From<AccountKeyType> for ApiKeyScope {
     }
 }
 
+fn write_completions(shell: Shell, output: &mut impl std::io::Write) -> Result<()> {
+    let mut command = Cli::command();
+    let mut generated = Vec::new();
+    clap_complete::generate(shell, &mut command, "attached", &mut generated);
+    output
+        .write_all(&generated)
+        .with_context(|| format!("could not write {shell} completion script"))
+}
+
 impl Cli {
     pub fn verbosity(&self) -> u8 {
         self.verbose
@@ -210,6 +227,11 @@ impl Cli {
 
     #[tracing::instrument(name = "cli_run", level = "debug", skip_all)]
     pub async fn run(self) -> Result<i32> {
+        if let Command::Completions { shell } = &self.command {
+            write_completions(*shell, &mut stdout().lock())?;
+            return Ok(0);
+        }
+
         let configuration =
             config::Config::load().context("could not load Attached configuration")?;
         local_encryption::configure_use_one_password(
@@ -409,6 +431,7 @@ impl Cli {
                 server::serve_candidate().await?;
                 Ok(0)
             }
+            Command::Completions { .. } => unreachable!("handled before configuration loading"),
             Command::Uninstall { yes } => {
                 installation::uninstall(yes, configuration.config_directory())?;
                 Ok(0)
@@ -506,6 +529,7 @@ mod tests {
             vec!["attached", "update", "--remote"],
             vec!["attached", "update", "--remote", "office/work"],
             vec!["attached", "upgrade"],
+            vec!["attached", "completions", "bash"],
             vec!["attached", "uninstall"],
             vec!["attached", "uninstall", "--yes"],
         ] {
@@ -697,6 +721,7 @@ mod tests {
             "sessions",
             "attach",
             "update",
+            "completions",
             "uninstall",
         ] {
             assert!(help.contains(command), "{help}");
@@ -736,6 +761,19 @@ mod tests {
         );
         assert!(import_help.contains("--bundle-stdin"), "{import_help}");
         assert!(import_help.contains("hidden input"), "{import_help}");
+    }
+
+    #[test]
+    fn generates_completions_for_every_supported_shell() {
+        for &shell in Shell::value_variants() {
+            let mut generated = Vec::new();
+            write_completions(shell, &mut generated).unwrap();
+            let generated = String::from_utf8(generated).unwrap();
+
+            assert!(!generated.is_empty(), "empty {shell} completion script");
+            assert!(generated.contains("sessions"), "{shell}: {generated}");
+            assert!(generated.contains("completions"), "{shell}: {generated}");
+        }
     }
 
     #[test]
