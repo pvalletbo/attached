@@ -26,8 +26,7 @@ pub(super) fn decide_upgrade(
         return Ok(false);
     }
     ensure!(
-        (local.major(), local.minor(), local.patch())
-            > (remote.major(), remote.minor(), remote.patch()),
+        local > remote,
         "remote Herdr {remote} is newer than local Herdr {local}; update local Herdr before attaching"
     );
     if explicit {

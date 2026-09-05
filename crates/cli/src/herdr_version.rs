@@ -540,15 +540,7 @@ fn reconcile_live_sessions(
         for session in sessions {
             match query_session(command_executable, &session) {
                 Ok(running) if running == expected_version => continue,
-                Ok(running)
-                    if reject_newer
-                        && (running.major(), running.minor(), running.patch())
-                            > (
-                                expected_version.major(),
-                                expected_version.minor(),
-                                expected_version.patch(),
-                            ) =>
-                {
+                Ok(running) if reject_newer && running > expected_version => {
                     bail!(
                         "Herdr session `{session}` is newer at {running}; expected {expected_version}"
                     );
@@ -666,15 +658,7 @@ pub(crate) fn update_session_with_config(
 ) -> Result<HerdrVersion> {
     let installed_before = query(executable)?;
     ensure!(
-        (
-            installed_before.major(),
-            installed_before.minor(),
-            installed_before.patch(),
-        ) <= (
-            requested_version.major(),
-            requested_version.minor(),
-            requested_version.patch(),
-        ),
+        installed_before <= requested_version,
         "remote Herdr binary is newer at {installed_before}; expected {requested_version}"
     );
     let executable = resolve_executable(executable)?;

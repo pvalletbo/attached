@@ -32,7 +32,7 @@ const AUTH_UNSUPPORTED_TUNNEL: u8 = 3;
 const AUTH_CAPACITY_EXHAUSTED: u8 = 4;
 const MAX_VERSION_WIRE_LEN: usize = 16;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct HerdrVersion {
     major: u32,
     minor: u32,

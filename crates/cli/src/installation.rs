@@ -671,8 +671,13 @@ mod tests {
     }
 
     #[test]
-    fn prepared_remote_update_can_commit_or_restore_the_previous_binary() {
-        for commit in [false, true] {
+    fn prepared_remote_update_commits_or_restores_on_rollback_and_drop() {
+        enum Finish {
+            Commit,
+            Rollback,
+            Drop,
+        }
+        for finish in [Finish::Commit, Finish::Rollback, Finish::Drop] {
             let root = crate::test_support::canonical_tempdir();
             let executable = root.path().join(ATTACHED_BINARY);
             let candidate = root.path().join("candidate");
@@ -689,25 +694,32 @@ mod tests {
                 ),
             );
 
+            let original = fs::read(&executable).unwrap();
             let prepared = prepare_remote_update_at(&executable).unwrap();
             assert_eq!(prepared.candidate_version(), AttachedVersion::new(9, 9, 9));
             assert_eq!(
                 crate::attached_version::query(&executable).unwrap(),
                 AttachedVersion::new(9, 9, 9)
             );
-            if commit {
-                prepared.commit().unwrap();
+            let committed = matches!(finish, Finish::Commit);
+            match finish {
+                Finish::Commit => prepared.commit().unwrap(),
+                Finish::Rollback => prepared.rollback().unwrap(),
+                Finish::Drop => drop(prepared),
+            }
+            if committed {
                 assert_eq!(
-                    crate::attached_version::query(&executable).unwrap(),
-                    AttachedVersion::new(9, 9, 9)
+                    fs::read(&executable).unwrap(),
+                    fs::read(&candidate).unwrap()
                 );
             } else {
-                prepared.rollback().unwrap();
-                assert_eq!(
-                    crate::attached_version::query(&executable).unwrap(),
-                    crate::attached_version::current()
-                );
+                assert_eq!(fs::read(&executable).unwrap(), original);
             }
+            assert_eq!(
+                fs::read_dir(root.path()).unwrap().count(),
+                2,
+                "rollback file leaked"
+            );
         }
     }
 
