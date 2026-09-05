@@ -93,12 +93,14 @@ impl CandidateProcess {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
         command.as_std_mut().process_group(0);
-        let mut child = command.spawn().with_context(|| {
-            format!(
-                "could not start updated Attached candidate {}",
-                executable.display()
-            )
-        })?;
+        let mut child = crate::bounded_process::retry_executable_busy_async(|| command.spawn())
+            .await
+            .with_context(|| {
+                format!(
+                    "could not start updated Attached candidate {}",
+                    executable.display()
+                )
+            })?;
         let input = child
             .stdin
             .take()
