@@ -18,6 +18,10 @@ use reqwest::{
 
 use super::state::AccountCredentials;
 
+#[cfg(test)]
+#[path = "http_tests.rs"]
+mod tests;
+
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ERROR_BODY_BYTES: usize = 4096;
 
