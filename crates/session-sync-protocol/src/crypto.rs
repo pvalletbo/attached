@@ -129,18 +129,21 @@ fn seal_session_access_descriptor_with_nonce(
     record_id: &[u8; 16],
     nonce: [u8; NONCE_LEN],
 ) -> Result<Envelope, SessionAccessError> {
-    let mut ciphertext = encode_session_access_descriptor(descriptor)?;
-    let key = derive_session_access_descriptor_key(account_root_key, account_id)?;
-    let cipher = XChaCha20Poly1305::new((&key).into());
+    let mut ciphertext = Zeroizing::new(encode_session_access_descriptor(descriptor)?);
+    let key = Zeroizing::new(derive_session_access_descriptor_key(
+        account_root_key,
+        account_id,
+    )?);
+    let cipher = XChaCha20Poly1305::new((&*key).into());
     let nonce_value = chacha20poly1305::XNonce::from(nonce);
     cipher
         .encrypt_in_place(
             &nonce_value,
             &envelope_aad(account_id, record_id),
-            &mut ciphertext,
+            &mut *ciphertext,
         )
         .map_err(|_| SessionAccessError::Decryption)?;
-    Envelope::new(nonce, ciphertext)
+    Envelope::new(nonce, std::mem::take(&mut *ciphertext))
 }
 
 pub fn open_session_access_descriptor_cursorless(
@@ -179,8 +182,11 @@ fn open_session_access_descriptor_with_policy(
     if envelope.ciphertext.len() > MAX_CIPHERTEXT_LEN {
         return Err(SessionAccessError::Limit);
     }
-    let key = derive_session_access_descriptor_key(account_root_key, &context.account_id)?;
-    let cipher = XChaCha20Poly1305::new((&key).into());
+    let key = Zeroizing::new(derive_session_access_descriptor_key(
+        account_root_key,
+        &context.account_id,
+    )?);
+    let cipher = XChaCha20Poly1305::new((&*key).into());
     let nonce_value = chacha20poly1305::XNonce::from(envelope.nonce);
     let mut plaintext = Zeroizing::new(envelope.ciphertext.clone());
     cipher
