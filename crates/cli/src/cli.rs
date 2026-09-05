@@ -1,5 +1,5 @@
 use std::{
-    io::{Write as _, stdout},
+    io::{self, stdout},
     path::PathBuf,
 };
 
@@ -303,10 +303,7 @@ impl Cli {
                         eprintln!("Warning: {warning}");
                     }
                     let rendered = session_picker::render_synchronized_list(&refreshed.sessions)?;
-                    stdout()
-                        .lock()
-                        .write_all(rendered.as_bytes())
-                        .context("could not write synchronized session list")?;
+                    write_session_list(&mut stdout().lock(), &rendered)?;
                     Ok(0)
                 }
             },
@@ -436,6 +433,14 @@ fn resolved_state_dir(
     let path = state_dir.unwrap_or_else(|| configuration.config_directory().to_owned());
     secure_state::prepare_private_dir(&path)?;
     Ok(path)
+}
+
+fn write_session_list(output: &mut impl io::Write, rendered: &str) -> Result<()> {
+    match output.write_all(rendered.as_bytes()) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(error).context("could not write synchronized session list"),
+    }
 }
 
 fn write_account_bundle(bundle: &str, output_path: &std::path::Path) -> Result<()> {
@@ -803,6 +808,36 @@ mod tests {
             }),
             "{verbose:?}"
         );
+    }
+
+    #[test]
+    fn session_list_ignores_only_broken_pipes() {
+        struct FailingWriter(io::ErrorKind);
+
+        impl io::Write for FailingWriter {
+            fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(self.0, "synthetic failure"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        assert!(
+            write_session_list(
+                &mut FailingWriter(io::ErrorKind::BrokenPipe),
+                "session list"
+            )
+            .is_ok()
+        );
+        let error = write_session_list(
+            &mut FailingWriter(io::ErrorKind::PermissionDenied),
+            "session list",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("could not write synchronized session list"));
     }
 
     #[test]
