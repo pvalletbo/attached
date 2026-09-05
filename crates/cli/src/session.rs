@@ -25,11 +25,17 @@ const DEFAULT_SESSION_BOOTSTRAP_LOCK: &str = "herdr-bootstrap.lock";
 pub struct Session {
     name: String,
     tui_socket: PathBuf,
+    api_socket: PathBuf,
 }
 
 impl Session {
     pub fn new(name: String, tui_socket: PathBuf) -> Self {
-        Self { name, tui_socket }
+        let api_socket = tui_socket.with_file_name("herdr.sock");
+        Self {
+            name,
+            tui_socket,
+            api_socket,
+        }
     }
 
     pub fn name(&self) -> &str {
@@ -45,6 +51,25 @@ impl Session {
             format!("Herdr session `{}` cannot accept a TUI stream", self.name())
         })?;
         Ok(&self.tui_socket)
+    }
+
+    pub fn validated_api_socket(&self) -> Result<&Path> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(&self.api_socket)
+            .context("Herdr API socket is unavailable")?;
+        ensure!(
+            metadata.file_type().is_socket(),
+            "Herdr API path is not a Unix socket"
+        );
+        ensure!(
+            metadata.uid() == rustix::process::geteuid().as_raw(),
+            "Herdr API socket has a different owner"
+        );
+        ensure!(
+            metadata.mode() & 0o077 == 0,
+            "Herdr API socket must be owner-only"
+        );
+        Ok(&self.api_socket)
     }
 
     #[tracing::instrument(name = "attach_local_session", level = "debug", skip_all)]
@@ -80,6 +105,8 @@ struct HerdrSession {
     name: String,
     running: bool,
     session_dir: PathBuf,
+    #[serde(default)]
+    socket_path: Option<PathBuf>,
 }
 
 fn sessions_from_json(output: &[u8]) -> Result<Vec<Session>> {
@@ -89,7 +116,14 @@ fn sessions_from_json(output: &[u8]) -> Result<Vec<Session>> {
         .sessions
         .into_iter()
         .filter(|session| session.running)
-        .map(|session| Session::new(session.name, session.session_dir.join("herdr-client.sock")))
+        .map(|session| {
+            let mut discovered =
+                Session::new(session.name, session.session_dir.join("herdr-client.sock"));
+            if let Some(path) = session.socket_path {
+                discovered.api_socket = path;
+            }
+            discovered
+        })
         .collect())
 }
 
@@ -352,6 +386,27 @@ mod tests {
         process::Child as TestChild,
         time::{Duration, Instant},
     };
+
+    #[test]
+    fn notification_api_socket_uses_discovery_and_rejects_unsafe_paths() {
+        use std::os::unix::net::UnixListener;
+        let root = crate::test_support::canonical_tempdir();
+        let api = root.path().join("custom-api.sock");
+        let _socket = UnixListener::bind(&api).unwrap();
+        fs::set_permissions(&api, fs::Permissions::from_mode(0o600)).unwrap();
+        let sessions = sessions_from_json(&serde_json::to_vec(&serde_json::json!({
+            "sessions":[{"name":"test", "running":true, "session_dir":root.path(), "socket_path":api}]
+        })).unwrap()).unwrap();
+        assert_eq!(sessions[0].validated_api_socket().unwrap(), api);
+        fs::set_permissions(&api, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(sessions[0].validated_api_socket().is_err());
+        fs::remove_file(&api).unwrap();
+        fs::write(&api, "not a socket").unwrap();
+        assert!(sessions[0].validated_api_socket().is_err());
+        fs::remove_file(&api).unwrap();
+        std::os::unix::fs::symlink(root.path().join("elsewhere"), &api).unwrap();
+        assert!(sessions[0].validated_api_socket().is_err());
+    }
 
     fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
         let process = PathBuf::from(format!("/proc/{pid}"));

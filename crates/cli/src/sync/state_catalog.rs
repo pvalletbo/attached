@@ -46,8 +46,8 @@ pub(super) struct SessionListing {
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct SyncedAttachment {
-    pub(super) record_id: RecordId,
-    pub(super) service_revision: u64,
+    pub(crate) record_id: RecordId,
+    pub(crate) service_revision: u64,
     pub endpoint_ticket: String,
     pub endpoint_identity: [u8; 32],
     pub attach_capability: [u8; 32],

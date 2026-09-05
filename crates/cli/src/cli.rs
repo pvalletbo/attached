@@ -78,6 +78,12 @@ enum Command {
         command: SessionsCommand,
     },
 
+    /// Watch remote agent activity without opening an interactive Herdr client.
+    Notifications {
+        #[command(subcommand)]
+        command: NotificationsCommand,
+    },
+
     /// Select and attach to a local or synchronized Herdr session.
     Attach {
         /// Synchronized `HOST/SESSION`; omit to choose local or synchronized with fzf.
@@ -145,6 +151,50 @@ enum SessionsCommand {
         herdr_bin: PathBuf,
 
         /// Override persistent state location (primarily for testing).
+        #[arg(long, hide = true)]
+        state_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum NotificationsCommand {
+    /// Keep passive event tunnels to all synchronized remote sessions.
+    ///
+    /// Experimental; requires event-capable Attached on both ends. Official Herdr
+    /// 0.8.2 JSON API is supported without modification. Finished and needs-attention
+    /// transitions create notifications; existing idle/blocked state is not replayed.
+    /// Sessions refresh every 30 seconds; pane discovery every 5 seconds. Offline
+    /// events are not replayed. Same-state-directory interactive attachments suppress
+    /// notifications (other machines/SSH clients are not detected).
+    ///
+    /// Linux uses native D-Bus notifications and needs a graphical session with
+    /// a notification daemon supporting actions. macOS needs terminal-notifier
+    /// (`brew install terminal-notifier`) with notifications allowed in System Settings.
+    /// Clicks open attached attach in a new terminal; macOS uses Terminal.app.
+    /// Keep the watcher running for Linux click actions. Notices replace the previous
+    /// notice for that session. Limits: 128 sessions per watcher, 64 event connections
+    /// per serving host, and 256 panes per session. New panes and subscription changes
+    /// have a discovery window; this is a live best-effort feed, not a durable queue.
+    Watch {
+        #[arg(long, default_value = "herdr")]
+        herdr_bin: PathBuf,
+        /// Linux terminal executable supporting -e PROGRAM ARGS; auto-detected by default.
+        #[arg(long, conflicts_with = "print")]
+        terminal: Option<PathBuf>,
+        /// Print live notification JSON instead of posting OS notifications (headless diagnostics).
+        #[arg(long)]
+        print: bool,
+        #[arg(long, hide = true)]
+        state_dir: Option<PathBuf>,
+    },
+    /// Internal notification click callback; never contains account secrets.
+    #[command(hide = true)]
+    Open {
+        target: String,
+        #[arg(long, default_value = "herdr")]
+        herdr_bin: PathBuf,
+        #[arg(long)]
+        terminal: Option<PathBuf>,
         #[arg(long, hide = true)]
         state_dir: Option<PathBuf>,
     },
@@ -329,6 +379,46 @@ impl Cli {
                     Ok(0)
                 }
             },
+            Command::Notifications { command } => {
+                let one_password = self.use_1password
+                    || configuration.password_source() == PasswordSource::OnePassword;
+                match command {
+                    NotificationsCommand::Watch {
+                        herdr_bin,
+                        terminal,
+                        print,
+                        state_dir,
+                    } => {
+                        let state_dir = resolved_state_dir(state_dir, &configuration)?;
+                        crate::notifications::watch(
+                            state_dir,
+                            herdr_bin,
+                            terminal,
+                            one_password,
+                            print,
+                        )
+                        .await?;
+                    }
+                    NotificationsCommand::Open {
+                        target,
+                        herdr_bin,
+                        terminal,
+                        state_dir,
+                    } => {
+                        let state_dir = resolved_state_dir(state_dir, &configuration)?;
+                        crate::notifications::desktop::Launch {
+                            attached: std::env::current_exe()?,
+                            state_dir,
+                            herdr_bin,
+                            terminal,
+                            one_password,
+                        }
+                        .open(&target)
+                        .await?;
+                    }
+                }
+                Ok(0)
+            }
             Command::Attach {
                 target,
                 herdr_bin,
@@ -573,6 +663,54 @@ mod tests {
         for removed in ["connect", "remote", "session", "admin", "sync"] {
             assert!(Cli::try_parse_from(["attached", removed]).is_err());
         }
+    }
+
+    #[test]
+    fn notification_watcher_cli_and_click_callback_are_explicit() {
+        for args in [
+            vec!["attached", "notifications", "watch"],
+            vec!["attached", "notifications", "watch", "--print"],
+            vec![
+                "attached",
+                "notifications",
+                "watch",
+                "--terminal",
+                "/usr/bin/kitty",
+            ],
+            vec![
+                "attached",
+                "notifications",
+                "open",
+                "--use-1password",
+                "--",
+                "office/work",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok());
+        }
+        assert!(Cli::try_parse_from(["attached", "notifications"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "attached",
+                "notifications",
+                "watch",
+                "--print",
+                "--terminal",
+                "kitty"
+            ])
+            .is_err()
+        );
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("notifications")
+            .unwrap()
+            .find_subcommand_mut("watch")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("terminal-notifier"));
+        assert!(help.contains("D-Bus"));
+        assert!(help.contains("not replayed"));
     }
 
     #[test]

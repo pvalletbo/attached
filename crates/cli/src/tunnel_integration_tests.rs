@@ -212,20 +212,36 @@ async fn attached_update_endpoint(
     identity: iroh::SecretKey,
     bind_addr: Option<std::net::SocketAddr>,
 ) -> Endpoint {
-    Endpoint::builder(presets::N0)
-        .secret_key(identity)
-        .clear_ip_transports()
-        .bind_addr_with_opts(
-            bind_addr.unwrap_or_else(|| (Ipv4Addr::LOCALHOST, 0).into()),
-            BindOpts::default().set_prefix_len(8),
-        )
-        .unwrap()
-        .relay_mode(RelayMode::Disabled)
-        .clear_address_lookup()
-        .alpns(vec![ATTACHED_UPDATE_ALPN.to_vec()])
-        .bind()
-        .await
-        .unwrap()
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let result = Endpoint::builder(presets::N0)
+            .secret_key(identity.clone())
+            .clear_ip_transports()
+            .bind_addr_with_opts(
+                bind_addr.unwrap_or_else(|| (Ipv4Addr::LOCALHOST, 0).into()),
+                BindOpts::default().set_prefix_len(8),
+            )
+            .unwrap()
+            .relay_mode(RelayMode::Disabled)
+            .clear_address_lookup()
+            .alpns(vec![ATTACHED_UPDATE_ALPN.to_vec()])
+            .bind()
+            .await;
+        match result {
+            Ok(endpoint) => return endpoint,
+            // Parallel subprocess tests can briefly inherit a CLOEXEC UDP socket
+            // between fork and exec. Closing its owning endpoint is not a barrier
+            // for those inherited descriptors. Retry only this fixed-port rebind.
+            Err(iroh::endpoint::BindError::Sockets { ref source, .. })
+                if bind_addr.is_some()
+                    && source.kind() == io::ErrorKind::AddrInUse
+                    && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => panic!("could not bind test update endpoint: {error:#}"),
+        }
+    }
 }
 
 async fn upgrade_endpoint(identity: iroh::SecretKey) -> Endpoint {
