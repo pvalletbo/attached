@@ -12,9 +12,9 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use attached_session_sync_protocol::account::AuthorizedConsumerIdentity;
 use attached_tunnel_protocol::{
     ATTACHED_UPDATE_ALPN, AttachedUpdateRequest, AttachedUpdateResponse, AttachedVersion,
-    CapabilitySecret, HerdrVersion, TUNNEL_ALPN, UPGRADE_ALPN, UpdateOperationId, UpgradeResponse,
-    read_attached_update_request, read_upgrade_request, write_attached_update_response,
-    write_upgrade_response,
+    CapabilitySecret, EVENTS_ALPN, HerdrVersion, TUNNEL_ALPN, UPGRADE_ALPN, UpdateOperationId,
+    UpgradeResponse, read_attached_update_request, read_upgrade_request,
+    write_attached_update_response, write_upgrade_response,
 };
 use iroh::{
     Endpoint,
@@ -83,9 +83,26 @@ impl EndpointHooks for ConsumerIdentityAuthorization {
         &self,
         connection: &iroh::endpoint::Connection,
     ) -> AfterHandshakeOutcome {
-        // Iroh exposes the authenticated peer key after TLS, but rejecting from this hook keeps
-        // the connection from reaching application dispatch or opening a tunnel stream.
-        let outcome = self.authorize(connection.remote_id().as_bytes());
+        // The event watcher uses a separate transport key to avoid displacing an
+        // interactive client's relay connection. It must prove the same authorized
+        // consumer key on a TLS-bound proof stream before reaching application
+        // dispatch. All other ALPNs still require that key as the TLS identity.
+        let outcome = if connection.alpn() == EVENTS_ALPN {
+            match crate::notifications::transport::authorize_identity(
+                connection,
+                self.authorized_identity.as_bytes(),
+            )
+            .await
+            {
+                Ok(()) => AfterHandshakeOutcome::Accept,
+                Err(_) => AfterHandshakeOutcome::Reject {
+                    error_code: UNAUTHORIZED_IDENTITY_ERROR_CODE.into(),
+                    reason: UNAUTHORIZED_IDENTITY_REASON.to_vec(),
+                },
+            }
+        } else {
+            self.authorize(connection.remote_id().as_bytes())
+        };
         if matches!(outcome, AfterHandshakeOutcome::Reject { .. }) {
             warn!(
                 category = "authorization",
@@ -96,6 +113,10 @@ impl EndpointHooks for ConsumerIdentityAuthorization {
         outcome
     }
 }
+
+#[cfg(test)]
+#[path = "notifications/identity_tests.rs"]
+mod event_identity_tests;
 
 #[cfg(test)]
 async fn run_registered_lifecycle<Lifecycle, LifecycleFuture>(
@@ -315,6 +336,7 @@ async fn bind_server_endpoint(
         .secret_key(key.clone())
         .alpns(vec![
             TUNNEL_ALPN.to_vec(),
+            EVENTS_ALPN.to_vec(),
             UPGRADE_ALPN.to_vec(),
             ATTACHED_UPDATE_ALPN.to_vec(),
         ])
@@ -1039,6 +1061,8 @@ async fn serve_endpoint(
 ) -> Result<EndpointOutcome> {
     let pending = Arc::new(Semaphore::new(MAX_PENDING_CONNECTIONS));
     let authenticated = Arc::new(Semaphore::new(MAX_AUTHENTICATED_CONNECTIONS));
+    // Long-lived watchers cannot consume interactive attachment capacity.
+    let event_connections = Arc::new(Semaphore::new(64));
     let cancellation = CancellationToken::new();
     let mut connections = JoinSet::new();
     let shutdown = tokio::signal::ctrl_c();
@@ -1072,6 +1096,7 @@ async fn serve_endpoint(
                 let herdr_bin = herdr_bin.clone();
                 let capability = capability.clone();
                 let authenticated = authenticated.clone();
+                let event_connections = event_connections.clone();
                 let updater = update_resources.update_limit.clone();
                 let version = version.clone();
                 let child_cancellation = cancellation.child_token();
@@ -1100,6 +1125,17 @@ async fn serve_endpoint(
                                 updater,
                             )
                             .await;
+                        }
+                        if connection.alpn() == EVENTS_ALPN {
+                            let advertised_version = *version.borrow();
+                            return crate::notifications::transport::serve(
+                                connection, &capability, advertised_version, child_cancellation,
+                                move |name| resolve_session(herdr_bin, name),
+                                move || {
+                                    drop(pending_permit);
+                                    event_connections.try_acquire_owned().context("event connection capacity exhausted")
+                                },
+                            ).await;
                         }
                         if connection.alpn() != TUNNEL_ALPN {
                             bail!("unsupported tunnel protocol");
