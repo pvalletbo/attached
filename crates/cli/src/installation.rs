@@ -319,7 +319,7 @@ impl UninstallPlan {
 
         local_encryption::with_key_coordination(|| {
             for directory in &self.data_directories {
-                remove_path_if_present(directory).with_context(|| {
+                remove_owned_state(directory).with_context(|| {
                     format!(
                         "could not delete Attached credentials and state from {}",
                         directory.display()
@@ -327,7 +327,7 @@ impl UninstallPlan {
                 })?;
             }
             for file in &self.installer_files {
-                remove_path_if_present(file).with_context(|| {
+                remove_installer_file(file).with_context(|| {
                     format!(
                         "could not delete installer metadata from {}",
                         file.display()
@@ -404,17 +404,89 @@ fn ensure_install_directory_is_writable(executable: &Path) -> Result<()> {
     Ok(())
 }
 
-fn remove_path_if_present(path: &Path) -> Result<()> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
+// Exact names only: neither a directory name nor an installer receipt proves
+// ownership of other contents. Unknown files (including abandoned temporaries)
+// and directories are deliberately retained for manual inspection.
+const OWNED_STATE_FILES: &[&str] = &[
+    "admin-identity.key",
+    "sync-account.bundle",
+    "sync-account.lock",
+    "sync-catalog.json",
+    "sync-catalog.lock",
+    "encryption-salt.argon2id-v1",
+    "one-password-item.json",
+    "config.toml",
+    "attached-receipt.json",
+];
 
-    if metadata.file_type().is_dir() {
-        fs::remove_dir_all(path)?;
-    } else {
-        fs::remove_file(path)?;
+fn open_cleanup_directory(path: &Path) -> Result<Option<fs::File>> {
+    use rustix::fs::{Mode, OFlags};
+    use std::path::Component;
+
+    ensure!(path.is_absolute(), "cleanup directory must be absolute");
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut directory = fs::File::from(rustix::fs::open("/", flags, Mode::empty())?);
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => {
+                match rustix::fs::openat(&directory, name, flags, Mode::empty()) {
+                    Ok(next) => directory = next.into(),
+                    Err(rustix::io::Errno::NOENT) => return Ok(None),
+                    Err(error) => return Err(error).context("refusing unsafe cleanup traversal"),
+                }
+            }
+            _ => anyhow::bail!("cleanup path must not contain parent components"),
+        }
+    }
+    Ok(Some(directory))
+}
+
+fn unlink_cleanup_file(directory: &fs::File, name: &std::ffi::OsStr) -> Result<()> {
+    // unlinkat without REMOVEDIR cannot recurse or follow the final symlink,
+    // even if another process substitutes an entry after we open the directory.
+    match rustix::fs::unlinkat(directory, name, rustix::fs::AtFlags::empty()) {
+        Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("could not remove {}", name.display())),
+    }
+}
+
+fn remove_owned_state(path: &Path) -> Result<()> {
+    use rustix::fs::{AtFlags, FileType};
+    let parent = path.parent().context("cleanup path has no parent")?;
+    let name = path.file_name().context("cleanup path has no file name")?;
+    let Some(parent) = open_cleanup_directory(parent)? else {
+        return Ok(());
+    };
+    match rustix::fs::statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::Symlink => {
+            return unlink_cleanup_file(&parent, name);
+        }
+        Ok(_) => {}
+        Err(rustix::io::Errno::NOENT) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    let directory = rustix::fs::openat(
+        &parent,
+        name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map(fs::File::from)?;
+    for name in OWNED_STATE_FILES {
+        unlink_cleanup_file(&directory, std::ffi::OsStr::new(name))?;
+    }
+    Ok(())
+}
+
+fn remove_installer_file(path: &Path) -> Result<()> {
+    let parent = path.parent().context("installer file has no parent")?;
+    let name = path.file_name().context("installer file has no name")?;
+    if let Some(directory) = open_cleanup_directory(parent)? {
+        unlink_cleanup_file(&directory, name)?;
     }
     Ok(())
 }
@@ -430,8 +502,17 @@ fn confirm_uninstall(
     )?;
     writeln!(output, "  binary: {}", plan.executable.display())?;
     for directory in &plan.data_directories {
-        writeln!(output, "  data:   {}", directory.display())?;
+        writeln!(output, "  managed files in: {}", directory.display())?;
     }
+    writeln!(
+        output,
+        "Only these state filenames are removed: {}.",
+        OWNED_STATE_FILES.join(", ")
+    )?;
+    writeln!(
+        output,
+        "Directories and all other contents are preserved; inspect any leftovers manually."
+    )?;
     writeln!(
         output,
         "Any 1Password-managed encryption password is preserved because other computers and custom state directories cannot be discovered."
@@ -666,7 +747,9 @@ mod tests {
         fs::create_dir_all(&state).unwrap();
         fs::create_dir_all(&xdg_state).unwrap();
         fs::create_dir_all(fish_configuration.parent().unwrap()).unwrap();
-        fs::write(state.join("sync-account.json"), b"credential").unwrap();
+        for name in OWNED_STATE_FILES {
+            fs::write(state.join(name), b"synthetic state").unwrap();
+        }
         fs::write(xdg_state.join("attached-receipt.json"), b"receipt").unwrap();
         fs::write(&fish_configuration, b"installer path setup").unwrap();
 
@@ -684,10 +767,33 @@ mod tests {
         plan.execute_with_store(&store).unwrap();
 
         assert!(!executable.exists());
-        assert!(!state.exists());
-        assert!(!xdg_state.exists());
+        assert_eq!(fs::read_dir(&state).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&xdg_state).unwrap().count(), 0);
         assert!(!fish_configuration.exists());
         assert_eq!(*store.remove_calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn uninstall_preserves_unrelated_custom_directory_contents() {
+        let root = crate::test_support::canonical_tempdir();
+        let state = root.path().join("shared");
+        fs::create_dir(&state).unwrap();
+        fs::write(state.join("sync-account.bundle"), b"synthetic credential").unwrap();
+        fs::write(state.join("sentinel"), b"unrelated").unwrap();
+        fs::create_dir(state.join("unrelated-directory")).unwrap();
+        fs::write(state.join("unrelated-directory/keep"), b"keep").unwrap();
+        let plan = UninstallPlan {
+            executable: executable(root.path()),
+            data_directories: vec![state.clone()],
+            installer_files: Vec::new(),
+        };
+        plan.execute_with_store(&RemovalStore::default()).unwrap();
+        assert_eq!(fs::read(state.join("sentinel")).unwrap(), b"unrelated");
+        assert_eq!(
+            fs::read(state.join("unrelated-directory/keep")).unwrap(),
+            b"keep"
+        );
+        assert!(!state.join("sync-account.bundle").exists());
     }
 
     #[test]
@@ -721,7 +827,7 @@ mod tests {
         let executable = executable(root.path());
         let state = root.path().join("state");
         fs::create_dir(&state).unwrap();
-        fs::write(state.join("ciphertext"), b"encrypted").unwrap();
+        fs::write(state.join("sync-account.bundle"), b"encrypted").unwrap();
         let plan = UninstallPlan {
             executable: executable.clone(),
             data_directories: vec![state.clone()],
@@ -733,7 +839,7 @@ mod tests {
         };
 
         plan.execute_with_store(&store).unwrap();
-        assert!(!state.exists());
+        assert!(!state.join("sync-account.bundle").exists());
         assert!(!executable.exists());
         assert_eq!(*store.remove_calls.lock().unwrap(), 0);
     }
@@ -758,6 +864,35 @@ mod tests {
         assert!(!executable.exists());
         assert!(!linked_state.exists());
         assert_eq!(fs::read(external.join("keep")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn uninstall_unlinks_owned_symlinks_without_touching_targets() {
+        let root = crate::test_support::canonical_tempdir();
+        let state = root.path().join("state");
+        fs::create_dir(&state).unwrap();
+        let external = root.path().join("keep");
+        fs::write(&external, b"keep").unwrap();
+        symlink(&external, state.join("sync-account.bundle")).unwrap();
+        remove_owned_state(&state).unwrap();
+        assert!(!state.join("sync-account.bundle").is_symlink());
+        assert_eq!(fs::read(external).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn uninstall_rejects_symlinked_ancestors_and_directory_shaped_files() {
+        let root = crate::test_support::canonical_tempdir();
+        let state = root.path().join("state");
+        fs::create_dir_all(state.join("sync-account.bundle")).unwrap();
+        fs::write(state.join("sync-account.bundle/keep"), b"keep").unwrap();
+        symlink(root.path(), root.path().join("linked")).unwrap();
+        assert!(remove_owned_state(&root.path().join("linked/state")).is_err());
+        assert!(remove_owned_state(&state).is_err());
+        assert!(remove_installer_file(&state.join("sync-account.bundle")).is_err());
+        assert_eq!(
+            fs::read(state.join("sync-account.bundle/keep")).unwrap(),
+            b"keep"
+        );
     }
 
     #[test]
