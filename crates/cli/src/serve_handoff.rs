@@ -187,20 +187,30 @@ impl CandidateProcess {
                 .context("could not listen for termination while supervising updated Attached")?;
         let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
             .context("could not listen for terminal closure while supervising updated Attached")?;
-        let signal = tokio::select! {
-            status = self.child.wait() => {
-                self.terminate_on_drop = self.child.id().is_some();
-                return status.context("could not wait for updated Attached");
+        let interrupt = tokio::signal::ctrl_c();
+        tokio::pin!(interrupt);
+        loop {
+            let signal = tokio::select! {
+                status = self.child.wait() => {
+                    self.terminate_on_drop = self.child.id().is_some();
+                    return status.context("could not wait for updated Attached");
+                }
+                result = &mut interrupt => {
+                    result.context("could not listen for interruption while supervising updated Attached")?;
+                    Signal::INT
+                }
+                _ = terminate.recv() => Signal::TERM,
+                _ = hangup.recv() => Signal::HUP,
+            };
+            if let Some(id) = self.child.id() {
+                signal_process_group(id, signal);
             }
-            result = tokio::signal::ctrl_c() => {
-                result.context("could not listen for interruption while supervising updated Attached")?;
-                Signal::INT
+            // A server launched through `nohup` inherits an ignored SIGHUP disposition. Forward
+            // the signal, but do not turn an intentionally ignored hangup into SIGKILL after the
+            // grace period; keep supervising until the child exits or receives INT/TERM.
+            if shutdown_requires_exit(signal) {
+                break;
             }
-            _ = terminate.recv() => Signal::TERM,
-            _ = hangup.recv() => Signal::HUP,
-        };
-        if let Some(id) = self.child.id() {
-            signal_process_group(id, signal);
         }
         let status = match timeout(CANDIDATE_EXIT_GRACE, self.child.wait()).await {
             Ok(status) => status.context("could not wait for updated Attached after signalling it"),
@@ -229,6 +239,10 @@ impl Drop for CandidateProcess {
             let _ = self.child.start_kill();
         }
     }
+}
+
+fn shutdown_requires_exit(signal: Signal) -> bool {
+    signal != Signal::HUP
 }
 
 fn signal_process_group(child_id: u32, signal: Signal) {
@@ -418,6 +432,13 @@ mod tests {
             CandidateEvent::ClientSucceeded
         );
         assert!(candidate.supervise().await.unwrap().success());
+    }
+
+    #[test]
+    fn ignored_hangups_are_not_escalated_to_forced_shutdown() {
+        assert!(!shutdown_requires_exit(Signal::HUP));
+        assert!(shutdown_requires_exit(Signal::INT));
+        assert!(shutdown_requires_exit(Signal::TERM));
     }
 
     #[tokio::test]
