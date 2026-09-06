@@ -58,7 +58,7 @@ test("local test script replaces the binary without a backup and reloads the plu
     CARGO_TARGET_DIR: target,
     ATTACHED_LOCAL_BIN_DIR: localBin,
     ATTACHED_TEST_LOG: log,
-    PATH: `${bin}:${process.env.PATH}`
+    PATH: `${bin}:${localBin}:${process.env.PATH}`
   };
 
   const debug = run([], env);

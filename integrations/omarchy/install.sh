@@ -37,6 +37,15 @@ for command in omarchy omarchy-shell; do
   }
 done
 
+attached_missing=false
+if ! command -v attached >/dev/null 2>&1; then
+  attached_missing=true
+  command -v curl >/dev/null 2>&1 || {
+    printf 'Attached is not installed and curl is unavailable.\n' >&2
+    exit 1
+  }
+fi
+
 # Omarchy's validator checks the manifest, entry point, namespace and symlinks
 # before any user configuration is changed.
 omarchy plugin validate "$source_dir"
@@ -172,6 +181,21 @@ fi
 if [[ -e "$plugin_config" && ! -f "$plugin_config" ]]; then
   printf 'Refusing to replace a non-regular plugin configuration: %s\n' "$plugin_config" >&2
   exit 1
+fi
+
+# Install the CLI only after every plugin refusal check has passed. A successful
+# CLI installation is intentionally retained if a later shell reload fails.
+if [[ $attached_missing == true ]]; then
+  printf 'Attached is not installed; installing it from https://install.attached.sh...\n'
+  if ! curl --proto '=https' --tlsv1.2 -LsSf https://install.attached.sh | sh; then
+    printf 'Could not install Attached from https://install.attached.sh.\n' >&2
+    exit 1
+  fi
+  hash -r
+  if ! command -v attached >/dev/null 2>&1; then
+    printf 'Attached was installed but is not available on PATH. Add its bin directory to PATH and retry.\n' >&2
+    exit 1
+  fi
 fi
 
 # Snapshot both managed paths before the first write. Any copy, rescan, or

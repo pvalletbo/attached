@@ -16,6 +16,105 @@ function runInstaller(env) {
   });
 }
 
+test("installer bootstraps a missing Attached CLI after preflight", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "attached-omarchy-bootstrap-"));
+  const home = path.join(root, "home");
+  const bin = path.join(root, "bin");
+  const localBin = path.join(home, ".local", "bin");
+  const log = path.join(root, "commands.log");
+  const destination = path.join(
+    home,
+    ".config",
+    "omarchy",
+    "plugins",
+    "pvalletbo.attached"
+  );
+  const bindingsPath = path.join(home, ".config", "hypr", "bindings.lua");
+  fs.mkdirSync(bin, { recursive: true });
+
+  for (const command of ["omarchy", "omarchy-shell"]) {
+    fs.writeFileSync(
+      path.join(bin, command),
+      `#!/bin/sh\nprintf '${command} %s\\n' "$*" >> "$ATTACHED_TEST_LOG"\n`,
+      { mode: 0o755 }
+    );
+  }
+  fs.writeFileSync(
+    path.join(bin, "curl"),
+    [
+      "#!/bin/sh",
+      "printf 'curl %s\\n' \"$*\" >> \"$ATTACHED_TEST_LOG\"",
+      "if [ \"${ATTACHED_TEST_CURL_FAIL:-}\" = true ]; then exit 22; fi",
+      "cat <<'INSTALLER'",
+      "#!/bin/sh",
+      "set -eu",
+      "install -d -m 0755 \"$HOME/.local/bin\"",
+      "cat > \"$HOME/.local/bin/attached\" <<'ATTACHED'",
+      "#!/bin/sh",
+      "printf 'attached test binary\\n'",
+      "ATTACHED",
+      "chmod 0755 \"$HOME/.local/bin/attached\"",
+      "INSTALLER",
+      ""
+    ].join("\n"),
+    { mode: 0o755 }
+  );
+
+  const env = {
+    ...process.env,
+    HOME: home,
+    XDG_CONFIG_HOME: path.join(root, "xdg-config"),
+    PATH: `${bin}:${localBin}:/usr/bin`,
+    ATTACHED_TEST_LOG: log
+  };
+
+  fs.mkdirSync(path.dirname(bindingsPath), { recursive: true });
+  fs.writeFileSync(bindingsPath, "-- BEGIN Attached session picker\n");
+  const rejected = runInstaller(env);
+  assert.notEqual(rejected.status, 0);
+  assert.match(rejected.stderr, /partial or duplicate managed shortcut block/);
+  assert.doesNotMatch(fs.readFileSync(log, "utf8"), /^curl /m);
+  assert.equal(fs.existsSync(localBin), false);
+  fs.unlinkSync(bindingsPath);
+
+  const failed = runInstaller({ ...env, ATTACHED_TEST_CURL_FAIL: "true" });
+  assert.notEqual(failed.status, 0);
+  assert.match(failed.stderr, /Could not install Attached/);
+  assert.equal(fs.existsSync(localBin), false);
+  assert.equal(fs.existsSync(destination), false);
+  assert.equal(fs.existsSync(bindingsPath), false);
+
+  const installed = runInstaller(env);
+  assert.equal(installed.status, 0, installed.stderr);
+  assert.match(installed.stdout, /Attached is not installed; installing it/);
+  assert.ok(fs.statSync(path.join(localBin, "attached")).isFile());
+  assert.equal(fs.statSync(path.join(localBin, "attached")).mode & 0o777, 0o755);
+  assert.ok(fs.statSync(path.join(destination, "Overlay.qml")).isFile());
+
+  const bootstrapCommands = fs.readFileSync(log, "utf8");
+  assert.ok(
+    bootstrapCommands.lastIndexOf("omarchy plugin validate")
+      < bootstrapCommands.lastIndexOf("curl "),
+    "plugin preflight must finish before downloading Attached"
+  );
+  assert.ok(
+    bootstrapCommands.lastIndexOf("curl ")
+      < bootstrapCommands.lastIndexOf("omarchy-shell shell rescanPlugins"),
+    "Attached must be available before plugin activation"
+  );
+
+  const reinstalled = runInstaller(env);
+  assert.equal(reinstalled.status, 0, reinstalled.stderr);
+  assert.doesNotMatch(reinstalled.stdout, /installing it from/);
+
+  const commands = fs.readFileSync(log, "utf8");
+  assert.equal((commands.match(/^curl /gm) || []).length, 2);
+  assert.match(
+    commands,
+    /curl --proto =https --tlsv1\.2 -LsSf https:\/\/install\.attached\.sh/
+  );
+});
+
 test("installer is idempotent and refuses every destructive or partial write", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "attached-omarchy-install-"));
   const home = path.join(root, "home");
@@ -34,7 +133,7 @@ test("installer is idempotent and refuses every destructive or partial write", (
   fs.mkdirSync(path.dirname(bindingsPath), { recursive: true });
   fs.mkdirSync(bin, { recursive: true });
 
-  for (const command of ["omarchy", "omarchy-shell"]) {
+  for (const command of ["omarchy", "omarchy-shell", "attached"]) {
     fs.writeFileSync(
       path.join(bin, command),
       `#!/bin/sh\ninvocation="${command} $*"\nprintf '%s\\n' "$invocation" >> "$ATTACHED_TEST_LOG"\nif [ "$ATTACHED_TEST_FAIL_COMMAND" = "$invocation" ]; then exit 42; fi\n`,
