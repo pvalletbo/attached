@@ -118,10 +118,9 @@ mod tests {
             "{error}"
         );
         assert!(
-            matches!(
-                listener.try_accept(),
-                Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock
-            ),
+            tokio::time::timeout(std::time::Duration::from_millis(20), listener.accept())
+                .await
+                .is_err(),
             "the synchronization service received a connection before local encryption was ready"
         );
         assert!(!state_dir.join("sync-account.bundle").exists());
