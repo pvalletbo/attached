@@ -41,7 +41,8 @@ async fn create_with_store(
 }
 
 fn prepare_encrypted_account_storage(state_dir: &Path, store: &dyn MasterKeyStore) -> Result<()> {
-    let directory = StateDir::open(state_dir).context("could not open synchronization account state")?;
+    let directory =
+        StateDir::open(state_dir).context("could not open synchronization account state")?;
     with_master_key_store(&directory, store, true, |_| Ok(()))
         .context("could not prepare encrypted synchronization account storage")
 }
