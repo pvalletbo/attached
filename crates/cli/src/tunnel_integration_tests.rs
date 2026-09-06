@@ -186,7 +186,9 @@ impl Harness {
 
     async fn close(self) {
         self.connection.close(0_u32.into(), b"test complete");
-        let _ = within(self.server).await;
+        let _ = within(self.server)
+            .await
+            .expect("tunnel server task panicked");
         self.client_endpoint.close().await;
         self.server_endpoint.close().await;
     }
@@ -683,8 +685,65 @@ async fn abrupt_local_and_iroh_closures_do_not_poison_later_streams() {
             .server_connection
             .close(7_u32.into(), b"abrupt server test close");
         harness.connection.closed().await;
-        harness.client_endpoint.close().await;
-        harness.server_endpoint.close().await;
+        harness.close().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn backpressured_bulk_stream_does_not_starve_interactive_stream_and_drop_unblocks_writer() {
+    within(async {
+        let harness = Harness::authenticated().await;
+        let (_bulk_send, _bulk_receive) = harness.open().await;
+        let mut bulk_upstream = accept(&harness.tui).await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        // JoinSet aborts the writer even if an assertion below fails.
+        let mut writers = JoinSet::new();
+        writers.spawn(async move {
+            let chunk = [0x42; 64 * 1024];
+            bulk_upstream.write_all(&chunk).await?;
+            started_tx.send(()).unwrap();
+            for _ in 0..1024 {
+                bulk_upstream.write_all(&chunk).await?;
+            }
+            io::Result::Ok(())
+        });
+        started_rx.await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(100), writers.join_next())
+                .await
+                .is_err(),
+            "an unread stream buffered the entire 64 MiB transfer"
+        );
+
+        // A separate stream on the SAME connection must still make progress.
+        // This is a starvation/deadlock guard, not a machine-speed benchmark.
+        timeout(Duration::from_secs(10), async {
+            let (mut send, mut receive) = harness.open().await;
+            let mut upstream = accept(&harness.tui).await;
+            for sequence in 0..16_u8 {
+                send.write_all(&[sequence]).await.unwrap();
+                let mut request = [0];
+                upstream.read_exact(&mut request).await.unwrap();
+                assert_eq!(request, [sequence]);
+                upstream.write_all(&[sequence + 1]).await.unwrap();
+                let mut response = [0];
+                receive.read_exact(&mut response).await.unwrap();
+                assert_eq!(response, [sequence + 1]);
+            }
+        })
+        .await
+        .expect("bulk backpressure starved interactive traffic");
+
+        harness
+            .server_connection
+            .close(19_u32.into(), b"drop during backpressure");
+        let error = writers.join_next().await.unwrap().unwrap().unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+        ));
+        harness.close().await;
     })
     .await;
 }
