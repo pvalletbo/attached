@@ -99,6 +99,10 @@ enum Command {
         #[arg(long)]
         upgrade_remote: bool,
 
+        /// Fetch synchronized sessions now instead of using the five-minute discovery cache.
+        #[arg(long)]
+        no_cache: bool,
+
         /// Override persistent state location (primarily for testing).
         #[arg(long, hide = true)]
         state_dir: Option<PathBuf>,
@@ -333,6 +337,7 @@ impl Cli {
                 target,
                 herdr_bin,
                 upgrade_remote,
+                no_cache,
                 state_dir,
             } => {
                 let state_dir = resolved_state_dir(state_dir, &configuration)?;
@@ -370,7 +375,7 @@ impl Cli {
                         let local_version = herdr_version::query(&herdr_bin).context(
                             "could not determine the local Herdr version; remote discovery was not started",
                         )?;
-                        sync::refresh::refresh_sessions(&state_dir, local_version)
+                        sync::refresh::sessions_for_attach(&state_dir, local_version, no_cache)
                             .await
                             .context("could not refresh synchronized sessions")
                     }.await;
@@ -518,6 +523,23 @@ mod tests {
     use clap::{CommandFactory, Parser};
 
     use super::*;
+
+    #[test]
+    fn attach_cache_is_enabled_by_default_and_can_be_bypassed() {
+        for target in [None, Some("host/work")] {
+            for bypass in [false, true] {
+                let mut args = vec!["attached", "attach"];
+                args.extend(target);
+                if bypass {
+                    args.push("--no-cache");
+                }
+                let cli = Cli::try_parse_from(args).unwrap();
+                assert!(
+                    matches!(cli.command, Command::Attach { no_cache, .. } if no_cache == bypass)
+                );
+            }
+        }
+    }
 
     #[test]
     fn exposes_only_the_simplified_command_surface() {
