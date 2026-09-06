@@ -1,24 +1,43 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use attached_session_sync_protocol::account::AuthorizedConsumerIdentity;
 use attached_tunnel_protocol::{
-    CapabilitySecret, HerdrVersion, TUNNEL_ALPN, UPGRADE_ALPN, UpgradeResponse,
-    read_upgrade_request, write_upgrade_response,
+    ATTACHED_UPDATE_ALPN, AttachedUpdateRequest, AttachedUpdateResponse, AttachedVersion,
+    CapabilitySecret, HerdrVersion, TUNNEL_ALPN, UPGRADE_ALPN, UpdateOperationId, UpgradeResponse,
+    read_attached_update_request, read_upgrade_request, write_attached_update_response,
+    write_upgrade_response,
 };
-use iroh::{Endpoint, endpoint::presets};
+use iroh::{
+    Endpoint,
+    endpoint::{AfterHandshakeOutcome, BindOpts, EndpointHooks, presets},
+};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::{Mutex, Semaphore, watch},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, watch},
     task::JoinSet,
-    time::timeout,
+    time::{Instant, timeout, timeout_at},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
+use zeroize::Zeroizing;
 
 use crate::{
+    attached_version,
     diagnostics::next_connection_id,
-    herdr_version, identity,
+    herdr_version, identity, installation, local_encryption,
+    serve_handoff::{
+        ActivatedCandidateIpc, CandidateConfig, CandidateDisposition, CandidateEvent, CandidateIpc,
+        CandidateProcess, ParentCommand, ServeConfig,
+    },
     session::{self, Session},
     sync::{publisher, state},
     tunnel,
@@ -28,7 +47,57 @@ const AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(5);
 const PUBLISH_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_PENDING_CONNECTIONS: usize = 16;
 const MAX_AUTHENTICATED_CONNECTIONS: usize = 16;
+const UNAUTHORIZED_IDENTITY_ERROR_CODE: u32 = 403;
+const UNAUTHORIZED_IDENTITY_REASON: &[u8] = b"unauthorized consumer identity";
+const CANDIDATE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const CLIENT_RECONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const CANDIDATE_EVENT_TIMEOUT: Duration = Duration::from_secs(5);
+const ATTACHED_UPDATE_PREPARE_TIMEOUT: Duration = Duration::from_secs(130);
 
+#[derive(Debug)]
+struct ConsumerIdentityAuthorization {
+    authorized_identity: AuthorizedConsumerIdentity,
+}
+
+impl ConsumerIdentityAuthorization {
+    const fn new(authorized_identity: AuthorizedConsumerIdentity) -> Self {
+        Self {
+            authorized_identity,
+        }
+    }
+
+    fn authorize(&self, remote_identity: &[u8; 32]) -> AfterHandshakeOutcome {
+        if remote_identity == self.authorized_identity.as_bytes() {
+            AfterHandshakeOutcome::Accept
+        } else {
+            AfterHandshakeOutcome::Reject {
+                error_code: UNAUTHORIZED_IDENTITY_ERROR_CODE.into(),
+                reason: UNAUTHORIZED_IDENTITY_REASON.to_vec(),
+            }
+        }
+    }
+}
+
+impl EndpointHooks for ConsumerIdentityAuthorization {
+    async fn after_handshake(
+        &self,
+        connection: &iroh::endpoint::Connection,
+    ) -> AfterHandshakeOutcome {
+        // Iroh exposes the authenticated peer key after TLS, but rejecting from this hook keeps
+        // the connection from reaching application dispatch or opening a tunnel stream.
+        let outcome = self.authorize(connection.remote_id().as_bytes());
+        if matches!(outcome, AfterHandshakeOutcome::Reject { .. }) {
+            warn!(
+                category = "authorization",
+                authentication_layer = "iroh_remote_identity",
+                "Iroh connection admission rejected: unauthorized remote identity"
+            );
+        }
+        outcome
+    }
+}
+
+#[cfg(test)]
 async fn run_registered_lifecycle<Lifecycle, LifecycleFuture>(
     registry_dir: &std::path::Path,
     endpoint_identity: [u8; 32],
@@ -45,6 +114,93 @@ where
     result
 }
 
+struct ServerRuntime {
+    config: ServeConfig,
+    authorized_consumer_identity: AuthorizedConsumerIdentity,
+    key: iroh::SecretKey,
+    capability: CapabilitySecret,
+    master_key: Zeroizing<[u8; 32]>,
+    herdr_version: HerdrVersion,
+    update_limit: Arc<Semaphore>,
+    active_operation: Arc<Mutex<Option<UpdateOperationId>>>,
+}
+
+#[derive(Clone)]
+struct CandidateConfirmation {
+    operation_id: UpdateOperationId,
+    session: String,
+    version: AttachedVersion,
+    events: mpsc::UnboundedSender<CandidateEvent>,
+    disposition: watch::Receiver<CandidateDisposition>,
+    abort: CancellationToken,
+    announced_consumer: Arc<AtomicBool>,
+}
+
+impl CandidateConfirmation {
+    fn new(
+        operation_id: UpdateOperationId,
+        session: String,
+        version: AttachedVersion,
+        ipc: ActivatedCandidateIpc,
+    ) -> Self {
+        Self {
+            operation_id,
+            session,
+            version,
+            events: ipc.events,
+            disposition: ipc.disposition,
+            abort: ipc.abort,
+            announced_consumer: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn is_pending(&self) -> bool {
+        *self.disposition.borrow() == CandidateDisposition::Pending
+    }
+}
+
+#[derive(Clone)]
+struct RollbackRecord {
+    operation_id: UpdateOperationId,
+    reason: String,
+}
+
+struct UpdateResources {
+    config: ServeConfig,
+    master_key: Arc<Zeroizing<[u8; 32]>>,
+    endpoint_identity: [u8; 32],
+    bind_sockets: Vec<SocketAddr>,
+    capability: CapabilitySecret,
+    update_limit: Arc<Semaphore>,
+    active_operation: Arc<Mutex<Option<UpdateOperationId>>>,
+    candidate: Option<Arc<CandidateConfirmation>>,
+    rollback: Option<RollbackRecord>,
+}
+
+struct PreparedHandoff {
+    operation_id: UpdateOperationId,
+    version: AttachedVersion,
+    update: installation::PreparedRemoteUpdate,
+    candidate: CandidateProcess,
+    _permit: OwnedSemaphorePermit,
+}
+
+enum PreparedAttachedUpdate {
+    Current(AttachedVersion),
+    Handoff(Box<PreparedHandoff>),
+}
+
+enum EndpointOutcome {
+    Shutdown,
+    Handoff(Box<PreparedHandoff>),
+    CandidateAborted,
+}
+
+enum HandoffResolution {
+    Retired,
+    RolledBack(RollbackRecord),
+}
+
 pub async fn serve(
     state_dir: PathBuf,
     herdr_bin: PathBuf,
@@ -58,73 +214,349 @@ pub async fn serve(
     let authorized_consumer_identity = account
         .authorized_consumer_identity()
         .context("publish account bundle has no authorized consumer identity")?;
-
     let key = identity::load_or_create(&state_dir)?;
-    let endpoint = Endpoint::builder(presets::N0)
-        .secret_key(key)
-        .alpns(vec![TUNNEL_ALPN.to_vec(), UPGRADE_ALPN.to_vec()])
+    let master_key = local_encryption::handoff_master_key(&state_dir)?;
+    let initial_version =
+        herdr_version::query(&herdr_bin).context("could not determine the local Herdr version")?;
+    installation::current_attached_executable()?;
+    let endpoint = bind_server_endpoint(&key, authorized_consumer_identity, None).await?;
+    let host_label = host_label.unwrap_or_else(|| publisher::default_host_label(&endpoint.addr()));
+    let runtime = ServerRuntime {
+        config: ServeConfig {
+            state_dir,
+            herdr_bin,
+            host_label,
+        },
+        authorized_consumer_identity,
+        key,
+        capability: CapabilitySecret::generate(),
+        master_key,
+        herdr_version: initial_version,
+        update_limit: Arc::new(Semaphore::new(1)),
+        active_operation: Arc::new(Mutex::new(None)),
+    };
+    run_supervisor(runtime, Some(endpoint), None, None).await
+}
+
+pub(crate) async fn serve_candidate() -> Result<()> {
+    let (config, ipc) = CandidateIpc::receive().await?;
+    local_encryption::configure_handoff_master_key(config.master_key)?;
+    let current_version = attached_version::current();
+    ensure!(
+        current_version == config.expected_version,
+        "candidate version {current_version} does not match expected version {}",
+        config.expected_version
+    );
+    let account = state::load_account(
+        &config.serve.state_dir,
+        attached_session_sync_protocol::account::ApiKeyScope::Publish,
+    )
+    .context("candidate could not load the publish account")?;
+    let authorized_consumer_identity = account
+        .authorized_consumer_identity()
+        .context("publish account bundle has no authorized consumer identity")?;
+    let key = identity::load_or_create(&config.serve.state_dir)?;
+    ensure!(
+        key.public().as_bytes() == &config.expected_endpoint_identity,
+        "candidate endpoint identity changed during handoff"
+    );
+    let herdr_version = herdr_version::query(&config.serve.herdr_bin)
+        .context("candidate could not determine the local Herdr version")?;
+    let attached_executable = installation::current_attached_executable()?;
+    ensure!(
+        attached_version::query(&attached_executable)? == current_version,
+        "candidate executable version changed during preflight"
+    );
+    publisher::Publisher::load(&config.serve.state_dir, config.expected_endpoint_identity)
+        .context("candidate could not initialize the session publisher")?;
+    ipc.send(CandidateEvent::Prepared {
+        version: current_version,
+    })?;
+    let operation_id = config.operation_id;
+    let operation_session = config.session.clone();
+    let bind_sockets = config.bind_sockets.clone();
+    let capability = CapabilitySecret::from_bytes(config.capability);
+    let serve_config = config.serve.clone();
+    let master_key = Zeroizing::new(config.master_key);
+    drop(config);
+    let activated = ipc.activate().await?;
+    let confirmation = Arc::new(CandidateConfirmation::new(
+        operation_id,
+        operation_session,
+        current_version,
+        activated,
+    ));
+    let failure_events = confirmation.events.clone();
+    let runtime = ServerRuntime {
+        config: serve_config,
+        authorized_consumer_identity,
+        key,
+        capability,
+        master_key,
+        herdr_version,
+        update_limit: Arc::new(Semaphore::new(1)),
+        active_operation: Arc::new(Mutex::new(None)),
+    };
+    let result = run_supervisor(runtime, None, Some(bind_sockets), Some(confirmation)).await;
+    if let Err(error) = &result {
+        let _ = failure_events.send(CandidateEvent::Failed {
+            reason: bounded_public_error(error),
+        });
+    }
+    result
+}
+
+async fn bind_server_endpoint(
+    key: &iroh::SecretKey,
+    authorized_consumer_identity: AuthorizedConsumerIdentity,
+    bind_sockets: Option<&[SocketAddr]>,
+) -> Result<Endpoint> {
+    let mut builder = Endpoint::builder(presets::N0)
+        .secret_key(key.clone())
+        .alpns(vec![
+            TUNNEL_ALPN.to_vec(),
+            UPGRADE_ALPN.to_vec(),
+            ATTACHED_UPDATE_ALPN.to_vec(),
+        ])
+        .hooks(ConsumerIdentityAuthorization::new(
+            authorized_consumer_identity,
+        ));
+    if let Some(bind_sockets) = bind_sockets {
+        builder = builder.clear_ip_transports();
+        for socket in bind_sockets {
+            builder = builder
+                .bind_addr_with_opts(*socket, BindOpts::default())
+                .with_context(|| format!("could not reuse Iroh socket {socket}"))?;
+        }
+    }
+    let endpoint = builder
         .bind()
         .await
         .context("failed to bind the Iroh endpoint")?;
     endpoint.online().await;
+    Ok(endpoint)
+}
 
+async fn run_supervisor(
+    mut runtime: ServerRuntime,
+    mut initial_endpoint: Option<Endpoint>,
+    mut bind_sockets: Option<Vec<SocketAddr>>,
+    mut candidate: Option<Arc<CandidateConfirmation>>,
+) -> Result<()> {
     let registry_dir = crate::endpoint_registry::default_dir()
         .context("could not locate the live local endpoint registry")?;
-    let bootstrap_lock_dir = registry_dir.clone();
-    run_registered_lifecycle(
-        &registry_dir,
-        *endpoint.addr().id.as_bytes(),
-        || async move {
-            let initial_version = herdr_version::query(&herdr_bin)
-                .context("could not determine the local Herdr version")?;
-            session::ensure_active(bootstrap_lock_dir, herdr_bin.clone())
-                .await
-                .context("could not ensure an active Herdr session before serving")?;
-            let (version, published_versions) = watch::channel(initial_version);
-            let capability = CapabilitySecret::generate();
-            let host_label =
-                host_label.unwrap_or_else(|| publisher::default_host_label(&endpoint.addr()));
-            let publication = Arc::new(Mutex::new(
-                publisher::Publisher::load(&state_dir, *endpoint.addr().id.as_bytes())
-                    .context("could not initialize the session publisher")?,
-            ));
-
-            publish_sessions(
-                &publication,
-                &herdr_bin,
-                &host_label,
-                &endpoint,
-                &capability,
-                initial_version,
-            )
+    let mut rollback = None;
+    let mut announced = false;
+    loop {
+        let endpoint = match initial_endpoint.take() {
+            Some(endpoint) => endpoint,
+            None => {
+                bind_server_endpoint(
+                    &runtime.key,
+                    runtime.authorized_consumer_identity,
+                    bind_sockets.as_deref(),
+                )
+                .await?
+            }
+        };
+        bind_sockets = Some(endpoint.bound_sockets());
+        let endpoint_identity = *endpoint.addr().id.as_bytes();
+        let active_endpoint = crate::endpoint_registry::register(&registry_dir, endpoint_identity)
+            .context("could not register the live local endpoint")?;
+        session::ensure_active(registry_dir.clone(), runtime.config.herdr_bin.clone())
             .await
-            .context("could not publish the initial session catalog")?;
+            .context("could not ensure an active Herdr session before serving")?;
+        match herdr_version::query_running_sessions(&runtime.config.herdr_bin) {
+            Ok(running_version) => runtime.herdr_version = running_version,
+            Err(_) => warn!(
+                "could not verify running Herdr server versions; publishing the installed binary version"
+            ),
+        }
+        let (version, published_versions) = watch::channel(runtime.herdr_version);
+        let publication = Arc::new(Mutex::new(
+            publisher::Publisher::load(&runtime.config.state_dir, endpoint_identity)
+                .context("could not initialize the session publisher")?,
+        ));
+        publish_sessions(
+            &publication,
+            &runtime.config.herdr_bin,
+            &runtime.config.host_label,
+            &endpoint,
+            &runtime.capability,
+            runtime.herdr_version,
+        )
+        .await
+        .context("could not publish the initial session catalog")?;
+        if let Some(candidate) = &candidate {
+            candidate
+                .events
+                .send(CandidateEvent::Ready {
+                    version: candidate.version,
+                })
+                .map_err(|_| anyhow!("candidate watchdog stopped before readiness"))?;
+        }
+        if !announced {
+            eprintln!(
+                "Serving synchronized Herdr sessions as `{}`.",
+                runtime.config.host_label
+            );
+            announced = true;
+        }
+        let publisher_task = tokio::spawn(run_publisher(
+            publication,
+            runtime.config.herdr_bin.clone(),
+            runtime.config.host_label.clone(),
+            endpoint.clone(),
+            runtime.capability.clone(),
+            published_versions,
+        ));
+        let outcome = serve_endpoint(
+            &endpoint,
+            runtime.config.herdr_bin.clone(),
+            runtime.capability.clone(),
+            version.clone(),
+            Arc::new(UpdateResources {
+                config: runtime.config.clone(),
+                master_key: Arc::new(Zeroizing::new(*runtime.master_key)),
+                endpoint_identity,
+                bind_sockets: bind_sockets.clone().unwrap_or_default(),
+                capability: runtime.capability.clone(),
+                update_limit: runtime.update_limit.clone(),
+                active_operation: runtime.active_operation.clone(),
+                candidate: candidate.clone(),
+                rollback: rollback.clone(),
+            }),
+            candidate.as_ref().map(|candidate| candidate.abort.clone()),
+        )
+        .await;
+        runtime.herdr_version = *version.borrow();
+        publisher_task.abort();
+        let _ = publisher_task.await;
+        endpoint.close().await;
+        drop(endpoint);
+        drop(active_endpoint);
+        match outcome? {
+            EndpointOutcome::Shutdown => return Ok(()),
+            EndpointOutcome::CandidateAborted => bail!("candidate handoff was aborted"),
+            EndpointOutcome::Handoff(handoff) => match coordinate_handoff(*handoff).await? {
+                HandoffResolution::Retired => return Ok(()),
+                HandoffResolution::RolledBack(record) => {
+                    rollback = Some(record);
+                    candidate = None;
+                    *runtime.active_operation.lock().await = None;
+                }
+            },
+        }
+    }
+}
 
-            eprintln!("Serving synchronized Herdr sessions as `{host_label}`.");
-            let publisher = tokio::spawn(run_publisher(
-                publication,
-                herdr_bin.clone(),
-                host_label,
-                endpoint.clone(),
-                capability.clone(),
-                published_versions,
-            ));
-            let result = serve_endpoint(
-                &endpoint,
-                herdr_bin,
-                capability,
-                version,
-                authorized_consumer_identity,
-            )
-            .await;
-
-            publisher.abort();
-            let _ = publisher.await;
-            endpoint.close().await;
-            result
-        },
+async fn coordinate_handoff(mut handoff: PreparedHandoff) -> Result<HandoffResolution> {
+    let precommit = confirm_attached_candidate(
+        &mut handoff.candidate,
+        handoff.version,
+        CANDIDATE_CONFIRM_TIMEOUT,
     )
-    .await
+    .await;
+
+    if let Err(error) = precommit {
+        warn!(
+            operation_id = %handoff.operation_id,
+            error = %error,
+            "Attached update candidate failed; rolling back"
+        );
+        handoff.candidate.abort().await;
+        handoff
+            .update
+            .rollback()
+            .context("could not restore the previous Attached binary")?;
+        return Ok(HandoffResolution::RolledBack(RollbackRecord {
+            operation_id: handoff.operation_id,
+            reason: "updated Attached candidate did not become reachable; the previous server was restored"
+                .to_owned(),
+        }));
+    }
+
+    match timeout(CANDIDATE_EVENT_TIMEOUT, handoff.candidate.next_event()).await {
+        Ok(Ok(CandidateEvent::ClientSucceeded)) => {}
+        Ok(Ok(event)) => warn!(
+            operation_id = %handoff.operation_id,
+            ?event,
+            "candidate committed without the expected client acknowledgement"
+        ),
+        Ok(Err(error)) => warn!(
+            operation_id = %handoff.operation_id,
+            error = %error,
+            "candidate committed after its control channel closed"
+        ),
+        Err(_) => warn!(
+            operation_id = %handoff.operation_id,
+            "candidate committed before client acknowledgement was observed"
+        ),
+    }
+    if let Err(error) = handoff.update.commit() {
+        warn!(
+            operation_id = %handoff.operation_id,
+            error = %error,
+            "updated Attached is running but its rollback file could not be removed"
+        );
+    }
+    info!(
+        operation_id = %handoff.operation_id,
+        version = %handoff.version,
+        "remote Attached update committed"
+    );
+    let status = handoff.candidate.supervise().await?;
+    ensure!(
+        status.success(),
+        "updated Attached server exited with {status}"
+    );
+    Ok(HandoffResolution::Retired)
+}
+
+async fn confirm_attached_candidate(
+    candidate: &mut CandidateProcess,
+    expected_version: AttachedVersion,
+    confirmation_timeout: Duration,
+) -> Result<()> {
+    // Preparation finishes while the old endpoint is still serving. This function is called only
+    // after that endpoint has been drained and closed, so start the confirmation budget here to
+    // prevent shutdown latency from causing an early rollback.
+    let deadline = Instant::now() + confirmation_timeout;
+    candidate.send(&ParentCommand::Activate).await?;
+    match timeout_at(deadline, candidate.next_event())
+        .await
+        .context("updated Attached candidate readiness timed out")??
+    {
+        CandidateEvent::Ready { version } if version == expected_version => {}
+        CandidateEvent::Failed { reason } => {
+            bail!("updated Attached candidate failed: {reason}")
+        }
+        event => bail!("updated Attached candidate sent unexpected readiness event {event:?}"),
+    }
+    match timeout_at(deadline, candidate.next_event())
+        .await
+        .context("consumer did not reach the updated Attached candidate")??
+    {
+        CandidateEvent::ConsumerConnected => {}
+        CandidateEvent::Failed { reason } => {
+            bail!("updated Attached candidate failed: {reason}")
+        }
+        event => {
+            bail!("updated Attached candidate sent unexpected confirmation event {event:?}")
+        }
+    }
+    candidate.send(&ParentCommand::Commit).await
+}
+
+fn new_operation_id() -> Result<UpdateOperationId> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes)
+        .context("operating-system randomness is unavailable for the update operation")?;
+    Ok(UpdateOperationId::from_bytes(bytes))
+}
+
+fn bounded_public_error(_error: &anyhow::Error) -> String {
+    "updated Attached candidate failed".to_owned()
 }
 
 async fn run_publish_loop<Publish, PublishFuture>(
@@ -221,45 +653,69 @@ async fn resolve_session(herdr_bin: PathBuf, name: String) -> Result<Session> {
 
 fn perform_upgrade(
     herdr_bin: &std::path::Path,
+    session: &str,
     requested_version: HerdrVersion,
     version: &watch::Sender<HerdrVersion>,
     updater: Arc<Semaphore>,
 ) -> UpgradeResponse {
+    perform_upgrade_with(
+        herdr_bin,
+        session,
+        requested_version,
+        version,
+        updater,
+        herdr_version::update_session,
+    )
+}
+
+fn perform_upgrade_with<Update>(
+    herdr_bin: &std::path::Path,
+    session: &str,
+    requested_version: HerdrVersion,
+    version: &watch::Sender<HerdrVersion>,
+    updater: Arc<Semaphore>,
+    update: Update,
+) -> UpgradeResponse
+where
+    Update: FnOnce(&std::path::Path, &str, HerdrVersion) -> Result<HerdrVersion>,
+{
     let current = *version.borrow();
-    if (
-        requested_version.major(),
-        requested_version.minor(),
-        requested_version.patch(),
-    ) <= (current.major(), current.minor(), current.patch())
-    {
+    if requested_version < current {
         return UpgradeResponse::Failed(
-            "remote Herdr is already at or newer than the requested version".to_owned(),
+            "remote Herdr is newer than the requested version".to_owned(),
+        );
+    }
+    if let Ok(installed) = herdr_version::query(herdr_bin)
+        && installed > requested_version
+    {
+        if let Ok(running) = herdr_version::query_running_sessions(herdr_bin) {
+            version.send_replace(running);
+        }
+        return UpgradeResponse::Failed(
+            "remote Herdr is newer than the requested version".to_owned(),
         );
     }
     let Ok(_permit) = updater.try_acquire_owned() else {
         return UpgradeResponse::Busy;
     };
-    match herdr_version::update(herdr_bin) {
+    match update(herdr_bin, session, requested_version) {
         Ok(installed) => {
-            // The executable changed even when its channel did not produce the requested
-            // release, so refresh every consumer before deciding whether attach may proceed.
             version.send_replace(installed);
-            if installed == requested_version {
-                UpgradeResponse::Updated(installed)
-            } else {
-                UpgradeResponse::Failed(
-                    "remote Herdr update did not install the required version".to_owned(),
-                )
-            }
+            UpgradeResponse::Updated(installed)
         }
+        Err(error) if herdr_version::is_rolled_back(&error) => {
+            UpgradeResponse::Failed("remote Herdr update failed and was rolled back".to_owned())
+        }
+        Err(error) if herdr_version::is_package_managed(&error) => UpgradeResponse::Failed(
+            "remote Herdr is package-managed; update it on the serving host".to_owned(),
+        ),
         Err(_error) => {
-            // An updater can fail after replacing the executable. Refresh opportunistically;
-            // failure to query never permits attachment. Child output and the error chain stay
-            // process-local and are deliberately not logged or placed on the wire.
-            if let Ok(installed) = herdr_version::query(herdr_bin) {
-                version.send_replace(installed);
+            if let Ok(running) = herdr_version::query_running_sessions(herdr_bin) {
+                version.send_replace(running);
             }
-            UpgradeResponse::Failed("remote Herdr update failed".to_owned())
+            UpgradeResponse::Failed(
+                "remote Herdr update or live-handoff verification failed".to_owned(),
+            )
         }
     }
 }
@@ -277,16 +733,16 @@ where
     W: AsyncWrite + Unpin,
     Resolve: FnOnce(String) -> ResolveFuture,
     ResolveFuture: std::future::Future<Output = Result<()>>,
-    Update: FnOnce(HerdrVersion) -> UpgradeResponse,
+    Update: FnOnce(String, HerdrVersion) -> UpgradeResponse,
 {
     let request = timeout(framing_timeout, read_upgrade_request(receive, capability))
         .await
         .context("upgrade request frame timed out")??;
     // Authentication is complete before session resolution or update execution.
-    resolve(request.session).await?;
+    resolve(request.session.clone()).await?;
     timeout(
         framing_timeout,
-        write_upgrade_response(send, update(request.requested_version)),
+        write_upgrade_response(send, update(request.session, request.requested_version)),
     )
     .await
     .context("upgrade response frame timed out")?
@@ -312,13 +768,258 @@ async fn serve_upgrade_connection(
                 .await
                 .map(|_| ())
         },
-        |requested_version| {
+        |session, requested_version| {
             tokio::task::block_in_place(|| {
-                perform_upgrade(&herdr_bin, requested_version, &version, updater)
+                perform_upgrade(&herdr_bin, &session, requested_version, &version, updater)
             })
         },
     )
     .await
+}
+
+async fn prepare_attached_handoff(
+    resources: &UpdateResources,
+    session: String,
+    operation_id: UpdateOperationId,
+    permit: OwnedSemaphorePermit,
+) -> Result<PreparedAttachedUpdate> {
+    let update = timeout(
+        ATTACHED_UPDATE_PREPARE_TIMEOUT,
+        tokio::task::spawn_blocking(installation::prepare_remote_update),
+    )
+    .await
+    .context("remote `attached update` exceeded its preparation deadline")?
+    .context("remote `attached update` task failed")??;
+    let version = update.candidate_version();
+    if version == attached_version::current() {
+        update.commit()?;
+        return Ok(PreparedAttachedUpdate::Current(version));
+    }
+    let config = CandidateConfig {
+        serve: resources.config.clone(),
+        operation_id,
+        session,
+        expected_version: version,
+        expected_endpoint_identity: resources.endpoint_identity,
+        capability: resources.capability.to_bytes(),
+        master_key: **resources.master_key,
+        bind_sockets: resources.bind_sockets.clone(),
+    };
+    let candidate = CandidateProcess::spawn(update.executable(), &config).await?;
+    Ok(PreparedAttachedUpdate::Handoff(Box::new(PreparedHandoff {
+        operation_id,
+        version,
+        update,
+        candidate,
+        _permit: permit,
+    })))
+}
+
+async fn abort_prepared_handoff(mut handoff: PreparedHandoff) -> Result<()> {
+    handoff.candidate.abort().await;
+    handoff.update.rollback()
+}
+
+async fn candidate_confirmation_response(
+    resources: &UpdateResources,
+    session: &str,
+    operation_id: UpdateOperationId,
+    observed_version: AttachedVersion,
+) -> (
+    AttachedUpdateResponse,
+    Option<mpsc::UnboundedSender<CandidateEvent>>,
+) {
+    if let Some(candidate) = &resources.candidate
+        && candidate.operation_id == operation_id
+    {
+        if candidate.session != session {
+            return (
+                AttachedUpdateResponse::Failed(
+                    "Attached update confirmation selected a different session".to_owned(),
+                ),
+                None,
+            );
+        }
+        if candidate.version != observed_version {
+            return (
+                AttachedUpdateResponse::Failed(
+                    "updated Attached version did not match the prepared candidate".to_owned(),
+                ),
+                None,
+            );
+        }
+        let mut disposition = candidate.disposition.clone();
+        let notify_watchdog = *disposition.borrow() == CandidateDisposition::Pending
+            && !candidate.announced_consumer.swap(true, Ordering::SeqCst);
+        if notify_watchdog {
+            let _ = candidate.events.send(CandidateEvent::ConsumerConnected);
+        }
+        loop {
+            let current = *disposition.borrow();
+            match current {
+                CandidateDisposition::Pending => {
+                    if disposition.changed().await.is_err() {
+                        return (
+                            AttachedUpdateResponse::Failed(
+                                "updated Attached watchdog stopped before commit".to_owned(),
+                            ),
+                            None,
+                        );
+                    }
+                }
+                CandidateDisposition::Committed => {
+                    return (
+                        AttachedUpdateResponse::Committed(candidate.version),
+                        notify_watchdog.then(|| candidate.events.clone()),
+                    );
+                }
+                CandidateDisposition::Aborted => {
+                    return (
+                        AttachedUpdateResponse::Failed(
+                            "updated Attached candidate was rolled back".to_owned(),
+                        ),
+                        None,
+                    );
+                }
+            }
+        }
+    }
+
+    if resources
+        .active_operation
+        .lock()
+        .await
+        .is_some_and(|active| active == operation_id)
+    {
+        return (AttachedUpdateResponse::Waiting, None);
+    }
+    if let Some(rollback) = &resources.rollback
+        && rollback.operation_id == operation_id
+    {
+        return (
+            AttachedUpdateResponse::Failed(rollback.reason.clone()),
+            None,
+        );
+    }
+    (
+        AttachedUpdateResponse::Failed("unknown Attached update operation".to_owned()),
+        None,
+    )
+}
+
+async fn serve_attached_update_connection(
+    connection: iroh::endpoint::Connection,
+    resources: Arc<UpdateResources>,
+    handoff_tx: mpsc::Sender<PreparedHandoff>,
+) -> Result<()> {
+    let (mut send, mut receive) = timeout(AUTHENTICATION_TIMEOUT, connection.accept_bi())
+        .await
+        .context("Attached update request handshake timed out")??;
+    let request = timeout(
+        AUTHENTICATION_TIMEOUT,
+        read_attached_update_request(&mut receive, &resources.capability),
+    )
+    .await
+    .context("Attached update request frame timed out")??;
+    match request {
+        AttachedUpdateRequest::Start { session } => {
+            resolve_session(resources.config.herdr_bin.clone(), session.clone())
+                .await
+                .context("requested update session is unavailable")?;
+            if resources
+                .candidate
+                .as_ref()
+                .is_some_and(|candidate| candidate.is_pending())
+            {
+                write_attached_update_response(&mut send, AttachedUpdateResponse::Busy).await?;
+                return Ok(());
+            }
+            let permit = match resources.update_limit.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    write_attached_update_response(&mut send, AttachedUpdateResponse::Busy).await?;
+                    return Ok(());
+                }
+            };
+            let operation_id = new_operation_id()?;
+            *resources.active_operation.lock().await = Some(operation_id);
+            let prepared =
+                prepare_attached_handoff(&resources, session, operation_id, permit).await;
+            let prepared = match prepared {
+                Ok(PreparedAttachedUpdate::Current(version)) => {
+                    *resources.active_operation.lock().await = None;
+                    write_attached_update_response(
+                        &mut send,
+                        AttachedUpdateResponse::Current(version),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                Ok(PreparedAttachedUpdate::Handoff(prepared)) => *prepared,
+                Err(_error) => {
+                    *resources.active_operation.lock().await = None;
+                    let _ = write_attached_update_response(
+                        &mut send,
+                        AttachedUpdateResponse::Failed(
+                            "remote Attached update could not be prepared".to_owned(),
+                        ),
+                    )
+                    .await;
+                    bail!("remote Attached update preparation failed");
+                }
+            };
+            if let Err(error) = write_attached_update_response(
+                &mut send,
+                AttachedUpdateResponse::Restarting {
+                    operation_id,
+                    version: prepared.version,
+                    reconnect_timeout_secs: CLIENT_RECONNECT_TIMEOUT.as_secs() as u16,
+                },
+            )
+            .await
+            {
+                *resources.active_operation.lock().await = None;
+                abort_prepared_handoff(prepared).await?;
+                return Err(error).context("could not announce the Attached update handoff");
+            }
+            if let Err(error) = timeout(AUTHENTICATION_TIMEOUT, send.stopped())
+                .await
+                .context("client did not acknowledge the Attached update handoff")
+                .and_then(|result| result.map(|_| ()).map_err(Into::into))
+            {
+                *resources.active_operation.lock().await = None;
+                abort_prepared_handoff(prepared).await?;
+                return Err(error);
+            }
+            if let Err(error) = handoff_tx.send(prepared).await {
+                *resources.active_operation.lock().await = None;
+                abort_prepared_handoff(error.0).await?;
+                bail!("Attached server stopped before the prepared handoff");
+            }
+            Ok(())
+        }
+        AttachedUpdateRequest::Confirm {
+            session,
+            operation_id,
+            observed_version,
+        } => {
+            let (response, succeeded) = candidate_confirmation_response(
+                &resources,
+                &session,
+                operation_id,
+                observed_version,
+            )
+            .await;
+            write_attached_update_response(&mut send, response).await?;
+            if let Some(events) = succeeded {
+                timeout(AUTHENTICATION_TIMEOUT, send.stopped())
+                    .await
+                    .context("client did not acknowledge the committed Attached update")??;
+                let _ = events.send(CandidateEvent::ClientSucceeded);
+            }
+            Ok(())
+        }
+    }
 }
 
 async fn shutdown_connections(connections: &mut JoinSet<Result<()>>) {
@@ -328,34 +1029,37 @@ async fn shutdown_connections(connections: &mut JoinSet<Result<()>>) {
     while connections.join_next().await.is_some() {}
 }
 
-fn authorize_remote_identity(
-    remote_identity: &[u8; 32],
-    authorized_identity: AuthorizedConsumerIdentity,
-) -> Result<()> {
-    if remote_identity != authorized_identity.as_bytes() {
-        bail!("unauthorized remote identity");
-    }
-    Ok(())
-}
-
 async fn serve_endpoint(
     endpoint: &Endpoint,
     herdr_bin: PathBuf,
     capability: CapabilitySecret,
     version: watch::Sender<HerdrVersion>,
-    authorized_consumer_identity: AuthorizedConsumerIdentity,
-) -> Result<()> {
+    update_resources: Arc<UpdateResources>,
+    candidate_abort: Option<CancellationToken>,
+) -> Result<EndpointOutcome> {
     let pending = Arc::new(Semaphore::new(MAX_PENDING_CONNECTIONS));
     let authenticated = Arc::new(Semaphore::new(MAX_AUTHENTICATED_CONNECTIONS));
-    let updater = Arc::new(Semaphore::new(1));
     let cancellation = CancellationToken::new();
     let mut connections = JoinSet::new();
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
+    let (handoff_tx, mut handoff_rx) = mpsc::channel(1);
+    let abort_enabled = candidate_abort.is_some();
+    let candidate_abort = candidate_abort.unwrap_or_default();
 
     let result = loop {
         tokio::select! {
-            result = &mut shutdown => break result.context("failed to listen for Ctrl-C"),
+            result = &mut shutdown => {
+                result.context("failed to listen for Ctrl-C")?;
+                break Ok(EndpointOutcome::Shutdown);
+            }
+            () = candidate_abort.cancelled(), if abort_enabled => {
+                break Ok(EndpointOutcome::CandidateAborted);
+            }
+            handoff = handoff_rx.recv() => {
+                let handoff = handoff.context("Attached update handoff channel stopped")?;
+                break Ok(EndpointOutcome::Handoff(Box::new(handoff)));
+            }
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else {
                     break Err(anyhow!("Iroh endpoint stopped accepting connections"));
@@ -368,25 +1072,24 @@ async fn serve_endpoint(
                 let herdr_bin = herdr_bin.clone();
                 let capability = capability.clone();
                 let authenticated = authenticated.clone();
-                let updater = updater.clone();
+                let updater = update_resources.update_limit.clone();
                 let version = version.clone();
                 let child_cancellation = cancellation.child_token();
+                let update_resources = update_resources.clone();
+                let handoff_tx = handoff_tx.clone();
                 connections.spawn(async move {
                     let result = async {
                         let connection = timeout(AUTHENTICATION_TIMEOUT, incoming)
                             .await
                             .context("Iroh connection handshake timed out")??;
-                        if let Err(error) = authorize_remote_identity(
-                            connection.remote_id().as_bytes(),
-                            authorized_consumer_identity,
-                        ) {
-                            warn!(
-                                connection_id,
-                                category = "authorization",
-                                authentication_layer = "iroh_remote_identity",
-                                "Iroh connection rejected: unauthorized remote identity"
-                            );
-                            return Err(error);
+                        if connection.alpn() == ATTACHED_UPDATE_ALPN {
+                            drop(pending_permit);
+                            return serve_attached_update_connection(
+                                connection,
+                                update_resources,
+                                handoff_tx,
+                            )
+                            .await;
                         }
                         if connection.alpn() == UPGRADE_ALPN {
                             return serve_upgrade_connection(
@@ -441,15 +1144,15 @@ async fn serve_endpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use attached_session_sync_protocol::account::{
-        AuthorizedConsumerIdentity, ConsumerIdentitySecret,
-    };
+    use attached_session_sync_protocol::account::ConsumerIdentitySecret;
     use attached_tunnel_protocol::{
         authenticate_server, read_auth_response, read_upgrade_response, write_auth_request,
         write_upgrade_request,
     };
+    use iroh::{RelayMode, endpoint::BindOpts};
     use std::{
         fs,
+        net::Ipv4Addr,
         os::unix::fs::PermissionsExt,
         sync::atomic::{AtomicUsize, Ordering},
     };
@@ -459,8 +1162,8 @@ mod tests {
         fs::write(
             &path,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = update ]; then printf updated > '{}/updated'; exit 0; fi\nif [ \"$1\" = --version ]; then printf 'herdr {}\\n'; exit 0; fi\nexit 9\n",
-                root.display(), version
+                "#!/bin/sh\nif [ \"$1\" = update ]; then printf updated > '{}/updated'; exit 0; fi\nif [ \"$1\" = --version ]; then printf 'herdr {}\\n'; exit 0; fi\nif [ \"$1\" = session ] && [ \"$2\" = list ]; then printf '{{\"sessions\":[{{\"name\":\"work\",\"running\":true}}]}}\\n'; exit 0; fi\nif [ \"$1\" = --session ] && [ \"$3\" = status ]; then printf '{{\"running\":true,\"version\":\"{}\"}}\\n'; exit 0; fi\nexit 9\n",
+                root.display(), version, version
             ),
         )
         .unwrap();
@@ -469,18 +1172,24 @@ mod tests {
     }
 
     #[test]
-    fn unauthorized_remote_identity_is_rejected_before_dispatch() {
-        let expected = AuthorizedConsumerIdentity::from_bytes([0x11; 32]);
-        let mut dispatched = false;
+    fn consumer_identity_hook_accepts_only_the_published_public_key() {
+        let hook = ConsumerIdentityAuthorization::new(
+            ConsumerIdentitySecret::from_bytes([0x11; 32]).authorized_identity(),
+        );
+        let authorized = iroh::SecretKey::from_bytes(&[0x11; 32]).public();
+        let unauthorized = iroh::SecretKey::from_bytes(&[0x22; 32]).public();
 
-        let result = authorize_remote_identity(&[0x22; 32], expected);
-        if result.is_ok() {
-            dispatched = true;
-        }
-
-        let error = result.unwrap_err().to_string();
-        assert!(error.contains("unauthorized remote identity"), "{error}");
-        assert!(!dispatched);
+        assert!(matches!(
+            hook.authorize(authorized.as_bytes()),
+            AfterHandshakeOutcome::Accept
+        ));
+        let AfterHandshakeOutcome::Reject { error_code, reason } =
+            hook.authorize(unauthorized.as_bytes())
+        else {
+            panic!("unauthorized identity was accepted");
+        };
+        assert_eq!(error_code, UNAUTHORIZED_IDENTITY_ERROR_CODE.into());
+        assert_eq!(reason, UNAUTHORIZED_IDENTITY_REASON);
     }
 
     #[tokio::test]
@@ -498,11 +1207,19 @@ mod tests {
             let capability = CapabilitySecret::from_bytes([0x51; 32]);
             let wrong_capability = CapabilitySecret::from_bytes([0x52; 32]);
             let server = Endpoint::builder(presets::N0)
+                .clear_ip_transports()
+                .bind_addr_with_opts(
+                    (Ipv4Addr::LOCALHOST, 0),
+                    BindOpts::default().set_prefix_len(8),
+                )
+                .unwrap()
+                .relay_mode(RelayMode::Disabled)
+                .clear_address_lookup()
                 .alpns(vec![TUNNEL_ALPN.to_vec()])
+                .hooks(ConsumerIdentityAuthorization::new(authorized_identity))
                 .bind()
                 .await
                 .unwrap();
-            server.online().await;
             let server_addr = server.addr();
             let server_endpoint = server.clone();
             let server_capability = capability.clone();
@@ -514,18 +1231,18 @@ mod tests {
 
             let server_task = tokio::spawn(async move {
                 for _ in 0..3 {
-                    let connection = server_endpoint.accept().await.unwrap().await.unwrap();
-
-                    if authorize_remote_identity(
-                        connection.remote_id().as_bytes(),
-                        authorized_identity,
-                    )
-                    .is_err()
-                    {
-                        connection.close(1_u32.into(), b"unauthorized remote identity");
-                        processed.send("identity_rejected").unwrap();
-                        continue;
-                    }
+                    let incoming = server_endpoint.accept().await.unwrap();
+                    let connection = match incoming.await {
+                        Ok(connection) => connection,
+                        Err(error) => {
+                            assert!(
+                                error.to_string().contains("rejected locally"),
+                                "unexpected handshake error: {error}"
+                            );
+                            processed.send("identity_rejected").unwrap();
+                            continue;
+                        }
+                    };
 
                     server_attempts.fetch_add(1, Ordering::SeqCst);
                     let (mut send, mut receive) = connection.accept_bi().await.unwrap();
@@ -558,17 +1275,24 @@ mod tests {
 
             let unauthorized = Endpoint::builder(presets::N0)
                 .secret_key(unauthorized_key)
+                .clear_ip_transports()
+                .bind_addr_with_opts(
+                    (Ipv4Addr::LOCALHOST, 0),
+                    BindOpts::default().set_prefix_len(8),
+                )
+                .unwrap()
+                .relay_mode(RelayMode::Disabled)
+                .clear_address_lookup()
                 .bind()
                 .await
                 .unwrap();
-            let unauthorized_connection = unauthorized
-                .connect(server_addr.clone(), TUNNEL_ALPN)
-                .await
-                .unwrap();
+            let unauthorized_connection =
+                unauthorized.connect(server_addr.clone(), TUNNEL_ALPN).await;
             assert_eq!(events.recv().await.unwrap(), "identity_rejected");
             assert_eq!(capability_attempts.load(Ordering::SeqCst), 0);
             assert_eq!(session_resolutions.load(Ordering::SeqCst), 0);
             drop(unauthorized_connection);
+            unauthorized.close().await;
 
             async fn authenticate(
                 key: iroh::SecretKey,
@@ -577,6 +1301,14 @@ mod tests {
             ) -> (Endpoint, anyhow::Result<()>) {
                 let endpoint = Endpoint::builder(presets::N0)
                     .secret_key(key)
+                    .clear_ip_transports()
+                    .bind_addr_with_opts(
+                        (Ipv4Addr::LOCALHOST, 0),
+                        BindOpts::default().set_prefix_len(8),
+                    )
+                    .unwrap()
+                    .relay_mode(RelayMode::Disabled)
+                    .clear_address_lookup()
                     .bind()
                     .await
                     .unwrap();
@@ -598,6 +1330,7 @@ mod tests {
             assert_eq!(events.recv().await.unwrap(), "authorized");
             assert_eq!(capability_attempts.load(Ordering::SeqCst), 1);
             assert_eq!(session_resolutions.load(Ordering::SeqCst), 1);
+            authorized.close().await;
 
             let (wrong, result) =
                 authenticate(authorized_key, server_addr, &wrong_capability).await;
@@ -605,10 +1338,10 @@ mod tests {
             assert_eq!(events.recv().await.unwrap(), "capability_rejected");
             assert_eq!(capability_attempts.load(Ordering::SeqCst), 2);
             assert_eq!(session_resolutions.load(Ordering::SeqCst), 1);
+            wrong.close().await;
 
             server_task.await.unwrap();
             server.close().await;
-            drop((unauthorized, authorized, wrong));
         })
         .await
         .expect("live Iroh identity authorization scenario timed out");
@@ -655,6 +1388,7 @@ mod tests {
         assert_eq!(
             perform_upgrade(
                 &executable,
+                "work",
                 HerdrVersion::new(1, 2, 3),
                 &advertised,
                 Arc::new(Semaphore::new(1)),
@@ -665,19 +1399,37 @@ mod tests {
         assert!(published.has_changed().unwrap());
         assert_eq!(*published.borrow_and_update(), HerdrVersion::new(1, 2, 3));
 
+        assert!(
+            !root.path().join("updated").exists(),
+            "a current binary and live session reran the updater"
+        );
+        assert_eq!(
+            perform_upgrade(
+                &executable,
+                "work",
+                HerdrVersion::new(1, 2, 3),
+                &advertised,
+                Arc::new(Semaphore::new(1)),
+            ),
+            UpgradeResponse::Updated(HerdrVersion::new(1, 2, 3))
+        );
+        assert!(
+            !root.path().join("updated").exists(),
+            "an already-current live session reran the updater"
+        );
+
         let mismatched = fake_herdr(root.path(), "1.2.4");
         let (advertised, mut published) = watch::channel(HerdrVersion::new(1, 2, 2));
         let response = perform_upgrade(
             &mismatched,
+            "work",
             HerdrVersion::new(1, 2, 3),
             &advertised,
             Arc::new(Semaphore::new(1)),
         );
         assert_eq!(
             response,
-            UpgradeResponse::Failed(
-                "remote Herdr update did not install the required version".to_owned()
-            )
+            UpgradeResponse::Failed("remote Herdr is newer than the requested version".to_owned())
         );
         assert_eq!(*advertised.borrow(), HerdrVersion::new(1, 2, 4));
         assert!(published.has_changed().unwrap());
@@ -685,7 +1437,7 @@ mod tests {
     }
 
     #[test]
-    fn equal_or_older_requested_version_never_executes_remote_update() {
+    fn newer_requested_or_running_versions_never_execute_remote_update() {
         for requested in [HerdrVersion::new(1, 2, 3), HerdrVersion::new(1, 2, 2)] {
             let root = tempfile::tempdir().unwrap();
             let executable = fake_herdr(root.path(), "9.9.9");
@@ -694,19 +1446,25 @@ mod tests {
             assert_eq!(
                 perform_upgrade(
                     &executable,
+                    "work",
                     requested,
                     &advertised,
                     Arc::new(Semaphore::new(1)),
                 ),
                 UpgradeResponse::Failed(
-                    "remote Herdr is already at or newer than the requested version".to_owned()
+                    "remote Herdr is newer than the requested version".to_owned()
                 )
             );
             assert!(
                 !root.path().join("updated").exists(),
                 "server executed the updater for requested {requested}"
             );
-            assert_eq!(*advertised.borrow(), HerdrVersion::new(1, 2, 3));
+            let expected_advertised = if requested == HerdrVersion::new(1, 2, 3) {
+                HerdrVersion::new(9, 9, 9)
+            } else {
+                HerdrVersion::new(1, 2, 3)
+            };
+            assert_eq!(*advertised.borrow(), expected_advertised);
         }
     }
 
@@ -720,6 +1478,7 @@ mod tests {
         assert_eq!(
             perform_upgrade(
                 &executable,
+                "work",
                 HerdrVersion::new(1, 2, 3),
                 &advertised,
                 updater,
@@ -737,28 +1496,168 @@ mod tests {
         fs::write(
             &executable,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = update ]; then printf '%s' '{secret}' >&2; exit 7; fi\nprintf 'herdr 1.2.2\\n'\n"
+                "#!/bin/sh\nif [ \"$1\" = update ]; then printf '%s' '{secret}' >&2; exit 7; fi\nif [ \"$1\" = --version ]; then printf 'herdr 1.2.2\\n'; exit 0; fi\nif [ \"$1\" = session ] && [ \"$2\" = list ]; then printf '{{\"sessions\":[{{\"name\":\"work\",\"running\":true}}]}}\\n'; exit 0; fi\nif [ \"$1\" = --session ] && [ \"$3\" = status ]; then printf '{{\"running\":true,\"version\":\"1.2.2\"}}\\n'; exit 0; fi\nexit 9\n"
             ),
         )
         .unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         let (advertised, _) = watch::channel(HerdrVersion::new(1, 2, 2));
 
-        let response = perform_upgrade(
+        let response = perform_upgrade_with(
             &executable,
+            "work",
             HerdrVersion::new(1, 2, 3),
             &advertised,
             Arc::new(Semaphore::new(1)),
+            |executable, session, requested| {
+                herdr_version::update_session_with_config(executable, session, requested, None)
+            },
         );
         assert_eq!(
             response,
-            UpgradeResponse::Failed("remote Herdr update failed".to_owned())
+            UpgradeResponse::Failed("remote Herdr update failed and was rolled back".to_owned())
         );
         let wire = format!("{response:?}");
         assert!(!wire.contains("wire-secret"), "{wire}");
         assert!(!wire.contains("example.test"), "{wire}");
         assert!(!wire.contains("/srv/private"), "{wire}");
         assert!(!wire.contains("secret-herdr"), "{wire}");
+    }
+
+    #[tokio::test]
+    async fn candidate_confirmation_budget_begins_at_cutover() {
+        tokio::time::timeout(Duration::from_secs(8), async {
+            let root = crate::test_support::canonical_tempdir();
+            let executable = root.path().join("candidate");
+            fs::write(
+                &executable,
+                "#!/bin/sh\nset -eu\nIFS= read -r config\nprintf '%s\\n' '{\"type\":\"prepared\",\"version\":{\"major\":0,\"minor\":4,\"patch\":0}}'\nIFS= read -r activate\nsleep 1\nprintf '%s\\n' '{\"type\":\"ready\",\"version\":{\"major\":0,\"minor\":4,\"patch\":0}}' '{\"type\":\"consumer_connected\"}'\nIFS= read -r commit\n",
+            )
+            .unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+            let version = AttachedVersion::new(0, 4, 0);
+            let config = CandidateConfig {
+                serve: ServeConfig {
+                    state_dir: root.path().join("state"),
+                    herdr_bin: PathBuf::from("herdr"),
+                    host_label: "office".to_owned(),
+                },
+                operation_id: UpdateOperationId::from_bytes([0x30; 16]),
+                session: "work".to_owned(),
+                expected_version: version,
+                expected_endpoint_identity: [0x51; 32],
+                capability: [0x61; 32],
+                master_key: [0x71; 32],
+                bind_sockets: Vec::new(),
+            };
+            let mut candidate = CandidateProcess::spawn(&executable, &config).await.unwrap();
+
+            // Simulate slow response acknowledgement and old-endpoint shutdown taking longer than
+            // the candidate confirmation budget. That pre-cutover work must not consume the budget.
+            tokio::time::sleep(Duration::from_millis(2_200)).await;
+            confirm_attached_candidate(&mut candidate, version, Duration::from_secs(2))
+                .await
+                .unwrap();
+            assert!(candidate.supervise().await.unwrap().success());
+        })
+        .await
+        .expect("candidate confirmation scenario timed out");
+    }
+
+    #[tokio::test]
+    async fn candidate_confirmation_waits_for_watchdog_commit() {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let operation_id = UpdateOperationId::from_bytes([0x31; 16]);
+            let candidate_version = AttachedVersion::new(0, 4, 0);
+            let (events, mut received_events) = mpsc::unbounded_channel();
+            let (disposition_tx, disposition) = watch::channel(CandidateDisposition::Pending);
+            let candidate = Arc::new(CandidateConfirmation {
+                operation_id,
+                session: "work".to_owned(),
+                version: candidate_version,
+                events,
+                disposition,
+                abort: CancellationToken::new(),
+                announced_consumer: Arc::new(AtomicBool::new(false)),
+            });
+            let resources = Arc::new(UpdateResources {
+                config: ServeConfig {
+                    state_dir: PathBuf::from("/state"),
+                    herdr_bin: PathBuf::from("herdr"),
+                    host_label: "office".to_owned(),
+                },
+                master_key: Arc::new(Zeroizing::new([0x41; 32])),
+                endpoint_identity: [0x51; 32],
+                bind_sockets: Vec::new(),
+                capability: CapabilitySecret::from_bytes([0x61; 32]),
+                update_limit: Arc::new(Semaphore::new(1)),
+                active_operation: Arc::new(Mutex::new(None)),
+                candidate: Some(candidate),
+                rollback: None,
+            });
+            let confirmation = tokio::spawn(async move {
+                candidate_confirmation_response(&resources, "work", operation_id, candidate_version)
+                    .await
+            });
+
+            assert_eq!(
+                received_events.recv().await.unwrap(),
+                CandidateEvent::ConsumerConnected
+            );
+            assert!(!confirmation.is_finished());
+            disposition_tx.send_replace(CandidateDisposition::Committed);
+            let (response, completion) = confirmation.await.unwrap();
+            assert_eq!(
+                response,
+                AttachedUpdateResponse::Committed(candidate_version)
+            );
+            completion
+                .unwrap()
+                .send(CandidateEvent::ClientSucceeded)
+                .unwrap();
+            assert_eq!(
+                received_events.recv().await.unwrap(),
+                CandidateEvent::ClientSucceeded
+            );
+        })
+        .await
+        .expect("candidate confirmation scenario timed out");
+    }
+
+    #[tokio::test]
+    async fn rolled_back_operation_returns_a_terminal_failure() {
+        let operation_id = UpdateOperationId::from_bytes([0x32; 16]);
+        let resources = UpdateResources {
+            config: ServeConfig {
+                state_dir: PathBuf::from("/state"),
+                herdr_bin: PathBuf::from("herdr"),
+                host_label: "office".to_owned(),
+            },
+            master_key: Arc::new(Zeroizing::new([0x41; 32])),
+            endpoint_identity: [0x51; 32],
+            bind_sockets: Vec::new(),
+            capability: CapabilitySecret::from_bytes([0x61; 32]),
+            update_limit: Arc::new(Semaphore::new(1)),
+            active_operation: Arc::new(Mutex::new(None)),
+            candidate: None,
+            rollback: Some(RollbackRecord {
+                operation_id,
+                reason: "previous server restored".to_owned(),
+            }),
+        };
+
+        let (response, completion) = candidate_confirmation_response(
+            &resources,
+            "work",
+            operation_id,
+            AttachedVersion::new(0, 4, 0),
+        )
+        .await;
+        assert_eq!(
+            response,
+            AttachedUpdateResponse::Failed("previous server restored".to_owned())
+        );
+        assert!(completion.is_none());
     }
 
     #[tokio::test]
@@ -840,7 +1739,7 @@ mod tests {
                     calls.fetch_add(1, Ordering::SeqCst);
                     async { Ok(()) }
                 },
-                |_| {
+                |_, _| {
                     server_calls.fetch_add(1, Ordering::SeqCst);
                     UpgradeResponse::Busy
                 },
@@ -876,7 +1775,8 @@ mod tests {
                     anyhow::ensure!(session == "work", "wrong session");
                     Ok(())
                 },
-                |version| {
+                |session, version| {
+                    assert_eq!(session, "work");
                     assert_eq!(version, requested);
                     UpgradeResponse::Updated(version)
                 },

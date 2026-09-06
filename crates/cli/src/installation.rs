@@ -5,14 +5,17 @@ use std::{
     io::{self, BufRead, IsTerminal, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, ensure};
 
-use crate::{identity, local_encryption};
+use crate::{attached_version::AttachedVersion, identity, local_encryption};
 
 const ATTACHED_BINARY: &str = "attached";
 const INSTALLER_URL: &str = "https://install.attached.sh";
+const REMOTE_UPDATE_TIMEOUT: Duration = Duration::from_secs(120);
+const REMOTE_UPDATE_OUTPUT_LIMIT: u64 = 64 * 1024;
 
 pub fn update() -> Result<()> {
     let executable = current_attached_executable()?;
@@ -28,8 +31,8 @@ pub fn update() -> Result<()> {
     )
 }
 
-pub fn uninstall(assume_yes: bool) -> Result<()> {
-    let plan = UninstallPlan::discover()?;
+pub fn uninstall(assume_yes: bool, configured_directory: &Path) -> Result<()> {
+    let plan = UninstallPlan::discover(configured_directory)?;
 
     if !assume_yes {
         ensure!(
@@ -49,7 +52,7 @@ pub fn uninstall(assume_yes: bool) -> Result<()> {
     Ok(())
 }
 
-fn current_attached_executable() -> Result<PathBuf> {
+pub(crate) fn current_attached_executable() -> Result<PathBuf> {
     let executable =
         env::current_exe().context("could not locate the current Attached executable")?;
     validate_executable_path(&executable)?;
@@ -80,6 +83,143 @@ fn validate_executable_path(executable: &Path) -> Result<()> {
     Ok(())
 }
 
+pub(crate) struct PreparedRemoteUpdate {
+    executable: PathBuf,
+    rollback: Option<tempfile::NamedTempFile>,
+    candidate_version: AttachedVersion,
+}
+
+impl PreparedRemoteUpdate {
+    pub(crate) fn executable(&self) -> &Path {
+        &self.executable
+    }
+
+    pub(crate) const fn candidate_version(&self) -> AttachedVersion {
+        self.candidate_version
+    }
+
+    pub(crate) fn commit(mut self) -> Result<()> {
+        let rollback = self
+            .rollback
+            .take()
+            .context("update rollback is unavailable")?;
+        rollback
+            .close()
+            .context("could not remove the previous Attached binary after commit")?;
+        sync_parent(&self.executable)
+    }
+
+    pub(crate) fn rollback(mut self) -> Result<()> {
+        let rollback = self
+            .rollback
+            .take()
+            .context("update rollback is unavailable")?;
+        restore_backup(&self.executable, rollback)
+    }
+}
+
+impl Drop for PreparedRemoteUpdate {
+    fn drop(&mut self) {
+        if let Some(rollback) = self.rollback.take() {
+            let _ = restore_backup(&self.executable, rollback);
+        }
+    }
+}
+
+pub(crate) fn prepare_remote_update() -> Result<PreparedRemoteUpdate> {
+    prepare_remote_update_at(&current_attached_executable()?)
+}
+
+fn prepare_remote_update_at(executable: &Path) -> Result<PreparedRemoteUpdate> {
+    validate_executable_path(executable)?;
+    let install_dir = executable
+        .parent()
+        .context("the current Attached executable has no parent directory")?;
+    let rollback = tempfile::Builder::new()
+        .prefix(".attached-rollback-")
+        .tempfile_in(install_dir)
+        .with_context(|| {
+            format!(
+                "could not create an update rollback file in {}",
+                install_dir.display()
+            )
+        })?;
+    fs::copy(executable, rollback.path()).with_context(|| {
+        format!(
+            "could not retain the current Attached binary {}",
+            executable.display()
+        )
+    })?;
+    fs::set_permissions(rollback.path(), fs::metadata(executable)?.permissions())?;
+    rollback
+        .as_file()
+        .sync_all()
+        .context("could not sync the retained Attached binary")?;
+
+    let mut prepared = PreparedRemoteUpdate {
+        executable: executable.to_owned(),
+        rollback: Some(rollback),
+        candidate_version: crate::attached_version::current(),
+    };
+    let result = (|| {
+        let output = crate::bounded_process::run(
+            executable,
+            [OsStr::new("update")].as_slice(),
+            REMOTE_UPDATE_TIMEOUT,
+            REMOTE_UPDATE_OUTPUT_LIMIT,
+        )?;
+        ensure!(
+            output.status.success(),
+            "remote `attached update` exited with status {}: {}",
+            output.status,
+            crate::bounded_process::diagnostic(&output.stderr)
+        );
+        validate_executable_path(executable)
+            .context("the updater did not leave a valid Attached executable")?;
+        let candidate_version = crate::attached_version::query(executable)
+            .context("could not verify the updated Attached executable")?;
+        ensure!(
+            candidate_version >= crate::attached_version::current(),
+            "the Attached updater installed older version {candidate_version}"
+        );
+        prepared.candidate_version = candidate_version;
+        sync_parent(executable)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        return match prepared.rollback() {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(rollback.context(error)),
+        };
+    }
+    Ok(prepared)
+}
+
+fn restore_backup(executable: &Path, rollback: tempfile::NamedTempFile) -> Result<()> {
+    rollback
+        .as_file()
+        .sync_all()
+        .context("could not sync the retained Attached binary")?;
+    let rollback = rollback.into_temp_path();
+    fs::rename(&rollback, executable).with_context(|| {
+        format!(
+            "could not restore the previous Attached binary at {}",
+            executable.display()
+        )
+    })?;
+    sync_parent(executable)
+}
+
+fn sync_parent(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("Attached binary has no parent directory")?;
+    fs::File::open(parent)
+        .with_context(|| format!("could not open {} for synchronization", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("could not synchronize {}", parent.display()))
+}
+
 fn run_installer(
     url: &str,
     install_dir: &Path,
@@ -90,6 +230,7 @@ fn run_installer(
         .context("could not create a temporary file for the Attached installer")?;
     let download_status = Command::new(curl_executable)
         .args([
+            "--disable",
             "--proto",
             "=https",
             "--proto-redir",
@@ -137,7 +278,7 @@ struct UninstallPlan {
 }
 
 impl UninstallPlan {
-    fn discover() -> Result<Self> {
+    fn discover(configured_directory: &Path) -> Result<Self> {
         let executable = current_attached_executable()?;
         let home = env::var_os("HOME").context("HOME is not set")?;
         let home = PathBuf::from(home);
@@ -146,7 +287,11 @@ impl UninstallPlan {
 
         Ok(Self {
             executable,
-            data_directories: attached_data_directories(&home, env::var_os("XDG_CONFIG_HOME"))?,
+            data_directories: attached_data_directories(
+                &home,
+                env::var_os("XDG_CONFIG_HOME"),
+                Some(configured_directory),
+            )?,
             installer_files: vec![home.join(".config/fish/conf.d/attached.env.fish")],
         })
     }
@@ -174,7 +319,7 @@ impl UninstallPlan {
 
         local_encryption::with_key_coordination(|| {
             for directory in &self.data_directories {
-                remove_path_if_present(directory).with_context(|| {
+                remove_owned_state(directory).with_context(|| {
                     format!(
                         "could not delete Attached credentials and state from {}",
                         directory.display()
@@ -182,7 +327,7 @@ impl UninstallPlan {
                 })?;
             }
             for file in &self.installer_files {
-                remove_path_if_present(file).with_context(|| {
+                remove_installer_file(file).with_context(|| {
                     format!(
                         "could not delete installer metadata from {}",
                         file.display()
@@ -209,6 +354,7 @@ impl UninstallPlan {
 fn attached_data_directories(
     home: &Path,
     xdg_config_home: Option<std::ffi::OsString>,
+    configured_directory: Option<&Path>,
 ) -> Result<Vec<PathBuf>> {
     let state_directory = identity::state_dir_for_home(home)?;
     ensure!(
@@ -226,6 +372,16 @@ fn attached_data_directories(
         let installer_directory = xdg_config_home.join(ATTACHED_BINARY);
         if !directories.contains(&installer_directory) {
             directories.push(installer_directory);
+        }
+    }
+
+    if let Some(configured_directory) = configured_directory {
+        ensure!(
+            configured_directory.is_absolute(),
+            "the configured Attached directory must be an absolute path"
+        );
+        if !directories.iter().any(|path| path == configured_directory) {
+            directories.push(configured_directory.to_owned());
         }
     }
 
@@ -248,17 +404,89 @@ fn ensure_install_directory_is_writable(executable: &Path) -> Result<()> {
     Ok(())
 }
 
-fn remove_path_if_present(path: &Path) -> Result<()> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
+// Exact names only: neither a directory name nor an installer receipt proves
+// ownership of other contents. Unknown files (including abandoned temporaries)
+// and directories are deliberately retained for manual inspection.
+const OWNED_STATE_FILES: &[&str] = &[
+    "admin-identity.key",
+    "sync-account.bundle",
+    "sync-account.lock",
+    "sync-catalog.json",
+    "sync-catalog.lock",
+    "encryption-salt.argon2id-v1",
+    "one-password-item.json",
+    "config.toml",
+    "attached-receipt.json",
+];
 
-    if metadata.file_type().is_dir() {
-        fs::remove_dir_all(path)?;
-    } else {
-        fs::remove_file(path)?;
+fn open_cleanup_directory(path: &Path) -> Result<Option<fs::File>> {
+    use rustix::fs::{Mode, OFlags};
+    use std::path::Component;
+
+    ensure!(path.is_absolute(), "cleanup directory must be absolute");
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut directory = fs::File::from(rustix::fs::open("/", flags, Mode::empty())?);
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => {
+                match rustix::fs::openat(&directory, name, flags, Mode::empty()) {
+                    Ok(next) => directory = next.into(),
+                    Err(rustix::io::Errno::NOENT) => return Ok(None),
+                    Err(error) => return Err(error).context("refusing unsafe cleanup traversal"),
+                }
+            }
+            _ => anyhow::bail!("cleanup path must not contain parent components"),
+        }
+    }
+    Ok(Some(directory))
+}
+
+fn unlink_cleanup_file(directory: &fs::File, name: &std::ffi::OsStr) -> Result<()> {
+    // unlinkat without REMOVEDIR cannot recurse or follow the final symlink,
+    // even if another process substitutes an entry after we open the directory.
+    match rustix::fs::unlinkat(directory, name, rustix::fs::AtFlags::empty()) {
+        Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("could not remove {}", name.display())),
+    }
+}
+
+fn remove_owned_state(path: &Path) -> Result<()> {
+    use rustix::fs::{AtFlags, FileType};
+    let parent = path.parent().context("cleanup path has no parent")?;
+    let name = path.file_name().context("cleanup path has no file name")?;
+    let Some(parent) = open_cleanup_directory(parent)? else {
+        return Ok(());
+    };
+    match rustix::fs::statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::Symlink => {
+            return unlink_cleanup_file(&parent, name);
+        }
+        Ok(_) => {}
+        Err(rustix::io::Errno::NOENT) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    let directory = rustix::fs::openat(
+        &parent,
+        name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map(fs::File::from)?;
+    for name in OWNED_STATE_FILES {
+        unlink_cleanup_file(&directory, std::ffi::OsStr::new(name))?;
+    }
+    Ok(())
+}
+
+fn remove_installer_file(path: &Path) -> Result<()> {
+    let parent = path.parent().context("installer file has no parent")?;
+    let name = path.file_name().context("installer file has no name")?;
+    if let Some(directory) = open_cleanup_directory(parent)? {
+        unlink_cleanup_file(&directory, name)?;
     }
     Ok(())
 }
@@ -274,8 +502,17 @@ fn confirm_uninstall(
     )?;
     writeln!(output, "  binary: {}", plan.executable.display())?;
     for directory in &plan.data_directories {
-        writeln!(output, "  data:   {}", directory.display())?;
+        writeln!(output, "  managed files in: {}", directory.display())?;
     }
+    writeln!(
+        output,
+        "Only these state filenames are removed: {}.",
+        OWNED_STATE_FILES.join(", ")
+    )?;
+    writeln!(
+        output,
+        "Directories and all other contents are preserved; inspect any leftovers manually."
+    )?;
     writeln!(
         output,
         "Any 1Password-managed encryption password is preserved because other computers and custom state directories cannot be discovered."
@@ -379,6 +616,11 @@ mod tests {
             install_dir.to_str().unwrap()
         );
         let arguments = fs::read_to_string(curl_arguments).unwrap();
+        assert_eq!(
+            arguments.lines().next(),
+            Some("--disable"),
+            "curl only skips its configuration when --disable is the first argument"
+        );
         for expected in [
             "--proto",
             "=https",
@@ -429,6 +671,84 @@ mod tests {
     }
 
     #[test]
+    fn prepared_remote_update_commits_or_restores_on_rollback_and_drop() {
+        enum Finish {
+            Commit,
+            Rollback,
+            Drop,
+        }
+        for finish in [Finish::Commit, Finish::Rollback, Finish::Drop] {
+            let root = crate::test_support::canonical_tempdir();
+            let executable = root.path().join(ATTACHED_BINARY);
+            let candidate = root.path().join("candidate");
+            script(
+                &candidate,
+                "if [ \"${1-}\" = --version ]; then printf 'attached 9.9.9\\n'; exit 0; fi\nexit 9",
+            );
+            script(
+                &executable,
+                &format!(
+                    "if [ \"${{1-}}\" = update ]; then cp '{}' \"$0.next\"; chmod 700 \"$0.next\"; mv \"$0.next\" \"$0\"; exit 0; fi\nif [ \"${{1-}}\" = --version ]; then printf 'attached {}\\n'; exit 0; fi\nexit 9",
+                    candidate.display(),
+                    env!("CARGO_PKG_VERSION")
+                ),
+            );
+
+            let original = fs::read(&executable).unwrap();
+            let prepared = prepare_remote_update_at(&executable).unwrap();
+            assert_eq!(prepared.candidate_version(), AttachedVersion::new(9, 9, 9));
+            assert_eq!(
+                crate::attached_version::query(&executable).unwrap(),
+                AttachedVersion::new(9, 9, 9)
+            );
+            let committed = matches!(finish, Finish::Commit);
+            match finish {
+                Finish::Commit => prepared.commit().unwrap(),
+                Finish::Rollback => prepared.rollback().unwrap(),
+                Finish::Drop => drop(prepared),
+            }
+            if committed {
+                assert_eq!(
+                    fs::read(&executable).unwrap(),
+                    fs::read(&candidate).unwrap()
+                );
+            } else {
+                assert_eq!(fs::read(&executable).unwrap(), original);
+            }
+            assert_eq!(
+                fs::read_dir(root.path()).unwrap().count(),
+                2,
+                "rollback file leaked"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_remote_update_restores_the_previous_binary() {
+        let root = crate::test_support::canonical_tempdir();
+        let executable = root.path().join(ATTACHED_BINARY);
+        let broken = root.path().join("broken");
+        script(&broken, "printf broken; exit 19");
+        script(
+            &executable,
+            &format!(
+                "if [ \"${{1-}}\" = update ]; then cp '{}' \"$0.next\"; chmod 700 \"$0.next\"; mv \"$0.next\" \"$0\"; exit 7; fi\nif [ \"${{1-}}\" = --version ]; then printf 'attached {}\\n'; exit 0; fi\nexit 9",
+                broken.display(),
+                env!("CARGO_PKG_VERSION")
+            ),
+        );
+
+        let error = prepare_remote_update_at(&executable)
+            .err()
+            .expect("failed updater was accepted");
+        assert!(error.to_string().contains("status"), "{error:#}");
+        assert_eq!(
+            crate::attached_version::query(&executable).unwrap(),
+            crate::attached_version::current()
+        );
+    }
+
+    #[test]
     fn uninstall_removes_the_binary_credentials_state_and_installer_receipt() {
         let root = crate::test_support::canonical_tempdir();
         let executable = executable(root.path());
@@ -439,7 +759,9 @@ mod tests {
         fs::create_dir_all(&state).unwrap();
         fs::create_dir_all(&xdg_state).unwrap();
         fs::create_dir_all(fish_configuration.parent().unwrap()).unwrap();
-        fs::write(state.join("sync-account.json"), b"credential").unwrap();
+        for name in OWNED_STATE_FILES {
+            fs::write(state.join(name), b"synthetic state").unwrap();
+        }
         fs::write(xdg_state.join("attached-receipt.json"), b"receipt").unwrap();
         fs::write(&fish_configuration, b"installer path setup").unwrap();
 
@@ -448,6 +770,7 @@ mod tests {
             data_directories: attached_data_directories(
                 &home,
                 Some(root.path().join("xdg").into_os_string()),
+                None,
             )
             .unwrap(),
             installer_files: vec![fish_configuration.clone()],
@@ -456,10 +779,33 @@ mod tests {
         plan.execute_with_store(&store).unwrap();
 
         assert!(!executable.exists());
-        assert!(!state.exists());
-        assert!(!xdg_state.exists());
+        assert_eq!(fs::read_dir(&state).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&xdg_state).unwrap().count(), 0);
         assert!(!fish_configuration.exists());
         assert_eq!(*store.remove_calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn uninstall_preserves_unrelated_custom_directory_contents() {
+        let root = crate::test_support::canonical_tempdir();
+        let state = root.path().join("shared");
+        fs::create_dir(&state).unwrap();
+        fs::write(state.join("sync-account.bundle"), b"synthetic credential").unwrap();
+        fs::write(state.join("sentinel"), b"unrelated").unwrap();
+        fs::create_dir(state.join("unrelated-directory")).unwrap();
+        fs::write(state.join("unrelated-directory/keep"), b"keep").unwrap();
+        let plan = UninstallPlan {
+            executable: executable(root.path()),
+            data_directories: vec![state.clone()],
+            installer_files: Vec::new(),
+        };
+        plan.execute_with_store(&RemovalStore::default()).unwrap();
+        assert_eq!(fs::read(state.join("sentinel")).unwrap(), b"unrelated");
+        assert_eq!(
+            fs::read(state.join("unrelated-directory/keep")).unwrap(),
+            b"keep"
+        );
+        assert!(!state.join("sync-account.bundle").exists());
     }
 
     #[test]
@@ -493,7 +839,7 @@ mod tests {
         let executable = executable(root.path());
         let state = root.path().join("state");
         fs::create_dir(&state).unwrap();
-        fs::write(state.join("ciphertext"), b"encrypted").unwrap();
+        fs::write(state.join("sync-account.bundle"), b"encrypted").unwrap();
         let plan = UninstallPlan {
             executable: executable.clone(),
             data_directories: vec![state.clone()],
@@ -505,7 +851,7 @@ mod tests {
         };
 
         plan.execute_with_store(&store).unwrap();
-        assert!(!state.exists());
+        assert!(!state.join("sync-account.bundle").exists());
         assert!(!executable.exists());
         assert_eq!(*store.remove_calls.lock().unwrap(), 0);
     }
@@ -530,6 +876,35 @@ mod tests {
         assert!(!executable.exists());
         assert!(!linked_state.exists());
         assert_eq!(fs::read(external.join("keep")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn uninstall_unlinks_owned_symlinks_without_touching_targets() {
+        let root = crate::test_support::canonical_tempdir();
+        let state = root.path().join("state");
+        fs::create_dir(&state).unwrap();
+        let external = root.path().join("keep");
+        fs::write(&external, b"keep").unwrap();
+        symlink(&external, state.join("sync-account.bundle")).unwrap();
+        remove_owned_state(&state).unwrap();
+        assert!(!state.join("sync-account.bundle").is_symlink());
+        assert_eq!(fs::read(external).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn uninstall_rejects_symlinked_ancestors_and_directory_shaped_files() {
+        let root = crate::test_support::canonical_tempdir();
+        let state = root.path().join("state");
+        fs::create_dir_all(state.join("sync-account.bundle")).unwrap();
+        fs::write(state.join("sync-account.bundle/keep"), b"keep").unwrap();
+        symlink(root.path(), root.path().join("linked")).unwrap();
+        assert!(remove_owned_state(&root.path().join("linked/state")).is_err());
+        assert!(remove_owned_state(&state).is_err());
+        assert!(remove_installer_file(&state.join("sync-account.bundle")).is_err());
+        assert_eq!(
+            fs::read(state.join("sync-account.bundle/keep")).unwrap(),
+            b"keep"
+        );
     }
 
     #[test]
@@ -572,13 +947,32 @@ mod tests {
     }
 
     #[test]
+    fn uninstall_includes_the_configured_directory_without_duplicates() {
+        let root = crate::test_support::canonical_tempdir();
+        let home = root.path().join("home");
+        let configured = root.path().join("configured");
+
+        let directories = attached_data_directories(&home, None, Some(&configured)).unwrap();
+        assert_eq!(
+            directories,
+            vec![home.join(".config/attached"), configured.clone()]
+        );
+
+        let default = home.join(".config/attached");
+        assert_eq!(
+            attached_data_directories(&home, None, Some(&default)).unwrap(),
+            vec![default]
+        );
+    }
+
+    #[test]
     fn lifecycle_commands_reject_renamed_executables_and_relative_config_roots() {
         let root = crate::test_support::canonical_tempdir();
         let renamed = root.path().join("renamed");
         fs::write(&renamed, b"binary").unwrap();
         assert!(validate_executable_path(&renamed).is_err());
 
-        let error = attached_data_directories(root.path(), Some("relative".into()))
+        let error = attached_data_directories(root.path(), Some("relative".into()), None)
             .unwrap_err()
             .to_string();
         assert!(error.contains("XDG_CONFIG_HOME"), "{error}");

@@ -79,6 +79,9 @@ pub async fn select(
         .shutdown()
         .await
         .context("failed to finish the fzf candidate input")?;
+    // ChildStdin::shutdown does not close a Unix pipe. fzf must receive EOF
+    // before we wait for its result; the handle was taken out of Child above.
+    drop(picker_stdin);
 
     let output = child
         .wait_with_output()

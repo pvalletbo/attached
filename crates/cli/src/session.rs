@@ -47,6 +47,7 @@ impl Session {
         Ok(&self.tui_socket)
     }
 
+    #[tracing::instrument(name = "attach_local_session", level = "debug", skip_all)]
     pub async fn attach_local(&self, herdr_bin: &Path) -> Result<i32> {
         self.validate()?;
         let status = Command::new(herdr_bin)
@@ -105,6 +106,7 @@ impl SessionManager {
         self.active_sessions_with_timeout(SESSION_DISCOVERY_TIMEOUT)
     }
 
+    #[tracing::instrument(name = "discover_local_sessions_blocking", level = "debug", skip_all)]
     fn active_sessions_with_timeout(&self, timeout: Duration) -> Result<Vec<Session>> {
         ensure!(!timeout.is_zero(), "Herdr session discovery timed out");
         let output = bounded_process::run(
@@ -316,6 +318,7 @@ pub async fn ensure_active(
         .context("default Herdr session startup worker failed")?
 }
 
+#[tracing::instrument(name = "discover_local_sessions", level = "debug", skip_all)]
 pub async fn discover_active(herdr_bin: PathBuf) -> Result<Vec<Session>> {
     tokio::task::spawn_blocking(move || SessionManager::new(herdr_bin).active_sessions())
         .await

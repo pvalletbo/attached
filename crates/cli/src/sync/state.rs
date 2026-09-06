@@ -233,11 +233,13 @@ fn install_account(state_dir: &Path, encoded: &[u8], allow_idempotent: bool) -> 
     })
 }
 
+#[tracing::instrument(name = "load_sync_account", level = "debug", skip_all)]
 pub fn load_account(state_dir: &Path, required_scope: ApiKeyScope) -> Result<AccountCredentials> {
     load_account_optional(state_dir, required_scope)?
         .context("no synchronization account is configured")
 }
 
+#[tracing::instrument(name = "inspect_sync_account", level = "debug", skip_all)]
 pub fn has_download_account(state_dir: &Path) -> Result<bool> {
     Ok(match load_stored_account(state_dir)? {
         None => false,
@@ -246,6 +248,7 @@ pub fn has_download_account(state_dir: &Path) -> Result<bool> {
     })
 }
 
+#[tracing::instrument(name = "load_optional_sync_account", level = "debug", skip_all)]
 pub fn load_account_optional(
     state_dir: &Path,
     required_scope: ApiKeyScope,
@@ -261,6 +264,7 @@ fn load_stored_account(state_dir: &Path) -> Result<Option<AccountBundle>> {
     load_stored_account_with_store(state_dir, active_store())
 }
 
+#[tracing::instrument(name = "read_sync_account", level = "debug", skip_all)]
 fn load_stored_account_with_store(
     state_dir: &Path,
     store: &dyn MasterKeyStore,

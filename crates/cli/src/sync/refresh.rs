@@ -7,6 +7,7 @@ use std::{
 use anyhow::{Context as _, Result, ensure};
 use attached_session_sync_protocol::{
     account::{ApiKeyScope, RecordId},
+    api::LiveRecordIndexEntry,
     canonical::HerdrVersion as SessionAccessHerdrVersion,
     crypto::{
         Envelope as CryptoEnvelope, VerificationContext,
@@ -14,12 +15,15 @@ use attached_session_sync_protocol::{
     },
 };
 use attached_tunnel_protocol::HerdrVersion;
+use futures_util::{StreamExt as _, stream};
 
 use super::{
-    http::SyncHttpClient,
+    http::{FetchedRecord, SyncHttpClient},
     state,
     state_catalog::{self, CatalogRecord, SyncedSession},
 };
+
+const RECORD_FETCH_CONCURRENCY: usize = 8;
 
 #[derive(Debug)]
 pub struct RefreshResult {
@@ -31,6 +35,10 @@ pub struct RefreshResult {
 pub enum RefreshWarning {
     CatalogRebuilt(anyhow::Error),
     RecordDiscarded {
+        record_id: RecordId,
+        error: anyhow::Error,
+    },
+    RecordUnavailable {
         record_id: RecordId,
         error: anyhow::Error,
     },
@@ -54,6 +62,10 @@ impl fmt::Display for RefreshWarning {
                 formatter,
                 "discarded synchronized record {record_id} from the local catalog: {error}"
             ),
+            Self::RecordUnavailable { record_id, error } => write!(
+                formatter,
+                "synchronized record {record_id} is temporarily unavailable: {error:#}; retry discovery"
+            ),
             Self::EndpointRegistryUnavailable => formatter.write_str(
                 "could not inspect the local endpoint registry; remote sessions were retained",
             ),
@@ -61,6 +73,7 @@ impl fmt::Display for RefreshWarning {
     }
 }
 
+#[tracing::instrument(name = "refresh_sessions", level = "debug", skip_all)]
 pub async fn refresh_sessions(
     state_dir: &Path,
     local_version: HerdrVersion,
@@ -92,6 +105,7 @@ async fn refresh_sessions_with_registry(
     .await
 }
 
+#[tracing::instrument(name = "refresh_catalog", level = "debug", skip_all)]
 async fn refresh_sessions_with_registry_at(
     state_dir: &Path,
     local_version: HerdrVersion,
@@ -132,6 +146,7 @@ async fn refresh_sessions_with_registry_at(
         .map(|record| (record.record_id, record))
         .collect::<BTreeMap<_, _>>();
     let mut accepted = Vec::with_capacity(index.records.len());
+    let mut changed = Vec::new();
     for indexed in index.records {
         let previous = existing.remove(&indexed.record_id);
         if let Some(previous) = previous
@@ -153,22 +168,27 @@ async fn refresh_sessions_with_registry_at(
             accepted.push(previous);
             continue;
         }
+        changed.push(indexed);
+    }
 
-        let fetched = client
-            .get_record(&account, indexed.record_id)
-            .await
-            .with_context(|| format!("could not fetch synchronized record {}", indexed.record_id))?
-            .with_context(|| {
-                format!(
-                    "synchronized record {} changed while refreshing",
-                    indexed.record_id
-                )
-            })?;
-        ensure!(
-            fetched.revision == indexed.revision,
-            "synchronized record {} changed while refreshing",
-            indexed.record_id
-        );
+    for (indexed, fetched) in fetch_changed_records(&client, &account, changed).await {
+        let fetched = match fetched {
+            Ok(Some(fetched)) => fetched,
+            result => {
+                let error = match result {
+                    Ok(None) => anyhow::anyhow!("record was removed during refresh"),
+                    Err(error) => error,
+                    Ok(Some(_)) => unreachable!(),
+                };
+                tracing::debug!(record_id = %indexed.record_id, outcome = "unavailable",
+                    "skipped unavailable synchronized record during refresh");
+                warnings.push(RefreshWarning::RecordUnavailable {
+                    record_id: indexed.record_id,
+                    error,
+                });
+                continue;
+            }
+        };
         let envelope = CryptoEnvelope::new(fetched.envelope.nonce, fetched.envelope.ciphertext)
             .with_context(|| {
                 format!(
@@ -221,6 +241,73 @@ async fn refresh_sessions_with_registry_at(
     let listing =
         state_catalog::sessions_excluding_local_endpoints(state_dir, &account, now, registry_dir)?;
     Ok(finish_refresh(listing, warnings))
+}
+
+const MAX_RECORD_FETCH_ATTEMPTS: usize = 3;
+
+// The index is not a snapshot. A newer GET may be used only after a second
+// index observation confirms that exact revision. Never move the revision
+// floor backwards, and still authenticate/decrypt the accepted envelope at the
+// caller. Continuous publication costs at most three GETs and three rechecks.
+#[tracing::instrument(name = "reconcile_sync_record", level = "debug", skip_all)]
+async fn fetch_consistent_record(
+    client: &SyncHttpClient,
+    account: &state::AccountCredentials,
+    mut indexed: LiveRecordIndexEntry,
+) -> Result<Option<FetchedRecord>> {
+    for attempt in 1..=MAX_RECORD_FETCH_ATTEMPTS {
+        let Some(fetched) = client.get_record(account, indexed.record_id).await? else {
+            return Ok(None);
+        };
+        ensure!(
+            fetched.revision >= indexed.revision,
+            "record revision moved backwards during refresh"
+        );
+        if fetched.revision == indexed.revision {
+            return Ok(Some(fetched));
+        }
+        tracing::debug!(record_id = %indexed.record_id, attempt,
+            indexed_revision = indexed.revision, fetched_revision = fetched.revision,
+            "publication raced catalog refresh; rechecking index");
+        let index = client
+            .list_records(account)
+            .await
+            .context("could not recheck the synchronized record index")?;
+        let Some(current) = index
+            .records
+            .into_iter()
+            .find(|entry| entry.record_id == indexed.record_id)
+        else {
+            return Ok(None);
+        };
+        ensure!(
+            current.revision >= fetched.revision,
+            "record index moved backwards during refresh"
+        );
+        if current.revision == fetched.revision {
+            return Ok(Some(fetched));
+        }
+        indexed = current;
+    }
+    anyhow::bail!("record kept changing after {MAX_RECORD_FETCH_ATTEMPTS} fetch attempts")
+}
+
+async fn fetch_changed_records(
+    client: &SyncHttpClient,
+    account: &state::AccountCredentials,
+    records: Vec<LiveRecordIndexEntry>,
+) -> Vec<(LiveRecordIndexEntry, Result<Option<FetchedRecord>>)> {
+    stream::iter(records)
+        .map(|indexed| async move {
+            let fetched = fetch_consistent_record(client, account, indexed).await;
+            (indexed, fetched)
+        })
+        // Bound whole reconciliation operations, including their index rechecks.
+        // Keep results ordered and errors per-record: a failed host must not
+        // cancel other hosts or restore the old fail-whole-refresh behavior.
+        .buffered(RECORD_FETCH_CONCURRENCY)
+        .collect()
+        .await
 }
 
 fn finish_refresh(
@@ -280,6 +367,28 @@ mod tests {
         0x02, 0xb6,
     ];
 
+    async fn read_request(stream: &mut tokio::net::TcpStream) -> anyhow::Result<Vec<u8>> {
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0_u8; 1024];
+            let read = stream.read(&mut chunk).await?;
+            anyhow::ensure!(read != 0, "HTTP request ended before its headers");
+            request.extend_from_slice(&chunk[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                return Ok(request);
+            }
+            anyhow::ensure!(request.len() <= 8192, "HTTP request headers too large");
+        }
+    }
+
+    async fn respond_not_found(mut stream: tokio::net::TcpStream) -> anyhow::Result<()> {
+        stream
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await?;
+        stream.shutdown().await?;
+        Ok(())
+    }
+
     async fn serve_catalog(
         listener: tokio::net::TcpListener,
         index_path: String,
@@ -289,17 +398,7 @@ mod tests {
     ) -> anyhow::Result<()> {
         for _ in 0..request_count {
             let (mut stream, _) = listener.accept().await?;
-            let mut request = Vec::new();
-            loop {
-                let mut chunk = [0_u8; 1024];
-                let read = stream.read(&mut chunk).await?;
-                anyhow::ensure!(read != 0, "HTTP request ended before its headers");
-                request.extend_from_slice(&chunk[..read]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
-                anyhow::ensure!(request.len() <= 8192, "HTTP request headers too large");
-            }
+            let request = read_request(&mut stream).await?;
             let request = std::str::from_utf8(&request)?;
             let path = request
                 .lines()
@@ -326,6 +425,321 @@ mod tests {
             stream.shutdown().await?;
         }
         Ok(())
+    }
+
+    async fn serve_sequence(
+        listener: tokio::net::TcpListener,
+        responses: Vec<(String, u16, Option<u64>, Vec<u8>)>,
+    ) {
+        // Each route retains its scripted revision order, while independent
+        // hosts may now arrive in either order.
+        let request_count = responses.len();
+        let mut by_path = BTreeMap::<_, std::collections::VecDeque<_>>::new();
+        for (path, status, revision, body) in responses {
+            by_path
+                .entry(path)
+                .or_default()
+                .push_back((status, revision, body));
+        }
+        for _ in 0..request_count {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await.unwrap();
+            let request = std::str::from_utf8(&request).unwrap();
+            let path = request.split_whitespace().nth(1).unwrap();
+            let (status, revision, body) = by_path
+                .get_mut(path)
+                .and_then(|responses| responses.pop_front())
+                .unwrap_or_else(|| panic!("unexpected HTTP request {path}"));
+            let etag = revision
+                .map(|revision| format!("ETag: \"{revision}\"\r\n"))
+                .unwrap_or_default();
+            let header = format!(
+                "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\n{etag}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(header.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+            stream.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn publication_between_index_and_fetch_is_reconciled() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let root = crate::test_support::canonical_tempdir();
+            let state_dir = root.path().join("state");
+            let registry_dir = root.path().join("registry");
+            state::test_support::create_account(
+                &state_dir,
+                &format!("http://{}", listener.local_addr().unwrap()),
+            )
+            .unwrap();
+            let account = state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
+            let now = super::super::utc_now_seconds();
+            let id = RecordId::from_bytes([42; 16]);
+            let descriptor = SessionAccessDescriptor::new(
+                "publisher".into(),
+                now - Duration::from_secs(1),
+                now + Duration::from_secs(300),
+                ENDPOINT.into(),
+                CapabilitySecret::from_bytes([42; 32]),
+                SessionAccessAttachedVersion::new(0, 2, 8),
+                SessionAccessVersion::new(3, 2, 1),
+                vec!["work".into()],
+            )
+            .unwrap();
+            let (nonce, ciphertext) = seal_session_access_descriptor(
+                &descriptor,
+                account.account_root_key(),
+                account.account_id().as_bytes(),
+                id.as_bytes(),
+            )
+            .unwrap()
+            .into_parts();
+            let envelope = serde_json::to_vec(&Envelope::new(nonce, ciphertext).unwrap()).unwrap();
+            let index_path = format!("/v1/accounts/{}/records", account.account_id());
+            let record_path = format!("{index_path}/{id}");
+            let index = |revision| {
+                serde_json::to_vec(
+                    &LiveRecordIndex::new(vec![LiveRecordIndexEntry {
+                        record_id: id,
+                        revision,
+                    }])
+                    .unwrap(),
+                )
+                .unwrap()
+            };
+            let server = tokio::spawn(serve_sequence(
+                listener,
+                vec![
+                    (index_path.clone(), 200, None, index(1)),
+                    (record_path, 200, Some(2), envelope),
+                    (index_path, 200, None, index(2)),
+                ],
+            ));
+            let refreshed = refresh_sessions_with_registry_at(
+                &state_dir,
+                HerdrVersion::new(3, 2, 1),
+                &registry_dir,
+                now,
+            )
+            .await
+            .unwrap();
+            assert_eq!(refreshed.sessions.len(), 1);
+            assert_eq!(refreshed.sessions[0].target, "publisher/work");
+            assert_eq!(
+                state_catalog::load(&state_dir, &account).unwrap().records[0].service_revision,
+                2
+            );
+            server.await.unwrap();
+        })
+        .await
+        .expect("publication race fixture timed out");
+    }
+
+    #[tokio::test]
+    async fn unstable_deleted_and_invalid_records_do_not_hide_other_hosts() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for scenario in ["churn", "deleted", "http-error", "reindexed-deletion", "rollback", "index-rollback", "invalid", "expired", "pruned-replay"] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let root = crate::test_support::canonical_tempdir();
+                let state_dir = root.path().join("state");
+                state::test_support::create_account(&state_dir, &format!("http://{}", listener.local_addr().unwrap())).unwrap();
+                let account = state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
+                let now = super::super::utc_now_seconds();
+                let changing = RecordId::from_bytes([42; 16]);
+                let stable = RecordId::from_bytes([43; 16]);
+                let sealed = |id: RecordId, expired: bool| {
+                    let descriptor = SessionAccessDescriptor::new(
+                        if id == stable { "stable" } else { "changing" }.into(),
+                        now - Duration::from_secs(120),
+                        if expired { now - Duration::from_secs(1) } else { now + Duration::from_secs(300) },
+                        ENDPOINT.into(), CapabilitySecret::from_bytes([42; 32]),
+                        SessionAccessAttachedVersion::new(0, 2, 8), SessionAccessVersion::new(3, 2, 1), vec!["work".into()],
+                    ).unwrap();
+                    let (nonce, ciphertext) = seal_session_access_descriptor(
+                        &descriptor, account.account_root_key(), account.account_id().as_bytes(), id.as_bytes(),
+                    ).unwrap().into_parts();
+                    Envelope::new(nonce, ciphertext).unwrap()
+                };
+                let mut envelope = sealed(changing, scenario == "expired");
+                if scenario == "pruned-replay" {
+                    let context = VerificationContext {
+                        account_id: *account.account_id().as_bytes(), record_id: *changing.as_bytes(), now,
+                        local_version: SessionAccessVersion::new(3, 2, 1),
+                    };
+                    let opened = open_session_access_descriptor_cursorless_for_native_upgrade(
+                        &CryptoEnvelope::new(envelope.nonce, envelope.ciphertext.clone()).unwrap(), account.account_root_key(), &context,
+                    ).unwrap();
+                    let mut catalog = state_catalog::Catalog::empty(&account);
+                    catalog.records.push(CatalogRecord::from_opened(changing, 2, &opened));
+                    state_catalog::save(&state_dir, &account, &catalog).unwrap();
+                    assert!(state_catalog::remove_if_revision(&state_dir, &account, changing, 2).unwrap());
+                }
+                if scenario == "invalid" {
+                    envelope.ciphertext[0] ^= 1;
+                }
+                let body = serde_json::to_vec(&envelope).unwrap();
+                let index_path = format!("/v1/accounts/{}/records", account.account_id());
+                let record_path = format!("{index_path}/{changing}");
+                let index = |revision: Option<u64>| {
+                    let mut entries = vec![LiveRecordIndexEntry { record_id: stable, revision: 1 }];
+                    if let Some(revision) = revision {
+                        entries.push(LiveRecordIndexEntry { record_id: changing, revision });
+                    }
+                    entries.sort_by_key(|entry| entry.record_id);
+                    serde_json::to_vec(&LiveRecordIndex::new(entries).unwrap()).unwrap()
+                };
+                let mut responses = vec![(index_path.clone(), 200, None, index(Some(if scenario == "rollback" { 3 } else { 1 })))];
+                if matches!(scenario, "deleted" | "http-error") {
+                    responses.push((record_path.clone(), if scenario == "deleted" { 404 } else { 503 }, None, Vec::new()));
+                } else if scenario == "churn" {
+                    for attempt in 0..MAX_RECORD_FETCH_ATTEMPTS {
+                        responses.push((record_path.clone(), 200, Some(2 + attempt as u64 * 2), body.clone()));
+                        responses.push((index_path.clone(), 200, None, index(Some(3 + attempt as u64 * 2))));
+                    }
+                } else {
+                    responses.push((record_path.clone(), 200, Some(2), body));
+                    if scenario != "rollback" {
+                        responses.push((index_path.clone(), 200, None, index(match scenario {
+                            "reindexed-deletion" => None,
+                            "index-rollback" => Some(1),
+                            _ => Some(2),
+                        })));
+                    }
+                }
+                responses.push((format!("{index_path}/{stable}"), 200, Some(1), serde_json::to_vec(&sealed(stable, false)).unwrap()));
+                let server = tokio::spawn(serve_sequence(listener, responses));
+                let refreshed = refresh_sessions_with_registry_at(
+                    &state_dir, HerdrVersion::new(3, 2, 1), &root.path().join("registry"), now,
+                ).await.unwrap();
+                assert_eq!(refreshed.sessions.len(), 1, "{scenario}: {:?}", refreshed.sessions);
+                assert_eq!(refreshed.sessions[0].target, "stable/work", "{scenario}");
+                assert!(state_catalog::load(&state_dir, &account).unwrap().records.iter().all(|record| record.record_id == stable), "{scenario}");
+                if !matches!(scenario, "invalid" | "expired" | "pruned-replay") {
+                    assert!(refreshed.warnings.iter().any(|warning| matches!(warning, RefreshWarning::RecordUnavailable { record_id, .. } if *record_id == changing)), "{scenario}");
+                }
+                server.await.unwrap();
+            }
+        }).await.expect("bounded reconciliation scenarios timed out");
+    }
+
+    #[tokio::test]
+    async fn changed_record_fetches_are_concurrent_and_bounded() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let root = crate::test_support::canonical_tempdir();
+            let state_dir = root.path().join("state");
+            state::test_support::create_account(&state_dir, &origin).unwrap();
+            let account = state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
+            let records = (0..=RECORD_FETCH_CONCURRENCY)
+                .map(|index| LiveRecordIndexEntry {
+                    record_id: RecordId::from_bytes([index as u8 + 1; 16]),
+                    revision: 1,
+                })
+                .collect::<Vec<_>>();
+
+            let server = tokio::spawn(async move {
+                let mut pending = Vec::new();
+                for _ in 0..RECORD_FETCH_CONCURRENCY {
+                    let (mut stream, _) = listener.accept().await?;
+                    let _ = read_request(&mut stream).await?;
+                    pending.push(stream);
+                }
+                anyhow::ensure!(
+                    tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                        .await
+                        .is_err(),
+                    "refresh exceeded its record-fetch concurrency bound"
+                );
+                for stream in pending {
+                    respond_not_found(stream).await?;
+                }
+                let (mut final_stream, _) = listener.accept().await?;
+                let _ = read_request(&mut final_stream).await?;
+                respond_not_found(final_stream).await
+            });
+
+            let fetched =
+                fetch_changed_records(&SyncHttpClient::new().unwrap(), &account, records).await;
+            assert_eq!(fetched.len(), RECORD_FETCH_CONCURRENCY + 1);
+            assert!(fetched.iter().all(|(_, record)| matches!(record, Ok(None))));
+            server.await.unwrap().unwrap();
+        })
+        .await
+        .expect("concurrent record-fetch scenario timed out");
+    }
+
+    #[tokio::test]
+    async fn concurrent_reconciliation_bounds_index_rechecks_and_preserves_order() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let root = crate::test_support::canonical_tempdir();
+            let state_dir = root.path().join("state");
+            state::test_support::create_account(
+                &state_dir, &format!("http://{}", listener.local_addr().unwrap()),
+            ).unwrap();
+            let account = state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
+            let records = (0..=RECORD_FETCH_CONCURRENCY).map(|index| LiveRecordIndexEntry {
+                record_id: RecordId::from_bytes([index as u8 + 1; 16]),
+                revision: 1,
+            }).collect::<Vec<_>>();
+            let reindex = serde_json::to_vec(&LiveRecordIndex::new(records.iter().map(|entry| {
+                LiveRecordIndexEntry { record_id: entry.record_id, revision: 3 }
+            }).collect()).unwrap()).unwrap();
+            let envelope = serde_json::to_vec(&Envelope::new([0; 24], vec![0; 32]).unwrap()).unwrap();
+            let index_path = format!("/v1/accounts/{}/records", account.account_id());
+            let final_path = format!("{index_path}/{}", records.last().unwrap().record_id);
+            let server = tokio::spawn(async move {
+                // Hold eight requests at each stage: GET=2, reindex=3, GET=3.
+                // A ninth operation must not start until a whole reconciliation
+                // finishes, and the rechecks themselves must remain bounded.
+                for stage in 0..3 {
+                    let mut pending = Vec::new();
+                    for _ in 0..RECORD_FETCH_CONCURRENCY {
+                        let (mut socket, _) = listener.accept().await.unwrap();
+                        let request = read_request(&mut socket).await.unwrap();
+                        let request = std::str::from_utf8(&request).unwrap();
+                        let path = request.split_whitespace().nth(1).unwrap();
+                        if stage == 1 {
+                            assert_eq!(path, index_path);
+                        } else {
+                            assert!(path.starts_with(&format!("{index_path}/")));
+                            assert_ne!(path, final_path);
+                        }
+                        pending.push(socket);
+                    }
+                    assert!(tokio::time::timeout(Duration::from_millis(50), listener.accept()).await.is_err(),
+                        "reconciliation exceeded concurrency bound at stage {stage}");
+                    // Complete in reverse order to exercise deterministic output.
+                    for mut socket in pending.into_iter().rev() {
+                        let (body, etag) = match stage {
+                            0 => (&envelope, "ETag: \"2\"\r\n"),
+                            1 => (&reindex, ""),
+                            _ => (&envelope, "ETag: \"3\"\r\n"),
+                        };
+                        let header = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{etag}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                        socket.write_all(header.as_bytes()).await.unwrap();
+                        socket.write_all(body).await.unwrap();
+                        socket.shutdown().await.unwrap();
+                    }
+                }
+                serve_sequence(listener, vec![
+                    (final_path.clone(), 200, Some(2), envelope.clone()),
+                    (index_path, 200, None, reindex),
+                    (final_path, 200, Some(3), envelope),
+                ]).await;
+            });
+            let fetched = fetch_changed_records(&SyncHttpClient::new().unwrap(), &account, records).await;
+            assert_eq!(fetched.len(), RECORD_FETCH_CONCURRENCY + 1);
+            for (position, (entry, record)) in fetched.into_iter().enumerate() {
+                assert_eq!(entry.record_id, RecordId::from_bytes([position as u8 + 1; 16]));
+                assert_eq!(record.unwrap().unwrap().revision, 3);
+            }
+            server.await.unwrap();
+        }).await.expect("concurrent revision reconciliation timed out");
     }
 
     #[tokio::test]

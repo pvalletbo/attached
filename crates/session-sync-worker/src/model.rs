@@ -134,11 +134,15 @@ impl StoredRecord {
         &self.envelope_ciphertext
     }
 
-    pub(crate) fn envelope(&self) -> Result<(Envelope, u64), MutationError> {
-        self.validate()?;
-        let envelope = Envelope::new(self.envelope_nonce, self.envelope_ciphertext.clone())
-            .map_err(|_| MutationError::InvalidStorage)?;
-        Ok((envelope, self.revision))
+    pub(crate) fn into_envelope(self) -> (Envelope, u64) {
+        // Construction validates the private fields, so moving them cannot
+        // introduce an invalid envelope or require another ciphertext copy.
+        let envelope = Envelope {
+            envelope_version: 1,
+            nonce: self.envelope_nonce,
+            ciphertext: self.envelope_ciphertext,
+        };
+        (envelope, self.revision)
     }
 
     fn validate(&self) -> Result<(), MutationError> {
@@ -155,15 +159,11 @@ impl StoredRecord {
 
 pub(crate) fn put(
     current: Option<&StoredRecord>,
-    envelope: &Envelope,
+    envelope: Envelope,
 ) -> Result<(StoredRecord, MutationOutcome), MutationError> {
     if envelope.envelope_version != 1 {
         return Err(MutationError::InvalidRequest);
     }
-    if let Some(record) = current {
-        record.validate()?;
-    }
-
     let (revision, outcome) = match current {
         Some(record) => {
             let revision = next_revision(record.revision)?;
@@ -171,7 +171,7 @@ pub(crate) fn put(
         }
         None => (1, MutationOutcome::Created { revision: 1 }),
     };
-    let record = StoredRecord::from_storage(revision, envelope.nonce, envelope.ciphertext.clone())?;
+    let record = StoredRecord::from_storage(revision, envelope.nonce, envelope.ciphertext)?;
     Ok((record, outcome))
 }
 
@@ -200,12 +200,32 @@ mod tests {
 
     #[test]
     fn unconditional_put_creates_then_replaces() {
-        let (first, created) = put(None, &envelope(3)).expect("create");
+        let (first, created) = put(None, envelope(3)).expect("create");
         assert_eq!(created, MutationOutcome::Created { revision: 1 });
 
-        let (second, updated) = put(Some(&first), &envelope(4)).expect("update");
+        let replacement = envelope(4);
+        let allocation = replacement.ciphertext.as_ptr();
+        let (second, updated) = put(Some(&first), replacement).expect("update");
         assert_eq!(updated, MutationOutcome::Updated { revision: 2 });
-        assert_eq!(second.envelope().expect("envelope").1, 2);
+        assert_eq!(
+            second.ciphertext().as_ptr(),
+            allocation,
+            "PUT copied ciphertext"
+        );
+        let (envelope, revision) = second.into_envelope();
+        assert_eq!(revision, 2);
+        assert_eq!(envelope.nonce, [4; 24]);
+        assert_eq!(envelope.ciphertext, vec![4; 32]);
+        assert_eq!(
+            envelope.ciphertext.as_ptr(),
+            allocation,
+            "ciphertext was copied"
+        );
+        assert_eq!(
+            first.revision(),
+            1,
+            "replacement mutated the previous record"
+        );
     }
 
     #[test]
@@ -219,11 +239,51 @@ mod tests {
     }
 
     #[test]
+    fn stored_records_validate_bounds_before_exposing_an_envelope() {
+        for revision in [0, i64::MAX as u64 + 1, u64::MAX] {
+            assert_eq!(
+                StoredRecord::from_storage(revision, [0; 24], Vec::new()).err(),
+                Some(MutationError::InvalidStorage)
+            );
+        }
+        assert_eq!(
+            StoredRecord::from_storage(1, [0; 24], vec![0; MAX_CIPHERTEXT_BYTES + 1]).err(),
+            Some(MutationError::InvalidStorage)
+        );
+        for length in [0, MAX_CIPHERTEXT_BYTES] {
+            let record =
+                StoredRecord::from_storage(i64::MAX as u64, [5; 24], vec![7; length]).unwrap();
+            let (envelope, revision) = record.into_envelope();
+            assert_eq!(revision, i64::MAX as u64);
+            assert_eq!(envelope, Envelope::new([5; 24], vec![7; length]).unwrap());
+        }
+    }
+
+    #[test]
+    fn updates_validate_public_envelope_fields() {
+        let mut invalid = envelope(1);
+        invalid.envelope_version = 2;
+        assert_eq!(
+            put(None, invalid).err(),
+            Some(MutationError::InvalidRequest)
+        );
+        let invalid = Envelope {
+            envelope_version: 1,
+            nonce: [0; 24],
+            ciphertext: vec![0; MAX_CIPHERTEXT_BYTES + 1],
+        };
+        assert_eq!(
+            put(None, invalid).err(),
+            Some(MutationError::InvalidStorage)
+        );
+    }
+
+    #[test]
     fn record_revision_cannot_exceed_sqlite_integer_range() {
         let current = StoredRecord::from_storage(i64::MAX as u64, [3; 24], vec![4; 32])
             .expect("maximum revision");
         assert!(matches!(
-            put(Some(&current), &envelope(5)),
+            put(Some(&current), envelope(5)),
             Err(MutationError::RevisionOverflow)
         ));
     }

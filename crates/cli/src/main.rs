@@ -3,8 +3,10 @@ use std::process::ExitCode;
 use clap::Parser;
 
 mod account_clipboard;
+mod attached_version;
 mod bounded_process;
 mod cli;
+mod config;
 mod diagnostics;
 mod download_account;
 mod endpoint_registry;
@@ -16,6 +18,7 @@ mod local_sockets;
 mod proxy;
 mod publish_account;
 mod secure_state;
+mod serve_handoff;
 mod server;
 mod session;
 mod session_catalog;
@@ -45,11 +48,16 @@ fn main() -> ExitCode {
 async fn async_main() -> ExitCode {
     let cli = Cli::parse();
     let verbosity = cli.verbosity();
-    if let Err(error) = diagnostics::init(verbosity) {
-        eprintln!("Error: {error}");
-        return ExitCode::FAILURE;
-    }
-    match cli.run().await {
+    let diagnostics_guard = match diagnostics::init(verbosity, cli.flamegraph()) {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let result = cli.run().await;
+    drop(diagnostics_guard);
+    match result {
         Ok(code) => exit_code(code),
         Err(error) => {
             eprintln!("Error: {}", diagnostics::format_error(&error, verbosity));

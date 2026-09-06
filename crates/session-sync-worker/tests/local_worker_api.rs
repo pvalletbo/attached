@@ -14,9 +14,9 @@ use anyhow::{Result, anyhow, bail, ensure};
 use attached_session_sync_protocol::{
     account::{AccountId, ApiToken, RecordId},
     api::{
-        CACHE_CONTROL_VALUE, CONTENT_TYPE_JSON, CreateAccountResponse, Envelope, HEADER_ETAG,
-        HEADER_RETRY_AFTER, LiveRecordIndex, LiveRecordIndexEntry, STATUS_CREATED,
-        STATUS_METHOD_NOT_ALLOWED, STATUS_NO_CONTENT, STATUS_NOT_FOUND, STATUS_OK,
+        AUTHENTICATE_VALUE, CACHE_CONTROL_VALUE, CONTENT_TYPE_JSON, CreateAccountResponse,
+        Envelope, HEADER_ETAG, HEADER_RETRY_AFTER, LiveRecordIndex, LiveRecordIndexEntry,
+        STATUS_CREATED, STATUS_METHOD_NOT_ALLOWED, STATUS_NO_CONTENT, STATUS_NOT_FOUND, STATUS_OK,
         STATUS_PAYLOAD_TOO_LARGE, STATUS_TOO_MANY_REQUESTS, STATUS_UNAUTHORIZED,
         parse_live_record_index,
     },
@@ -436,6 +436,71 @@ async fn create_account(worker: &LocalWorker) -> Result<TestAccount> {
     })
 }
 
+async fn verify_authentication(
+    worker: &LocalWorker,
+    account: &TestAccount,
+    records_path: &str,
+    record_path: &str,
+) -> Result<()> {
+    let mut malformed = HeaderMap::new();
+    malformed.insert(AUTHORIZATION, HeaderValue::from_static("Bearer invalid"));
+    let valid = envelope(0, b"unauthorized write")?;
+    let oversized = vec![b'x'; MAX_API_BODY_BYTES + 1];
+    for (method, path, wrong_scope, correct_scope) in [
+        (
+            Method::GET,
+            records_path,
+            &account.publish_token,
+            &account.download_token,
+        ),
+        (
+            Method::GET,
+            record_path,
+            &account.publish_token,
+            &account.download_token,
+        ),
+        (
+            Method::PUT,
+            record_path,
+            &account.download_token,
+            &account.publish_token,
+        ),
+    ] {
+        let mut duplicated = bearer(correct_scope);
+        duplicated.append(AUTHORIZATION, duplicated[AUTHORIZATION].clone());
+        for headers in [
+            HeaderMap::new(),
+            malformed.clone(),
+            bearer(wrong_scope),
+            duplicated,
+        ] {
+            // Valid, malformed and oversized PUT bodies share the same auth policy.
+            let bodies: &[Option<&[u8]>] = if method == Method::PUT {
+                &[Some(&valid), Some(b"not-json"), Some(&oversized)]
+            } else {
+                &[None]
+            };
+            for body in bodies {
+                let response = worker
+                    .request(method.clone(), path, headers.clone(), *body)
+                    .await?;
+                expect_status(&response, STATUS_UNAUTHORIZED, "authentication rejection")?;
+                expect_header(
+                    &response,
+                    "www-authenticate",
+                    AUTHENTICATE_VALUE,
+                    "authentication rejection",
+                )?;
+                ensure!(
+                    response.body.is_empty(),
+                    "authentication rejection exposed a body"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn exercise_api(worker: &LocalWorker) -> Result<(TestAccount, RecordId)> {
     let response = worker
         .request(Method::GET, "/healthz", HeaderMap::new(), None)
@@ -479,6 +544,7 @@ async fn exercise_api(worker: &LocalWorker) -> Result<(TestAccount, RecordId)> {
     let records_path = format!("/v1/accounts/{}/records", account.id);
     let record_id = RecordId::from_bytes([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
     let record_path = format!("{records_path}/{record_id}");
+    verify_authentication(worker, &account, &records_path, &record_path).await?;
 
     for path in [
         format!("{records_path}/"),
@@ -512,20 +578,6 @@ async fn exercise_api(worker: &LocalWorker) -> Result<(TestAccount, RecordId)> {
     let response = worker
         .request(
             Method::GET,
-            &records_path,
-            bearer(&account.publish_token),
-            None,
-        )
-        .await?;
-    expect_status(
-        &response,
-        STATUS_UNAUTHORIZED,
-        "publish scope read rejection",
-    )?;
-
-    let response = worker
-        .request(
-            Method::GET,
             &record_path,
             bearer(&account.download_token),
             None,
@@ -534,7 +586,12 @@ async fn exercise_api(worker: &LocalWorker) -> Result<(TestAccount, RecordId)> {
     expect_status(&response, STATUS_NOT_FOUND, "missing record")?;
 
     let first = envelope(1, b"first opaque fixture")?;
-    let publish_headers = publishing_headers(&account.publish_token);
+    let mut publish_headers = publishing_headers(&account.publish_token);
+    // The private forwarding marker must never be accepted from a public caller.
+    publish_headers.insert(
+        "x-attached-internal-oversized-body",
+        HeaderValue::from_static("1"),
+    );
     let response = worker
         .request(
             Method::PUT,
@@ -546,19 +603,7 @@ async fn exercise_api(worker: &LocalWorker) -> Result<(TestAccount, RecordId)> {
     expect_status(&response, STATUS_CREATED, "record creation")?;
     expect_header(&response, HEADER_ETAG, "\"1\"", "record creation")?;
 
-    let response = worker
-        .request(
-            Method::PUT,
-            &record_path,
-            publishing_headers(&account.download_token),
-            Some(&first),
-        )
-        .await?;
-    expect_status(
-        &response,
-        STATUS_UNAUTHORIZED,
-        "download scope write rejection",
-    )?;
+    verify_authentication(worker, &account, &records_path, &record_path).await?;
 
     let response = worker
         .request(
@@ -591,19 +636,6 @@ async fn exercise_api(worker: &LocalWorker) -> Result<(TestAccount, RecordId)> {
     expect_header(&response, HEADER_ETAG, "\"2\"", "same-value replacement")?;
 
     let oversized = vec![b'x'; MAX_API_BODY_BYTES + 1];
-    let response = worker
-        .request(
-            Method::PUT,
-            &record_path,
-            publishing_headers(&account.download_token),
-            Some(&oversized),
-        )
-        .await?;
-    expect_status(
-        &response,
-        STATUS_UNAUTHORIZED,
-        "oversized download-scope write rejection",
-    )?;
     let response = worker
         .request(
             Method::PUT,

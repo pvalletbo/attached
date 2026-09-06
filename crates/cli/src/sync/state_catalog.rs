@@ -51,6 +51,7 @@ pub struct SyncedAttachment {
     pub endpoint_ticket: String,
     pub endpoint_identity: [u8; 32],
     pub attach_capability: [u8; 32],
+    pub attached_version: Option<[u16; 3]>,
     pub herdr_version: [u16; 3],
     pub expires_at: DateTime<Utc>,
     pub session: String,
@@ -145,6 +146,7 @@ impl CatalogRecord {
     }
 }
 
+#[tracing::instrument(name = "load_sync_catalog", level = "debug", skip_all)]
 pub(super) fn load(state_dir: &Path, account: &AccountCredentials) -> Result<Catalog> {
     with_locked_existing(state_dir, CATALOG_LOCK, |directory| {
         Ok(read_catalog(directory, account, true)?.unwrap_or_else(|| Catalog::empty(account)))
@@ -165,15 +167,11 @@ pub(super) fn save(
         next.generation = current_generation
             .checked_add(1)
             .context("sync catalog generation exhausted")?;
-        let encoded = encode_catalog(&next)?;
-        ensure!(
-            encoded.len() <= MAX_CATALOG_BYTES,
-            "sync catalog exceeds local limit"
-        );
-        write_catalog(directory, &encoded, current.is_some())
+        write_catalog(directory, &next, current.is_some())
     })
 }
 
+#[tracing::instrument(name = "save_sync_catalog", level = "debug", skip_all)]
 pub(super) fn save_refresh(
     state_dir: &Path,
     account: &AccountCredentials,
@@ -274,12 +272,7 @@ pub(super) fn save_refresh(
             .checked_add(1)
             .context("sync catalog generation exhausted")?;
         validate(&reconciled, account)?;
-        let encoded = encode_catalog(&reconciled)?;
-        ensure!(
-            encoded.len() <= MAX_CATALOG_BYTES,
-            "sync catalog exceeds local limit"
-        );
-        write_catalog(directory, &encoded, existed)
+        write_catalog(directory, &reconciled, existed)
     })
 }
 
@@ -319,12 +312,7 @@ pub(super) fn remove_if_revision(
             .checked_add(1)
             .context("sync catalog generation exhausted")?;
         validate(&catalog, account)?;
-        let encoded = encode_catalog(&catalog)?;
-        ensure!(
-            encoded.len() <= MAX_CATALOG_BYTES,
-            "sync catalog exceeds local limit"
-        );
-        write_catalog(directory, &encoded, true)?;
+        write_catalog(directory, &catalog, true)?;
         Ok(true)
     })
 }
@@ -346,6 +334,7 @@ fn read_catalog(
     read_catalog_with_store(directory, account, migrate_legacy, active_store())
 }
 
+#[tracing::instrument(name = "read_sync_catalog", level = "debug", skip_all)]
 fn read_catalog_with_store(
     directory: &StateDir,
     account: &AccountCredentials,
@@ -381,9 +370,11 @@ fn read_catalog_with_store(
     Ok(Some(catalog))
 }
 
-fn write_catalog(directory: &StateDir, plaintext: &[u8], replace: bool) -> Result<()> {
+#[tracing::instrument(name = "write_sync_catalog", level = "debug", skip_all)]
+fn write_catalog(directory: &StateDir, catalog: &Catalog, replace: bool) -> Result<()> {
+    let plaintext = encode_catalog(catalog)?;
     with_master_key(directory, true, |key| {
-        let encrypted = seal(key, Purpose::SyncCatalog, plaintext, MAX_CATALOG_BYTES)?;
+        let encrypted = seal(key, Purpose::SyncCatalog, &plaintext, MAX_CATALOG_BYTES)?;
         if replace {
             directory.atomic_replace(CATALOG_FILE, &encrypted)
         } else if directory.create_noclobber(CATALOG_FILE, &encrypted)? {
@@ -397,6 +388,10 @@ fn write_catalog(directory: &StateDir, plaintext: &[u8], replace: bool) -> Resul
 fn encode_catalog(catalog: &Catalog) -> Result<Zeroizing<Vec<u8>>> {
     let mut encoded = Zeroizing::new(Vec::new());
     serde_json::to_writer(&mut *encoded, catalog).context("could not encode sync catalog")?;
+    ensure!(
+        encoded.len() <= MAX_CATALOG_BYTES,
+        "sync catalog exceeds local limit"
+    );
     Ok(encoded)
 }
 
@@ -412,9 +407,8 @@ fn sessions_with_filter(
         .iter()
         .filter(|record| now < record.expires_at && !suppress(record))
         .flat_map(|record| {
-            let target_host = record.host_label.clone();
             record.sessions.iter().map(move |session| SyncedSession {
-                target: format!("{target_host}/{session}"),
+                target: format!("{}/{session}", record.host_label),
                 host: record.host_label.clone(),
                 session: session.clone(),
                 attached_version: record.attached_version,
@@ -427,6 +421,7 @@ fn sessions_with_filter(
     Ok(sessions)
 }
 
+#[tracing::instrument(name = "list_sync_sessions", level = "debug", skip_all)]
 pub(super) fn sessions_excluding_local_endpoints(
     state_dir: &Path,
     account: &AccountCredentials,
@@ -449,6 +444,7 @@ pub(super) fn sessions_excluding_local_endpoints(
     })
 }
 
+#[tracing::instrument(name = "load_sync_attachment", level = "debug", skip_all)]
 pub fn attachment(
     state_dir: &Path,
     account: &AccountCredentials,
@@ -473,6 +469,7 @@ pub fn attachment(
         endpoint_ticket: record.endpoint_ticket.clone(),
         endpoint_identity: record.endpoint_identity,
         attach_capability: record.attach_capability,
+        attached_version: record.attached_version,
         herdr_version: record.herdr_version,
         expires_at: record.expires_at,
         session: session.to_owned(),

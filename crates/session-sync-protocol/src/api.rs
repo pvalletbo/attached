@@ -4,7 +4,7 @@ use crate::{
     account::{AccountId, ApiToken, RecordId},
     limits::{
         MAX_API_BODY_BYTES, MAX_CIPHERTEXT_BYTES, MAX_CIPHERTEXT_TEXT_LEN, MAX_LIVE_RECORDS,
-        NONCE_BYTES, NONCE_TEXT_LEN,
+        NONCE_BYTES,
     },
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -175,7 +175,7 @@ impl Envelope {
         })
     }
     pub fn parse_json(input: &[u8]) -> Result<Self, ApiError> {
-        parse_bounded(input)
+        parse_bounded::<EnvelopeWire<'_>>(input)?.decode()
     }
 }
 impl Serialize for Envelope {
@@ -191,6 +191,39 @@ impl Serialize for Envelope {
 }
 impl<'de> Deserialize<'de> for Envelope {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        EnvelopeWire::deserialize(d)?.decode().map_err(|error| {
+            de::Error::custom(match error {
+                ApiError::InvalidRequest => "invalid envelope",
+                ApiError::TooLarge => "ciphertext text exceeds limit",
+            })
+        })
+    }
+}
+
+// Borrow encoded fields until the entire object has been parsed. This rejects
+// escaped values without allocating and lets malformed metadata take precedence
+// over oversized ciphertext, regardless of JSON field order.
+struct EnvelopeWire<'a> {
+    version: u16,
+    nonce: &'a str,
+    ciphertext: &'a str,
+}
+
+impl EnvelopeWire<'_> {
+    fn decode(self) -> Result<Envelope, ApiError> {
+        if self.version != 1 {
+            return Err(ApiError::InvalidRequest);
+        }
+        let nonce = decode_fixed(self.nonce)?;
+        if self.ciphertext.len() > MAX_CIPHERTEXT_TEXT_LEN {
+            return Err(ApiError::TooLarge);
+        }
+        Envelope::new(nonce, decode_vec(self.ciphertext, MAX_CIPHERTEXT_BYTES)?)
+    }
+}
+
+impl<'de> Deserialize<'de> for EnvelopeWire<'de> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
         #[serde(field_identifier, rename_all = "snake_case")]
         enum Field {
@@ -200,11 +233,11 @@ impl<'de> Deserialize<'de> for Envelope {
         }
         struct V;
         impl<'de> Visitor<'de> for V {
-            type Value = Envelope;
+            type Value = EnvelopeWire<'de>;
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str("envelope object")
             }
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Envelope, A::Error> {
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
                 let (mut version, mut nonce, mut ciphertext) = (None, None, None);
                 while let Some(field) = map.next_key()? {
                     match field {
@@ -214,27 +247,16 @@ impl<'de> Deserialize<'de> for Envelope {
                         }
                         Field::Nonce => {
                             duplicate(&nonce, "nonce")?;
-                            let text = map.next_value_seed(BorrowedStrSeed::<NONCE_TEXT_LEN>)?;
-                            let decoded = decode_fixed::<NONCE_BYTES>(text)
-                                .map_err(|_| de::Error::custom("invalid nonce"))?;
-                            nonce = Some(decoded);
+                            nonce = Some(map.next_value::<&str>()?);
                         }
                         Field::Ciphertext => {
                             duplicate(&ciphertext, "ciphertext")?;
-                            let text =
-                                map.next_value_seed(TooLargeStrSeed::<MAX_CIPHERTEXT_TEXT_LEN>)?;
-                            ciphertext = Some(
-                                decode_vec(text, MAX_CIPHERTEXT_BYTES)
-                                    .map_err(|_| de::Error::custom("invalid ciphertext"))?,
-                            );
+                            ciphertext = Some(map.next_value::<&str>()?);
                         }
                     }
                 }
-                if version != Some(1) {
-                    return Err(de::Error::custom("invalid envelope version"));
-                }
-                Ok(Envelope {
-                    envelope_version: 1,
+                Ok(EnvelopeWire {
+                    version: version.ok_or_else(|| de::Error::missing_field("envelope_version"))?,
                     nonce: nonce.ok_or_else(|| de::Error::missing_field("nonce"))?,
                     ciphertext: ciphertext.ok_or_else(|| de::Error::missing_field("ciphertext"))?,
                 })
@@ -313,62 +335,6 @@ pub fn parse_live_record_index(input: &[u8]) -> Result<LiveRecordIndex, ApiError
     parse_bounded(input)
 }
 
-struct BorrowedStrSeed<const MAX: usize>;
-impl<'de, const MAX: usize> DeserializeSeed<'de> for BorrowedStrSeed<MAX> {
-    type Value = &'de str;
-    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
-        struct V<const M: usize>;
-        impl<'de, const M: usize> Visitor<'de> for V<M> {
-            type Value = &'de str;
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, "borrowed string of at most {M} bytes")
-            }
-            fn visit_borrowed_str<E: de::Error>(self, v: &'de str) -> Result<Self::Value, E> {
-                if v.len() > M {
-                    Err(E::invalid_length(v.len(), &self))
-                } else {
-                    Ok(v)
-                }
-            }
-            fn visit_str<E: de::Error>(self, _: &str) -> Result<Self::Value, E> {
-                Err(E::custom("escaped or copied string forbidden"))
-            }
-            fn visit_string<E: de::Error>(self, _: String) -> Result<Self::Value, E> {
-                Err(E::custom("allocated string forbidden"))
-            }
-        }
-        d.deserialize_str(V::<MAX>)
-    }
-}
-
-struct TooLargeStrSeed<const MAX: usize>;
-impl<'de, const MAX: usize> DeserializeSeed<'de> for TooLargeStrSeed<MAX> {
-    type Value = &'de str;
-    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
-        struct V<const M: usize>;
-        impl<'de, const M: usize> Visitor<'de> for V<M> {
-            type Value = &'de str;
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, "borrowed string of at most {M} bytes")
-            }
-            fn visit_borrowed_str<E: de::Error>(self, v: &'de str) -> Result<Self::Value, E> {
-                if v.len() > M {
-                    Err(E::custom("ciphertext text exceeds limit"))
-                } else {
-                    Ok(v)
-                }
-            }
-            fn visit_str<E: de::Error>(self, _: &str) -> Result<Self::Value, E> {
-                Err(E::custom("escaped or copied string forbidden"))
-            }
-            fn visit_string<E: de::Error>(self, _: String) -> Result<Self::Value, E> {
-                Err(E::custom("allocated string forbidden"))
-            }
-        }
-        d.deserialize_str(V::<MAX>)
-    }
-}
-
 struct BoundedVecSeed<T, const MAX: usize>(PhantomData<T>);
 impl<'de, T: Deserialize<'de>, const MAX: usize> DeserializeSeed<'de> for BoundedVecSeed<T, MAX> {
     type Value = Vec<T>;
@@ -408,83 +374,11 @@ fn duplicate<T, E: de::Error>(slot: &Option<T>, name: &'static str) -> Result<()
     }
 }
 
-fn parse_bounded<T: for<'de> Deserialize<'de>>(input: &[u8]) -> Result<T, ApiError> {
+fn parse_bounded<'de, T: Deserialize<'de>>(input: &'de [u8]) -> Result<T, ApiError> {
     if input.len() > MAX_API_BODY_BYTES {
         return Err(ApiError::TooLarge);
     }
-    if let Ok(value) = deserialize_complete(input) {
-        return Ok(value);
-    }
-    if normalize_oversized_ciphertexts(input)
-        .is_some_and(|normalized| deserialize_complete::<T>(&normalized).is_ok())
-    {
-        return Err(ApiError::TooLarge);
-    }
-    Err(ApiError::InvalidRequest)
-}
-
-fn deserialize_complete<T: for<'de> Deserialize<'de>>(
-    input: &[u8],
-) -> Result<T, serde_json::Error> {
-    let mut d = serde_json::Deserializer::from_slice(input);
-    let value = T::deserialize(&mut d)?;
-    d.end()?;
-    Ok(value)
-}
-
-fn normalize_oversized_ciphertexts(input: &[u8]) -> Option<Vec<u8>> {
-    const KEY: &[u8] = b"\"ciphertext\"";
-    let mut ranges = Vec::new();
-    let mut search_from = 0;
-    while search_from < input.len() {
-        let Some(relative) = input[search_from..]
-            .windows(KEY.len())
-            .position(|window| window == KEY)
-        else {
-            break;
-        };
-        let key_start = search_from.checked_add(relative)?;
-        let mut cursor = key_start.checked_add(KEY.len())?;
-        while input.get(cursor).is_some_and(u8::is_ascii_whitespace) {
-            cursor += 1;
-        }
-        if input.get(cursor) != Some(&b':') {
-            search_from = key_start + 1;
-            continue;
-        }
-        cursor += 1;
-        while input.get(cursor).is_some_and(u8::is_ascii_whitespace) {
-            cursor += 1;
-        }
-        if input.get(cursor) != Some(&b'\"') {
-            search_from = key_start + 1;
-            continue;
-        }
-        let value_start = cursor + 1;
-        cursor = value_start;
-        while let Some(byte) = input.get(cursor) {
-            match byte {
-                b'\\' => break,
-                b'\"' => {
-                    if cursor - value_start > MAX_CIPHERTEXT_TEXT_LEN {
-                        ranges.push(value_start..cursor);
-                    }
-                    break;
-                }
-                _ => cursor += 1,
-            }
-        }
-        search_from = cursor.saturating_add(1);
-    }
-    if ranges.is_empty() {
-        return None;
-    }
-    let mut normalized = Vec::with_capacity(input.len());
-    normalized.extend_from_slice(input);
-    for range in ranges.into_iter().rev() {
-        normalized.drain(range);
-    }
-    Some(normalized)
+    serde_json::from_slice(input).map_err(|_| ApiError::InvalidRequest)
 }
 
 fn decode_fixed<const N: usize>(value: &str) -> Result<[u8; N], ApiError> {

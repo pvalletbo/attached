@@ -124,16 +124,15 @@ impl Publisher {
 }
 
 fn current_attached_version() -> Result<SessionAccessAttachedVersion> {
-    fn component(value: &str, name: &str) -> Result<u16> {
-        value
-            .parse()
+    let version = crate::attached_version::current();
+    let component = |value, name| {
+        u16::try_from(value)
             .with_context(|| format!("Attached {name} version exceeds sync protocol"))
-    }
-
+    };
     Ok(SessionAccessAttachedVersion::new(
-        component(env!("CARGO_PKG_VERSION_MAJOR"), "major")?,
-        component(env!("CARGO_PKG_VERSION_MINOR"), "minor")?,
-        component(env!("CARGO_PKG_VERSION_PATCH"), "patch")?,
+        component(version.major(), "major")?,
+        component(version.minor(), "minor")?,
+        component(version.patch(), "patch")?,
     ))
 }
 

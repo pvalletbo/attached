@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 
 pub mod account;
 pub mod attach;
+pub mod attached_update;
 pub mod http;
 pub mod publisher;
 pub mod refresh;

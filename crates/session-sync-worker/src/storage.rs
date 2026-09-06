@@ -16,6 +16,13 @@ pub(crate) enum InitializeOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StoreError {
     Unavailable,
+    Mutation(MutationError),
+}
+
+impl From<MutationError> for StoreError {
+    fn from(error: MutationError) -> Self {
+        Self::Mutation(error)
+    }
 }
 
 fn initialize_schema(storage: &Storage) -> Result<(), StoreError> {
@@ -152,19 +159,16 @@ pub(crate) fn put_record(
     storage: &Storage,
     record_id: RecordId,
     envelope: Envelope,
-) -> Result<Result<MutationOutcome, MutationError>, StoreError> {
+) -> Result<MutationOutcome, StoreError> {
     let current = load_record(storage, record_id)?;
     let live_records = live_record_count(storage)?;
     if live_records > MAX_LIVE_RECORDS {
         return Err(StoreError::Unavailable);
     }
     if current.is_none() && live_records == MAX_LIVE_RECORDS {
-        return Ok(Err(MutationError::LiveQuotaExceeded));
+        return Err(MutationError::LiveQuotaExceeded.into());
     }
-    let (record, outcome) = match model::put(current.as_ref(), &envelope) {
-        Ok(value) => value,
-        Err(error) => return Ok(Err(error)),
-    };
+    let (record, outcome) = model::put(current.as_ref(), envelope)?;
 
     // SQL storage calls are synchronous. With no intervening await, Durable
     // Objects commit the read/check/write sequence as one implicit transaction.
@@ -201,7 +205,7 @@ pub(crate) fn put_record(
     if stored_revision != record.revision() {
         return Err(StoreError::Unavailable);
     }
-    Ok(Ok(outcome))
+    Ok(outcome)
 }
 
 fn schema_exists(storage: &Storage) -> Result<bool, StoreError> {
@@ -253,11 +257,7 @@ fn parse_record(row: Vec<SqlStorageValue>) -> Result<StoredRecord, StoreError> {
 }
 
 fn revision_text(value: SqlStorageValue) -> Result<u64, StoreError> {
-    revision_text_value(text(value)?)
-}
-
-fn revision_text_value(value: String) -> Result<u64, StoreError> {
-    value
+    text(value)?
         .parse::<u64>()
         .ok()
         .filter(|revision| *revision > 0 && *revision <= i64::MAX as u64)
@@ -317,6 +317,36 @@ fn single_text(row: Vec<SqlStorageValue>) -> Result<String, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_sql_record_rows_fail_closed() {
+        for row in [
+            vec![],
+            vec![SqlStorageValue::String("1".into())],
+            vec![
+                SqlStorageValue::Integer(1),
+                SqlStorageValue::Blob(vec![0; 24]),
+                SqlStorageValue::Blob(vec![]),
+            ],
+            vec![
+                SqlStorageValue::String("0".into()),
+                SqlStorageValue::Blob(vec![0; 24]),
+                SqlStorageValue::Blob(vec![]),
+            ],
+            vec![
+                SqlStorageValue::String("1".into()),
+                SqlStorageValue::Blob(vec![0; 23]),
+                SqlStorageValue::Blob(vec![]),
+            ],
+            vec![
+                SqlStorageValue::String("1".into()),
+                SqlStorageValue::Blob(vec![0; 24]),
+                SqlStorageValue::Blob(vec![0; MAX_CIPHERTEXT_BYTES + 1]),
+            ],
+        ] {
+            assert_eq!(parse_record(row).err(), Some(StoreError::Unavailable));
+        }
+    }
 
     #[test]
     fn sqlite_revisions_are_decoded_without_javascript_numbers() {

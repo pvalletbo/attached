@@ -109,7 +109,7 @@ fn normalize_bundle(bundle: Zeroizing<String>) -> Result<Zeroizing<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use attached_session_sync_protocol::account::ApiKeyScope;
+    use attached_session_sync_protocol::account::{AccountBundle, ApiKeyScope};
 
     fn fixture_bundle(owner: &Path, scope: ApiKeyScope) -> String {
         sync::state::test_support::create_account(owner, "https://sync.example").unwrap();
@@ -123,7 +123,13 @@ mod tests {
     #[test]
     fn download_bundle_file_configures_encrypted_downloader_state() {
         let root = crate::test_support::canonical_tempdir();
-        let bundle = fixture_bundle(&root.path().join("owner"), ApiKeyScope::Download);
+        let owner = root.path().join("owner");
+        let bundle = fixture_bundle(&owner, ApiKeyScope::Download);
+        let publish = sync::state::export_account(&owner, ApiKeyScope::Publish).unwrap();
+        let published_identity = match AccountBundle::parse(publish.as_bytes()).unwrap() {
+            AccountBundle::Scoped(bundle) => bundle.authorized_consumer_identity().unwrap(),
+            AccountBundle::Owner(_) => panic!("export produced an owner bundle"),
+        };
         let bundle_file = root.path().join("download.bundle");
         std::fs::write(&bundle_file, format!("{bundle}\n")).unwrap();
         let state = root.path().join("downloader");
@@ -139,7 +145,16 @@ mod tests {
 
         assert!(sync::state::has_download_account(&state).unwrap());
         let credentials = sync::state::load_account(&state, ApiKeyScope::Download).unwrap();
-        assert!(credentials.consumer_identity_secret().is_some());
+        let imported_identity = iroh::SecretKey::from_bytes(
+            credentials
+                .consumer_identity_secret()
+                .expect("download import retained the consumer Iroh private key"),
+        );
+        assert_eq!(
+            imported_identity.public().as_bytes(),
+            published_identity.as_bytes(),
+            "imported download identity must match the public key in the publish bundle"
+        );
         assert!(sync::state::load_account(&state, ApiKeyScope::Publish).is_err());
         assert_eq!(
             sync::state::export_account(&state, ApiKeyScope::Download).unwrap(),

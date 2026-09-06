@@ -115,15 +115,9 @@ pub(crate) async fn handle_account_request(
 fn account_router<'a>(state: &'a State) -> Router<'a, &'a State> {
     Router::with_data(state)
         .post_async(INTERNAL_INITIALIZE_PATH, initialize_account)
-        .get_async(ACCOUNT_RECORD_INDEX_ROUTE, |request, context| {
-            route_account_request(request, context, AccountOperation::ListRecords)
-        })
-        .get_async(ACCOUNT_RECORD_ROUTE, |request, context| {
-            route_account_request(request, context, AccountOperation::GetRecord)
-        })
-        .put_async(ACCOUNT_RECORD_ROUTE, |request, context| {
-            route_account_request(request, context, AccountOperation::PutRecord)
-        })
+        .get_async(ACCOUNT_RECORD_INDEX_ROUTE, route_account_request)
+        .get_async(ACCOUNT_RECORD_ROUTE, route_account_request)
+        .put_async(ACCOUNT_RECORD_ROUTE, route_account_request)
         .or_else_any_method("/", route_not_found)
         .or_else_any_method(ROUTER_FALLBACK_ROUTE, route_not_found)
 }
@@ -131,14 +125,13 @@ fn account_router<'a>(state: &'a State) -> Router<'a, &'a State> {
 #[derive(Clone, Copy)]
 enum AccountOperation {
     ListRecords,
-    GetRecord,
-    PutRecord,
+    GetRecord(RecordId),
+    PutRecord(RecordId),
 }
 
 async fn route_account_request(
     request: Request,
     context: RouteContext<&State>,
-    operation: AccountOperation,
 ) -> worker::Result<Response> {
     if context
         .param("account_id")
@@ -149,20 +142,41 @@ async fn route_account_request(
     let Some(account_id) = account_id_param(&context) else {
         return error_response(STATUS_BAD_REQUEST, ErrorCode::InvalidRequest);
     };
-    if matches!(operation, AccountOperation::ListRecords) {
-        return list_records(request, context.data, account_id).await;
-    }
-    let Some(record_id) = record_id_param(&context) else {
-        return error_response(STATUS_BAD_REQUEST, ErrorCode::InvalidRequest);
+    let operation = match (request.method(), context.param("record_id")) {
+        (Method::Get, None) => AccountOperation::ListRecords,
+        (method @ (Method::Get | Method::Put), Some(_)) => {
+            let Some(record_id) = record_id_param(&context) else {
+                return error_response(STATUS_BAD_REQUEST, ErrorCode::InvalidRequest);
+            };
+            if method == Method::Get {
+                AccountOperation::GetRecord(record_id)
+            } else {
+                AccountOperation::PutRecord(record_id)
+            }
+        }
+        _ => return error_response(STATUS_NOT_FOUND, ErrorCode::InvalidRequest),
     };
+    let scope = match operation {
+        AccountOperation::ListRecords | AccountOperation::GetRecord(_) => ApiKeyScope::Download,
+        AccountOperation::PutRecord(_) => ApiKeyScope::Publish,
+    };
+    let authentication = authenticate_request(context.data, request.headers(), account_id, scope);
+    // GET bodies are unused. Rejected PUTs must also release their stream before
+    // returning, while authenticated PUTs retain it for bounded envelope parsing.
+    if !matches!(operation, AccountOperation::PutRecord(_)) || authentication.is_err() {
+        cancel_request_body(&request).await?;
+    }
+    match authentication {
+        Ok(()) => {}
+        Err(AuthenticationError::Unauthorized) => return unauthorized_response(),
+        Err(AuthenticationError::Unavailable) => return unavailable_response(),
+    }
     match operation {
-        AccountOperation::GetRecord => {
-            get_record(request, context.data, account_id, record_id).await
+        AccountOperation::ListRecords => list_records(context.data),
+        AccountOperation::GetRecord(record_id) => get_record(context.data, record_id),
+        AccountOperation::PutRecord(record_id) => {
+            put_record(request, context.data, record_id).await
         }
-        AccountOperation::PutRecord => {
-            put_record(request, context.data, account_id, record_id).await
-        }
-        AccountOperation::ListRecords => unreachable!("record operation guarded above"),
     }
 }
 
@@ -335,23 +349,7 @@ async fn initialize_account(
     }
 }
 
-async fn list_records(
-    request: Request,
-    state: &State,
-    account_id: AccountId,
-) -> worker::Result<Response> {
-    match authenticate_request(state, request.headers(), account_id, ApiKeyScope::Download) {
-        AuthenticationOutcome::Authenticated => {}
-        AuthenticationOutcome::Unauthorized => {
-            cancel_request_body(&request).await?;
-            return unauthorized_response();
-        }
-        AuthenticationOutcome::Unavailable => {
-            cancel_request_body(&request).await?;
-            return unavailable_response();
-        }
-    }
-    cancel_request_body(&request).await?;
+fn list_records(state: &State) -> worker::Result<Response> {
     let index = match storage::load_index(&state.storage()) {
         Ok(index) => index,
         Err(_) => return unavailable_response(),
@@ -359,55 +357,26 @@ async fn list_records(
     json_response(STATUS_OK, &index)
 }
 
-async fn get_record(
-    request: Request,
-    state: &State,
-    account_id: AccountId,
-    record_id: RecordId,
-) -> worker::Result<Response> {
-    match authenticate_request(state, request.headers(), account_id, ApiKeyScope::Download) {
-        AuthenticationOutcome::Authenticated => {}
-        AuthenticationOutcome::Unauthorized => {
-            cancel_request_body(&request).await?;
-            return unauthorized_response();
-        }
-        AuthenticationOutcome::Unavailable => {
-            cancel_request_body(&request).await?;
-            return unavailable_response();
-        }
-    }
-    cancel_request_body(&request).await?;
+fn get_record(state: &State, record_id: RecordId) -> worker::Result<Response> {
     let record = match storage::load_record(&state.storage(), record_id) {
         Ok(record) => record,
         Err(_) => return unavailable_response(),
     };
-    match record.map(|record| record.envelope()).transpose() {
-        Ok(Some((envelope, revision))) => {
+    match record {
+        Some(record) => {
+            let (envelope, revision) = record.into_envelope();
             let response = json_response(STATUS_OK, &envelope)?;
             etag_response(response, revision)
         }
-        Ok(None) => error_response(STATUS_NOT_FOUND, ErrorCode::InvalidRequest),
-        Err(_) => unavailable_response(),
+        None => error_response(STATUS_NOT_FOUND, ErrorCode::InvalidRequest),
     }
 }
 
 async fn put_record(
     mut request: Request,
     state: &State,
-    account_id: AccountId,
     record_id: RecordId,
 ) -> worker::Result<Response> {
-    match authenticate_request(state, request.headers(), account_id, ApiKeyScope::Publish) {
-        AuthenticationOutcome::Authenticated => {}
-        AuthenticationOutcome::Unauthorized => {
-            cancel_request_body(&request).await?;
-            return unauthorized_response();
-        }
-        AuthenticationOutcome::Unavailable => {
-            cancel_request_body(&request).await?;
-            return unavailable_response();
-        }
-    }
     // The public Worker drains oversized bodies and sets this private marker
     // because the sanitized request forwarded to the object has an empty body.
     if request.headers().has(INTERNAL_OVERSIZED_BODY_HEADER)? {
@@ -432,14 +401,13 @@ async fn put_record(
     };
 
     match storage::put_record(&state.storage(), record_id, envelope) {
-        Ok(Ok(outcome)) => mutation_success_response(outcome),
-        Ok(Err(error)) => mutation_error_response(error),
+        Ok(outcome) => mutation_success_response(outcome),
+        Err(StoreError::Mutation(error)) => mutation_error_response(error),
         Err(StoreError::Unavailable) => unavailable_response(),
     }
 }
 
-enum AuthenticationOutcome {
-    Authenticated,
+enum AuthenticationError {
     Unauthorized,
     Unavailable,
 }
@@ -449,28 +417,22 @@ fn authenticate_request(
     headers: &Headers,
     account_id: AccountId,
     required_scope: ApiKeyScope,
-) -> AuthenticationOutcome {
-    let value = match header_value(headers, "authorization") {
-        Ok(Some(value)) => value,
-        _ => return AuthenticationOutcome::Unauthorized,
-    };
-    let token = match ApiToken::parse_authorization(&[value.as_bytes()]) {
-        Ok(token) => token,
-        Err(_) => return AuthenticationOutcome::Unauthorized,
-    };
-    let supplied_hash = token.service_hash();
-    let account = match storage::load_account(&state.storage()) {
-        Ok(Some(account)) => account,
-        Ok(None) => return AuthenticationOutcome::Unauthorized,
-        Err(_) => return AuthenticationOutcome::Unavailable,
-    };
+) -> Result<(), AuthenticationError> {
+    let value = header_value(headers, "authorization")
+        .map_err(|_| AuthenticationError::Unauthorized)?
+        .ok_or(AuthenticationError::Unauthorized)?;
+    let token = ApiToken::parse_authorization(&[value.as_bytes()])
+        .map_err(|_| AuthenticationError::Unauthorized)?;
+    let account = storage::load_account(&state.storage())
+        .map_err(|_| AuthenticationError::Unavailable)?
+        .ok_or(AuthenticationError::Unauthorized)?;
     if account.account_id() != account_id {
-        return AuthenticationOutcome::Unavailable;
+        return Err(AuthenticationError::Unavailable);
     }
-    if account.authenticate(&supplied_hash, required_scope) {
-        AuthenticationOutcome::Authenticated
+    if account.authenticate(&token.service_hash(), required_scope) {
+        Ok(())
     } else {
-        AuthenticationOutcome::Unauthorized
+        Err(AuthenticationError::Unauthorized)
     }
 }
 

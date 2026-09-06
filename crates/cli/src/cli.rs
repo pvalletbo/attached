@@ -1,16 +1,19 @@
 use std::{
-    io::{Write as _, stdout},
+    io::{self, stdout},
     path::PathBuf,
 };
 
 use anyhow::{Context, Result, ensure};
 use attached_session_sync_protocol::account::ApiKeyScope;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::Shell;
 use zeroize::Zeroizing;
 
 use crate::{
-    account_clipboard, download_account, herdr_version, identity, installation, local_encryption,
-    publish_account, secure_state, server, session, session_catalog,
+    account_clipboard,
+    config::{self, PasswordSource},
+    download_account, herdr_version, installation, local_encryption, publish_account, secure_state,
+    server, session, session_catalog,
     session_picker::{self, SessionSelection},
     sync,
 };
@@ -18,12 +21,19 @@ use crate::{
 #[derive(Parser)]
 #[command(
     version,
-    about = "Discover and attach to synchronized Herdr sessions over Iroh"
+    about = "Discover and attach to synchronized Herdr sessions over Iroh",
+    after_long_help = "CONFIGURATION:\n    Attached reads $HOME/.config/attached/config.toml when it exists. Supported TOML settings:\n\n        password_source = \"password\" # or \"1password\"\n        config_directory = \"/absolute/path\" # defaults to $HOME/.config/attached\n\n    --use-1password overrides password_source for the current invocation."
 )]
 pub struct Cli {
     /// Increase diagnostic verbosity (`-v` for lifecycle, `-vv` for debug details).
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count, global = true)]
     verbose: u8,
+
+    /// Write span timings in folded-stack format for flamegraph generation.
+    ///
+    /// Pass `-vv` as well to print each span's busy and idle durations.
+    #[arg(long, value_name = "FILE", global = true)]
+    flamegraph: Option<PathBuf>,
 
     /// Have 1Password generate and store the encryption password instead of prompting for one.
     #[arg(long, global = true)]
@@ -92,11 +102,13 @@ enum Command {
 
         /// In noninteractive use, request an upgrade when remote Herdr is older than local Herdr.
         ///
-        /// The authenticated host runs exactly `herdr update --handoff` with its configured Herdr
-        /// executable. This installs from the remote configured channel and attempts Herdr's live
-        /// handoff; no requested release is selected. Attachment starts only if the installed
-        /// version then exactly matches the local Herdr version. A newer remote fails with
-        /// guidance to update local Herdr and is never mutated by this option.
+        /// The authenticated host stages `herdr update --handoff` noninteractively with inherited
+        /// Herdr session routing removed, atomically installs it, and hands off every live session.
+        /// Failures restore the previous binary and live version. If the binary was already
+        /// updated by an incomplete attempt, Attached retries Herdr's native handoff directly.
+        /// Attachment starts only after the binary and all live sessions exactly match local. A
+        /// newer remote fails with guidance to update local Herdr and is never mutated by this
+        /// option. Package-managed remote installations must be updated on their serving host.
         #[arg(long)]
         upgrade_remote: bool,
 
@@ -105,9 +117,27 @@ enum Command {
         state_dir: Option<PathBuf>,
     },
 
-    /// Update Attached to the latest release.
+    /// Update Attached to the latest release locally or on a synchronized host.
     #[command(visible_alias = "upgrade")]
-    Update,
+    Update {
+        /// Update the host serving `HOST/SESSION`; omit the target to choose with fzf.
+        #[arg(long, value_name = "HOST/SESSION", num_args = 0..=1)]
+        remote: Option<Option<String>>,
+
+        /// Override persistent state location (primarily for testing remote updates).
+        #[arg(long, hide = true)]
+        state_dir: Option<PathBuf>,
+    },
+
+    #[command(name = "__handoff-serve", hide = true)]
+    HandoffServe,
+
+    /// Generate a completion script for a supported shell.
+    Completions {
+        /// Shell whose completion script should be generated.
+        #[arg(value_enum)]
+        shell: Shell,
+    },
 
     /// Uninstall Attached and permanently delete all managed credentials and local state.
     Uninstall {
@@ -190,12 +220,33 @@ impl From<AccountKeyType> for ApiKeyScope {
     }
 }
 
+fn write_completions(shell: Shell, output: &mut impl std::io::Write) -> Result<()> {
+    let mut command = Cli::command();
+    let mut generated = Vec::new();
+    clap_complete::generate(shell, &mut command, "attached", &mut generated);
+    output
+        .write_all(&generated)
+        .with_context(|| format!("could not write {shell} completion script"))
+}
+
 impl Cli {
     pub fn verbosity(&self) -> u8 {
         self.verbose
     }
 
+    pub fn flamegraph(&self) -> Option<&std::path::Path> {
+        self.flamegraph.as_deref()
+    }
+
+    #[tracing::instrument(name = "cli_run", level = "debug", skip_all)]
     pub async fn run(self) -> Result<i32> {
+        if let Command::Completions { shell } = &self.command {
+            write_completions(*shell, &mut stdout().lock())?;
+            return Ok(0);
+        }
+
+        let configuration =
+            config::Config::load().context("could not load Attached configuration")?;
         let password_stdin = matches!(
             &self.command,
             Command::Sessions {
@@ -203,12 +254,15 @@ impl Cli {
                 ..
             }
         );
-        local_encryption::configure_password_provider(self.use_1password, password_stdin);
+        let use_one_password = !password_stdin
+            && (self.use_1password
+                || configuration.password_source() == PasswordSource::OnePassword);
+        local_encryption::configure_password_provider(use_one_password, password_stdin);
         match self.command {
             Command::Account { command } => {
                 match command {
                     AccountCommand::Create { service, state_dir } => {
-                        let state_dir = resolved_state_dir(state_dir)?;
+                        let state_dir = resolved_state_dir(state_dir, &configuration)?;
                         sync::account::create(&state_dir, &service).await?;
                         eprintln!(
                             "Account created and saved in encrypted local state; no portable account bundle was written."
@@ -225,7 +279,7 @@ impl Cli {
                         bundle_stdin,
                         state_dir,
                     } => {
-                        let state_dir = resolved_state_dir(state_dir)?;
+                        let state_dir = resolved_state_dir(state_dir, &configuration)?;
                         download_account::install(
                             &state_dir,
                             bundle_file.as_deref(),
@@ -237,7 +291,7 @@ impl Cli {
                         output,
                         state_dir,
                     } => {
-                        let state_dir = resolved_state_dir(state_dir)?;
+                        let state_dir = resolved_state_dir(state_dir, &configuration)?;
                         let scope = ApiKeyScope::from(key_type);
                         let bundle = Zeroizing::new(sync::account::export(&state_dir, scope)?);
                         if let Some(output) = output {
@@ -269,7 +323,7 @@ impl Cli {
                 bundle_file,
                 state_dir,
             } => {
-                let state_dir = resolved_state_dir(state_dir)?;
+                let state_dir = resolved_state_dir(state_dir, &configuration)?;
                 publish_account::ensure_configured(&state_dir, bundle_file.as_deref())?;
                 server::serve(state_dir, herdr_bin, host_label).await?;
                 Ok(0)
@@ -284,7 +338,7 @@ impl Cli {
                     herdr_bin,
                     state_dir,
                 }) => {
-                    let state_dir = resolved_state_dir(state_dir)?;
+                    let state_dir = resolved_state_dir(state_dir, &configuration)?;
                     sync::state::load_account(&state_dir, ApiKeyScope::Download)
                         .context("`sessions list` requires a download account bundle")?;
                     let local_version = herdr_version::query(&herdr_bin).context(
@@ -297,14 +351,11 @@ impl Cli {
                         eprintln!("Warning: {warning}");
                     }
                     let rendered = session_picker::render_synchronized_list(&refreshed.sessions)?;
-                    stdout()
-                        .lock()
-                        .write_all(rendered.as_bytes())
-                        .context("could not write synchronized session list")?;
+                    write_session_list(&mut stdout().lock(), &rendered)?;
                     Ok(0)
                 }
                 None => {
-                    let state_dir = resolved_state_dir(state_dir)?;
+                    let state_dir = resolved_state_dir(state_dir, &configuration)?;
                     let refreshed = session_catalog::refresh(&state_dir, &herdr_bin).await?;
                     for warning in refresh_warnings_to_display(&refreshed.warnings, self.verbose) {
                         eprintln!("Warning: {warning}");
@@ -319,7 +370,7 @@ impl Cli {
                 upgrade_remote,
                 state_dir,
             } => {
-                let state_dir = resolved_state_dir(state_dir)?;
+                let state_dir = resolved_state_dir(state_dir, &configuration)?;
                 let local_sessions = if target.is_none() {
                     match session::discover_active(herdr_bin.clone()).await {
                         Ok(sessions) => sessions,
@@ -350,16 +401,20 @@ impl Cli {
                     }
                 };
                 let synchronized_sessions = if has_download_account {
-                    let local_version = herdr_version::query(&herdr_bin).context(
-                        "could not determine the local Herdr version; catalog refresh and attachment were not started",
-                    )?;
-                    let refreshed = sync::refresh::refresh_sessions(&state_dir, local_version)
-                        .await
-                        .context("could not refresh synchronized sessions")?;
-                    for warning in refresh_warnings_to_display(&refreshed.warnings, self.verbose) {
-                        eprintln!("Warning: {warning}");
-                    }
-                    refreshed.sessions
+                    let refreshed = async {
+                        let local_version = herdr_version::query(&herdr_bin).context(
+                            "could not determine the local Herdr version; remote discovery was not started",
+                        )?;
+                        sync::refresh::refresh_sessions(&state_dir, local_version)
+                            .await
+                            .context("could not refresh synchronized sessions")
+                    }.await;
+                    attach_refresh_result(
+                        refreshed,
+                        target.is_none(),
+                        self.verbose,
+                        &mut std::io::stderr(),
+                    )?
                 } else {
                     Vec::new()
                 };
@@ -397,16 +452,61 @@ impl Cli {
                     }
                 }
             }
-            Command::Update => {
-                installation::update()?;
+            Command::Update { remote, state_dir } => {
+                if let Some(target) = remote {
+                    let state_dir = resolved_state_dir(state_dir, &configuration)?;
+                    sync::attached_update::update(&state_dir, target.as_deref(), self.verbose)
+                        .await?;
+                } else {
+                    ensure!(
+                        state_dir.is_none(),
+                        "--state-dir can only be used with --remote"
+                    );
+                    installation::update()?;
+                }
                 Ok(0)
             }
+            Command::HandoffServe => {
+                server::serve_candidate().await?;
+                Ok(0)
+            }
+            Command::Completions { .. } => unreachable!("handled before configuration loading"),
             Command::Uninstall { yes } => {
-                installation::uninstall(yes)?;
+                installation::uninstall(yes, configuration.config_directory())?;
                 Ok(0)
             }
         }
     }
+}
+
+fn attach_refresh_result(
+    refreshed: Result<sync::refresh::RefreshResult>,
+    interactive: bool,
+    verbosity: u8,
+    output: &mut impl std::io::Write,
+) -> Result<Vec<sync::state_catalog::SyncedSession>> {
+    let refreshed = match refreshed {
+        Ok(refreshed) => refreshed,
+        Err(error) if interactive => {
+            writeln!(
+                output,
+                "Warning: remote discovery failed: {error:#}. Showing local sessions only; check synchronization connectivity and credentials, then retry `attached attach`."
+            )?;
+            tracing::debug!(
+                operation = "attach_discovery",
+                stage = "remote",
+                outcome = "degraded",
+                "continuing with local session selection"
+            );
+            // Do not silently reuse cached descriptors or extend their validity.
+            return Ok(Vec::new());
+        }
+        Err(error) => return Err(error),
+    };
+    for warning in refresh_warnings_to_display(&refreshed.warnings, verbosity) {
+        writeln!(output, "Warning: {warning}")?;
+    }
+    Ok(refreshed.sessions)
 }
 
 fn refresh_warnings_to_display(
@@ -418,10 +518,21 @@ fn refresh_warnings_to_display(
         .filter(move |warning| verbosity > 0 || !warning.is_verbose_only())
 }
 
-fn resolved_state_dir(state_dir: Option<PathBuf>) -> Result<PathBuf> {
-    let path = state_dir.map_or_else(identity::default_state_dir, Ok)?;
+fn resolved_state_dir(
+    state_dir: Option<PathBuf>,
+    configuration: &config::Config,
+) -> Result<PathBuf> {
+    let path = state_dir.unwrap_or_else(|| configuration.config_directory().to_owned());
     secure_state::prepare_private_dir(&path)?;
     Ok(path)
+}
+
+fn write_session_list(output: &mut impl io::Write, rendered: &str) -> Result<()> {
+    match output.write_all(rendered.as_bytes()) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(error).context("could not write synchronized session list"),
+    }
 }
 
 fn write_account_bundle(bundle: &str, output_path: &std::path::Path) -> Result<()> {
@@ -485,7 +596,10 @@ mod tests {
             vec!["attached", "attach"],
             vec!["attached", "attach", "office/work"],
             vec!["attached", "update"],
+            vec!["attached", "update", "--remote"],
+            vec!["attached", "update", "--remote", "office/work"],
             vec!["attached", "upgrade"],
+            vec!["attached", "completions", "bash"],
             vec!["attached", "uninstall"],
             vec!["attached", "uninstall", "--yes"],
         ] {
@@ -677,6 +791,7 @@ mod tests {
             "sessions",
             "attach",
             "update",
+            "completions",
             "uninstall",
         ] {
             assert!(help.contains(command), "{help}");
@@ -685,6 +800,10 @@ mod tests {
             assert!(!help.contains(&format!("  {removed}  ")), "{help}");
         }
         assert!(!help.contains(account_clipboard::HELPER_COMMAND), "{help}");
+        assert!(
+            !help.contains(crate::serve_handoff::INTERNAL_COMMAND),
+            "{help}"
+        );
 
         let mut command = Cli::command();
         let export_help = command
@@ -712,6 +831,19 @@ mod tests {
         );
         assert!(import_help.contains("--bundle-stdin"), "{import_help}");
         assert!(import_help.contains("hidden input"), "{import_help}");
+    }
+
+    #[test]
+    fn generates_completions_for_every_supported_shell() {
+        for &shell in Shell::value_variants() {
+            let mut generated = Vec::new();
+            write_completions(shell, &mut generated).unwrap();
+            let generated = String::from_utf8(generated).unwrap();
+
+            assert!(!generated.is_empty(), "empty {shell} completion script");
+            assert!(generated.contains("sessions"), "{shell}: {generated}");
+            assert!(generated.contains("completions"), "{shell}: {generated}");
+        }
     }
 
     #[test]
@@ -747,6 +879,52 @@ mod tests {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("--use-1password"), "{help}");
         assert!(help.contains("generate and store"), "{help}");
+        assert!(help.contains("password_source = \"password\""), "{help}");
+        assert!(help.contains("config_directory"), "{help}");
+    }
+
+    #[tokio::test]
+    async fn sync_outage_degrades_only_interactive_attachment_and_explains_the_cause() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let root = crate::test_support::canonical_tempdir();
+            let state_dir = root.path().join("state");
+            sync::state::test_support::create_account(
+                &state_dir, &format!("http://{}", listener.local_addr().unwrap()),
+            ).unwrap();
+            assert!(sync::state::has_download_account(&state_dir).unwrap());
+            let server = tokio::spawn(async move {
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        let mut chunk = [0; 1024];
+                        let n = stream.read(&mut chunk).await.unwrap();
+                        assert!(n > 0 && request.len() < 8192);
+                        request.extend_from_slice(&chunk[..n]);
+                    }
+                    stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                }
+            });
+            for interactive in [true, false] {
+                let refreshed = sync::refresh::refresh_sessions(&state_dir, attached_tunnel_protocol::HerdrVersion::new(3, 2, 1)).await
+                    .context("could not refresh synchronized sessions");
+                let mut warnings = Vec::new();
+                let result = attach_refresh_result(refreshed, interactive, 0, &mut warnings);
+                if interactive {
+                    assert!(result.unwrap().is_empty(), "no stale remote cache fallback");
+                    let warnings = String::from_utf8(warnings).unwrap();
+                    assert!(warnings.contains("503"), "{warnings}");
+                    assert!(warnings.contains("local sessions only"), "{warnings}");
+                    assert!(warnings.contains("retry"), "{warnings}");
+                } else {
+                    assert!(format!("{:#}", result.unwrap_err()).contains("503"));
+                    assert!(warnings.is_empty(), "explicit remote attachment must fail");
+                }
+            }
+            server.await.unwrap();
+        }).await.expect("outage fixture timed out");
     }
 
     #[test]
@@ -807,11 +985,55 @@ mod tests {
     }
 
     #[test]
-    fn verbosity_is_repeatable_and_global() {
-        let cli = Cli::try_parse_from(["attached", "serve", "-vv"]).unwrap();
-        assert_eq!(cli.verbosity(), 2);
+    fn session_list_ignores_only_broken_pipes() {
+        struct FailingWriter(io::ErrorKind);
 
-        let cli = Cli::try_parse_from(["attached", "-v", "attach", "office/work"]).unwrap();
+        impl io::Write for FailingWriter {
+            fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(self.0, "synthetic failure"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        assert!(
+            write_session_list(
+                &mut FailingWriter(io::ErrorKind::BrokenPipe),
+                "session list"
+            )
+            .is_ok()
+        );
+        let error = write_session_list(
+            &mut FailingWriter(io::ErrorKind::PermissionDenied),
+            "session list",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("could not write synchronized session list"));
+    }
+
+    #[test]
+    fn verbosity_and_flamegraph_output_are_global() {
+        let cli = Cli::try_parse_from(["attached", "serve", "-vv", "--flamegraph", "serve.folded"])
+            .unwrap();
+        assert_eq!(cli.verbosity(), 2);
+        assert_eq!(cli.flamegraph(), Some(std::path::Path::new("serve.folded")));
+
+        let cli = Cli::try_parse_from([
+            "attached",
+            "-v",
+            "--flamegraph",
+            "attach.folded",
+            "attach",
+            "office/work",
+        ])
+        .unwrap();
         assert_eq!(cli.verbosity(), 1);
+        assert_eq!(
+            cli.flamegraph(),
+            Some(std::path::Path::new("attach.folded"))
+        );
     }
 }

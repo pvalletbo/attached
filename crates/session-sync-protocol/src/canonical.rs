@@ -3,7 +3,7 @@ use std::{fmt, str::FromStr, time::Duration};
 use attached_tunnel_protocol::CapabilitySecret;
 use chrono::{DateTime, Utc};
 use iroh_tickets::endpoint::EndpointTicket;
-use zeroize::{Zeroize as _, Zeroizing};
+use zeroize::Zeroizing;
 
 pub const MAX_CANONICAL_SESSION_ACCESS_DESCRIPTOR_LEN: usize =
     crate::limits::MAX_SESSION_ACCESS_DESCRIPTOR_BYTES;
@@ -124,19 +124,6 @@ impl SessionAccessDescriptor {
         )
     }
 
-    fn from_wire(mut wire: WireSessionAccessDescriptor) -> Result<Self, SessionAccessError> {
-        Self::new_with_optional_attached_version(
-            std::mem::take(&mut wire.host_label),
-            wire.issued_at,
-            wire.expires_at,
-            std::mem::take(&mut wire.endpoint_ticket),
-            CapabilitySecret::from_bytes(wire.attach_capability),
-            wire.attached_version,
-            wire.herdr_version,
-            std::mem::take(&mut wire.sessions),
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn new_with_optional_attached_version(
         host_label: String,
@@ -242,7 +229,7 @@ pub fn encode_session_access_descriptor(
     descriptor: &SessionAccessDescriptor,
 ) -> Result<Vec<u8>, SessionAccessError> {
     descriptor.validate()?;
-    let mut out = Vec::with_capacity(512);
+    let mut out = Zeroizing::new(Vec::with_capacity(512));
     put_head(
         &mut out,
         5,
@@ -283,7 +270,7 @@ pub fn encode_session_access_descriptor(
     if out.len() > MAX_CANONICAL_SESSION_ACCESS_DESCRIPTOR_LEN {
         return Err(SessionAccessError::Limit);
     }
-    Ok(out)
+    Ok(std::mem::take(&mut *out))
 }
 
 pub fn decode_session_access_descriptor(
@@ -308,7 +295,7 @@ pub fn decode_session_access_descriptor(
     decoder.key(4)?;
     let endpoint_ticket = decoder.text(1, MAX_ENDPOINT_TICKET_LEN)?.to_owned();
     decoder.key(5)?;
-    let attach_capability = decoder.fixed_bytes()?;
+    let attach_capability = CapabilitySecret::from_bytes(decoder.fixed_bytes()?);
     decoder.key(6)?;
     if decoder.head(4)? != 3 {
         return Err(SessionAccessError::Malformed);
@@ -340,36 +327,21 @@ pub fn decode_session_access_descriptor(
     if decoder.position != input.len() {
         return Err(SessionAccessError::Malformed);
     }
-    let descriptor = SessionAccessDescriptor::from_wire(WireSessionAccessDescriptor {
+    let descriptor = SessionAccessDescriptor::new_with_optional_attached_version(
         host_label,
         issued_at,
         expires_at,
         endpoint_ticket,
         attach_capability,
         attached_version,
-        herdr_version: HerdrVersion::new(major, minor, patch),
+        HerdrVersion::new(major, minor, patch),
         sessions,
-    })?;
-    if encode_session_access_descriptor(&descriptor)?.as_slice() != input {
+    )?;
+    let canonical = Zeroizing::new(encode_session_access_descriptor(&descriptor)?);
+    if canonical.as_slice() != input {
         return Err(SessionAccessError::NonCanonical);
     }
     Ok(descriptor)
-}
-
-struct WireSessionAccessDescriptor {
-    host_label: String,
-    issued_at: DateTime<Utc>,
-    expires_at: DateTime<Utc>,
-    endpoint_ticket: String,
-    attach_capability: [u8; 32],
-    attached_version: Option<AttachedVersion>,
-    herdr_version: HerdrVersion,
-    sessions: Vec<String>,
-}
-impl Drop for WireSessionAccessDescriptor {
-    fn drop(&mut self) {
-        self.attach_capability.zeroize();
-    }
 }
 
 fn unix_seconds(timestamp: DateTime<Utc>) -> Result<u64, SessionAccessError> {
