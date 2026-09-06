@@ -18,13 +18,17 @@ Item {
   property bool loading: false
   property bool awaitingPassword: false
   property bool requestActive: false
+  property bool refreshPending: false
   property bool catalogStarted: false
   property bool catalogExited: false
   property bool catalogCollected: false
   property bool catalogErrorCollected: false
+  property bool catalogResponseTooLarge: false
   property int catalogExitCode: -1
   property string catalogOutput: ""
   property string catalogErrorOutput: ""
+  readonly property int maxCatalogOutputCharacters: 4 * 1024 * 1024
+  readonly property int maxCatalogErrorCharacters: 64 * 1024
   property string pendingPassword: ""
   property string errorText: ""
   property string encryptionPasswordProvider: "password"
@@ -43,7 +47,7 @@ Item {
     root.opened = true
     searchInput.text = ""
     root.pendingPassword = ""
-    root.selectedIndex = 0
+    root.clearCatalog()
     root.refreshConfiguredCatalog()
     Qt.callLater(function() { searchInput.forceActiveFocus() })
   }
@@ -53,14 +57,22 @@ Item {
   function close() {
     root.opened = false
     root.requestActive = false
+    root.refreshPending = false
     root.catalogStarted = false
     root.loading = false
     root.awaitingPassword = false
     root.pendingPassword = ""
+    root.clearCatalog()
     searchInput.text = ""
     refreshDeadline.stop()
     if (catalogProcess.running)
       catalogProcess.running = false
+  }
+
+  function clearCatalog() {
+    root.sessions = []
+    root.filteredSessions = []
+    root.selectedIndex = 0
   }
 
   function dismiss() {
@@ -83,6 +95,7 @@ Item {
     } catch (error) {
       root.loading = false
       root.awaitingPassword = false
+      root.clearCatalog()
       root.errorText = String(error) + ". Fix " + configFile.path + " and press Ctrl+R."
       console.warn("attached-picker event=config_invalid")
       return
@@ -91,12 +104,24 @@ Item {
   }
 
   function refreshCatalog() {
-    // One Process instance means refreshes cannot overlap. This prevents a slow
-    // older request from replacing a newer catalog after the overlay reopens.
-    if (catalogProcess.running)
+    // One Process instance means refreshes cannot overlap. Cancel an older
+    // request and wait for both of its collectors before starting the pending
+    // refresh, so stale output cannot replace a newer catalog after reopen.
+    if (catalogProcess.running) {
+      root.requestActive = false
+      root.refreshPending = true
+      root.loading = true
+      root.awaitingPassword = false
+      root.pendingPassword = ""
+      root.clearCatalog()
+      refreshDeadline.stop()
+      catalogProcess.running = false
       return
+    }
+    root.refreshPending = false
     searchInput.text = ""
     root.pendingPassword = ""
+    root.clearCatalog()
     root.loading = root.encryptionPasswordProvider === "1password"
     root.awaitingPassword = root.encryptionPasswordProvider === "password"
     root.requestActive = true
@@ -104,6 +129,7 @@ Item {
     root.catalogExited = false
     root.catalogCollected = false
     root.catalogErrorCollected = false
+    root.catalogResponseTooLarge = false
     root.catalogExitCode = -1
     root.catalogOutput = ""
     root.catalogErrorOutput = ""
@@ -139,9 +165,29 @@ Item {
     console.info("attached-picker event=one_password_open_requested")
   }
 
+  function rejectOversizedCatalogResponse() {
+    if (root.catalogResponseTooLarge)
+      return
+    root.catalogResponseTooLarge = true
+    root.pendingPassword = ""
+    if (catalogProcess.running)
+      catalogProcess.running = false
+  }
+
   function finishCatalogLoad() {
-    if (!root.requestActive || !root.catalogExited || !root.catalogCollected
-        || !root.catalogErrorCollected)
+    if (!root.catalogExited || !root.catalogCollected || !root.catalogErrorCollected)
+      return
+    if (root.refreshPending) {
+      root.refreshPending = false
+      root.catalogOutput = ""
+      root.catalogErrorOutput = ""
+      Qt.callLater(function() {
+        if (root.opened)
+          root.refreshCatalog()
+      })
+      return
+    }
+    if (!root.requestActive)
       return
 
     root.requestActive = false
@@ -150,6 +196,13 @@ Item {
     root.pendingPassword = ""
     searchInput.text = ""
     refreshDeadline.stop()
+    if (root.catalogResponseTooLarge) {
+      root.errorText = "Attached returned too much output. Run `attached sessions` in a terminal for details, then press Ctrl+R."
+      root.catalogOutput = ""
+      root.catalogErrorOutput = ""
+      console.warn("attached-picker event=catalog_output_too_large")
+      return
+    }
     if (root.catalogExitCode !== 0) {
       root.errorText = SessionModel.catalogErrorMessage(
         root.catalogErrorOutput,
@@ -195,7 +248,8 @@ Item {
   }
 
   function activate(index) {
-    if (index < 0 || index >= root.filteredSessions.length)
+    if (!root.opened || root.requestActive || root.loading || root.awaitingPassword
+        || root.errorText.length > 0 || index < 0 || index >= root.filteredSessions.length)
       return
     var row = root.filteredSessions[index]
     // execDetached receives an argv array. No shell parses the remote session
@@ -220,17 +274,25 @@ Item {
     command: SessionModel.catalogCommand(root.encryptionPasswordProvider)
     stdinEnabled: true
     stdout: StdioCollector {
-      waitForEnd: true
+      waitForEnd: false
+      onDataChanged: {
+        if (text.length > root.maxCatalogOutputCharacters)
+          root.rejectOversizedCatalogResponse()
+      }
       onStreamFinished: {
-        root.catalogOutput = text
+        root.catalogOutput = root.catalogResponseTooLarge ? "" : text
         root.catalogCollected = true
         root.finishCatalogLoad()
       }
     }
     stderr: StdioCollector {
-      waitForEnd: true
+      waitForEnd: false
+      onDataChanged: {
+        if (text.length > root.maxCatalogErrorCharacters)
+          root.rejectOversizedCatalogResponse()
+      }
       onStreamFinished: {
-        root.catalogErrorOutput = text
+        root.catalogErrorOutput = root.catalogResponseTooLarge ? "" : text
         root.catalogErrorCollected = true
         root.finishCatalogLoad()
       }
@@ -241,7 +303,7 @@ Item {
     }
     onExited: function(exitCode, exitStatus) {
       root.catalogStarted = false
-      if (!root.requestActive)
+      if (!root.requestActive && !root.refreshPending)
         return
       root.catalogExitCode = exitCode
       root.catalogExited = true

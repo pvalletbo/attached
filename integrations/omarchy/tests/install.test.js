@@ -20,11 +20,17 @@ test("installer is idempotent and refuses every destructive or partial write", (
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "attached-omarchy-install-"));
   const home = path.join(root, "home");
   const bin = path.join(root, "bin");
-  const config = path.join(home, ".config");
+  const omarchyConfig = path.join(home, ".config");
+  const attachedConfig = path.join(root, "xdg-config");
   const log = path.join(root, "commands.log");
-  const bindingsPath = path.join(config, "hypr", "bindings.lua");
-  const destination = path.join(config, "omarchy", "plugins", "pvalletbo.attached");
-  const providerConfig = path.join(config, "attached", "omarchy.json");
+  const bindingsPath = path.join(omarchyConfig, "hypr", "bindings.lua");
+  const destination = path.join(
+    omarchyConfig,
+    "omarchy",
+    "plugins",
+    "pvalletbo.attached"
+  );
+  const providerConfig = path.join(attachedConfig, "attached", "omarchy.json");
   fs.mkdirSync(path.dirname(bindingsPath), { recursive: true });
   fs.mkdirSync(bin, { recursive: true });
 
@@ -39,7 +45,7 @@ test("installer is idempotent and refuses every destructive or partial write", (
   const env = {
     ...process.env,
     HOME: home,
-    XDG_CONFIG_HOME: config,
+    XDG_CONFIG_HOME: attachedConfig,
     PATH: `${bin}:${process.env.PATH}`,
     ATTACHED_TEST_LOG: log
   };

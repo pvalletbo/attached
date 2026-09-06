@@ -7,10 +7,11 @@ set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 source_dir="$script_dir/pvalletbo.attached"
 config_source="$script_dir/config.json"
-config_home=${XDG_CONFIG_HOME:-"$HOME/.config"}
-destination="$config_home/omarchy/plugins/pvalletbo.attached"
-bindings="$config_home/hypr/bindings.lua"
-attached_config_dir="$config_home/attached"
+omarchy_config_home="$HOME/.config"
+attached_config_home=${XDG_CONFIG_HOME:-"$HOME/.config"}
+destination="$omarchy_config_home/omarchy/plugins/pvalletbo.attached"
+bindings="$omarchy_config_home/hypr/bindings.lua"
+attached_config_dir="$attached_config_home/attached"
 plugin_config="$attached_config_dir/omarchy.json"
 marker='-- BEGIN Attached session picker'
 end_marker='-- END Attached session picker'

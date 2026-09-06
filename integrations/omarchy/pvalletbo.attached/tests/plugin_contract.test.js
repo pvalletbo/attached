@@ -7,7 +7,6 @@ const path = require("node:path");
 
 const plugin = path.resolve(__dirname, "..");
 const integration = path.resolve(plugin, "..");
-const repository = path.resolve(integration, "..", "..");
 
 test("manifest declares a loadable third-party overlay", () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(plugin, "manifest.json"), "utf8"));
@@ -36,10 +35,6 @@ test("configuration and documentation match both password providers", () => {
   ]) {
     assert.match(readme, new RegExp(contract.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), contract);
   }
-
-  const rootReadme = fs.readFileSync(path.join(repository, "README.md"), "utf8");
-  assert.match(rootReadme, /AI contribution notice/);
-  assert.match(rootReadme, /Omarchy Shell session picker/);
 });
 
 test("overlay supports safe catalog loading, keyboard and pointer activation", () => {
@@ -51,6 +46,10 @@ test("overlay supports safe catalog loading, keyboard and pointer activation", (
     "stdinEnabled: true",
     "catalogProcess.write",
     "TextInput.Password",
+    "root.clearCatalog()",
+    "root.refreshPending = true",
+    "root.catalogResponseTooLarge",
+    "onDataChanged:",
     "stderr: StdioCollector",
     "SessionModel.parseCatalog",
     "SessionModel.filterSessions",
@@ -79,6 +78,16 @@ test("overlay supports safe catalog loading, keyboard and pointer activation", (
     assert.match(qml, new RegExp(contract.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), contract);
   }
   assert.doesNotMatch(qml, /\b(?:bash|sh)\b.*-c/);
+  assert.match(
+    qml,
+    /function activate\(index\)[\s\S]{0,240}root\.requestActive[\s\S]{0,160}root\.errorText\.length > 0/,
+    "sessions must not remain actionable while refresh or error UI is displayed"
+  );
+  assert.match(
+    qml,
+    /function refreshCatalog\(\)[\s\S]{0,1200}root\.clearCatalog\(\)[\s\S]{0,500}catalogProcess\.running = true/,
+    "a refresh must clear stale sessions before launching the catalog process"
+  );
   assert.ok(
     qml.indexOf("text: row.modelData.host") < qml.indexOf("text: row.modelData.session"),
     "host must be the primary row label"

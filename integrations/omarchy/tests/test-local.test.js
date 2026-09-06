@@ -20,7 +20,8 @@ function run(args, env) {
 test("local test script replaces the binary without a backup and reloads the plugin", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "attached-omarchy-local-"));
   const home = path.join(root, "home");
-  const config = path.join(home, ".config");
+  const omarchyConfig = path.join(home, ".config");
+  const attachedConfig = path.join(root, "xdg-config");
   const bin = path.join(root, "commands");
   const localBin = path.join(home, ".local", "bin");
   const target = path.join(root, "target");
@@ -53,7 +54,7 @@ test("local test script replaces the binary without a backup and reloads the plu
   const env = {
     ...process.env,
     HOME: home,
-    XDG_CONFIG_HOME: config,
+    XDG_CONFIG_HOME: attachedConfig,
     CARGO_TARGET_DIR: target,
     ATTACHED_LOCAL_BIN_DIR: localBin,
     ATTACHED_TEST_LOG: log,
@@ -67,11 +68,14 @@ test("local test script replaces the binary without a backup and reloads the plu
   assert.equal(fs.statSync(installedBinary).mode & 0o777, 0o755);
   assert.equal(fs.existsSync(path.join(localBin, "attached.pre-pr")), false);
   assert.ok(
-    fs.statSync(path.join(config, "omarchy", "plugins", "pvalletbo.attached", "Overlay.qml"))
-      .isFile()
+    fs.statSync(
+      path.join(omarchyConfig, "omarchy", "plugins", "pvalletbo.attached", "Overlay.qml")
+    ).isFile()
   );
   assert.deepEqual(
-    JSON.parse(fs.readFileSync(path.join(config, "attached", "omarchy.json"), "utf8")),
+    JSON.parse(
+      fs.readFileSync(path.join(attachedConfig, "attached", "omarchy.json"), "utf8")
+    ),
     { encryptionPasswordProvider: "password" }
   );
 
