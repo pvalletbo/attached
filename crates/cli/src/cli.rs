@@ -254,10 +254,14 @@ impl Cli {
                 ..
             }
         );
-        let use_one_password = !password_stdin
-            && (self.use_1password
-                || configuration.password_source() == PasswordSource::OnePassword);
-        local_encryption::configure_password_provider(use_one_password, password_stdin);
+        local_encryption::configure_password_provider(
+            effective_use_one_password(
+                self.use_1password,
+                configuration.password_source(),
+                password_stdin,
+            ),
+            password_stdin,
+        );
         match self.command {
             Command::Account { command } => {
                 match command {
@@ -516,6 +520,14 @@ fn refresh_warnings_to_display(
     warnings
         .iter()
         .filter(move |warning| verbosity > 0 || !warning.is_verbose_only())
+}
+
+fn effective_use_one_password(
+    explicitly_requested: bool,
+    configured: PasswordSource,
+    password_stdin: bool,
+) -> bool {
+    !password_stdin && (explicitly_requested || configured == PasswordSource::OnePassword)
 }
 
 fn resolved_state_dir(
@@ -936,6 +948,21 @@ mod tests {
         assert!(password_stdin);
 
         assert!(Cli::try_parse_from(["attached", "sessions", "list", "--password-stdin"]).is_err());
+        assert!(effective_use_one_password(
+            false,
+            PasswordSource::OnePassword,
+            false
+        ));
+        assert!(effective_use_one_password(
+            true,
+            PasswordSource::Password,
+            false
+        ));
+        assert!(!effective_use_one_password(
+            false,
+            PasswordSource::OnePassword,
+            true
+        ));
 
         let mut command = Cli::command();
         let sessions_help = command

@@ -55,15 +55,24 @@ pub(crate) fn write_json(mut writer: impl Write, sessions: &[SyncedSession]) -> 
             published_at: session.published_at,
         })
         .collect::<Vec<_>>();
-    serde_json::to_writer(&mut writer, &rows)
-        .context("could not encode session catalog as JSON")?;
-    writer
-        .write_all(b"\n")
-        .context("could not write session catalog JSON")
+    match serde_json::to_writer(&mut writer, &rows) {
+        Ok(()) => {}
+        Err(error) if error.io_error_kind() == Some(std::io::ErrorKind::BrokenPipe) => {
+            return Ok(());
+        }
+        Err(error) => return Err(error).context("could not encode session catalog as JSON"),
+    }
+    match writer.write_all(b"\n") {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(error).context("could not write session catalog JSON"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use chrono::{TimeZone as _, Utc};
 
     use crate::sync::state_catalog::SyncedSession;
@@ -83,6 +92,23 @@ mod tests {
 
         assert!(refreshed.sessions.is_empty());
         assert!(refreshed.warnings.is_empty());
+    }
+
+    #[test]
+    fn json_catalog_ignores_closed_consumers() {
+        struct ClosedWriter;
+
+        impl io::Write for ClosedWriter {
+            fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "consumer closed"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        super::write_json(ClosedWriter, &[]).unwrap();
     }
 
     #[test]
