@@ -24,7 +24,7 @@ use super::{
 };
 
 const RECORD_FETCH_CONCURRENCY: usize = 8;
-const ATTACH_CACHE_SECONDS: i64 = 5 * 60;
+const ATTACH_CACHE_TTL: chrono::Duration = chrono::Duration::minutes(5);
 
 /// Reuse recent, account-bound discovery without extending descriptor validity.
 pub async fn sessions_for_attach(
@@ -57,8 +57,8 @@ fn cached_sessions(
     };
     let catalog = state_catalog::load(state_dir, &account)?;
     let fresh = catalog.refreshed_at.is_some_and(|refreshed_at| {
-        let age = now.signed_duration_since(refreshed_at).num_seconds();
-        (0..ATTACH_CACHE_SECONDS).contains(&age)
+        let age = now.signed_duration_since(refreshed_at);
+        (chrono::Duration::zero()..ATTACH_CACHE_TTL).contains(&age)
     });
     if !fresh {
         return Ok(None);
