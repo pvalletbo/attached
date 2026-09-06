@@ -1,7 +1,12 @@
-use std::{fs::File, io::Read, path::Path};
+use std::{
+    fs::File,
+    io::{self, Read},
+    path::Path,
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use attached_session_sync_protocol::limits::MAX_BUNDLE_ENCODED_BYTES;
+use rustix::fs::{Mode, OFlags};
 use zeroize::Zeroizing;
 
 use crate::sync;
@@ -52,8 +57,25 @@ where
 }
 
 fn read_bundle_file(path: &Path) -> Result<Zeroizing<String>> {
-    let file = File::open(path)
-        .with_context(|| format!("could not open download bundle file {}", path.display()))?;
+    // A FIFO at an explicitly supplied bundle path would block File::open until
+    // another process opens the writer end. Open nonblocking and accept regular
+    // files only; callers that want a pipe already have --bundle-stdin.
+    let file = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(io::Error::from)
+    .with_context(|| format!("could not open download bundle file {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("could not inspect download bundle file {}", path.display()))?;
+    ensure!(
+        metadata.file_type().is_file(),
+        "download bundle file {} is not a regular file; use --bundle-stdin for piped input",
+        path.display()
+    );
     read_bounded_bundle(file)
         .with_context(|| format!("could not read download bundle file {}", path.display()))
 }
@@ -163,6 +185,31 @@ mod tests {
         let stored = std::fs::read(state.join("sync-account.bundle")).unwrap();
         assert!(crate::local_encryption::is_envelope(&stored));
         assert_ne!(stored.as_slice(), bundle.as_bytes());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn fifo_bundle_file_is_rejected_without_waiting_for_a_writer() {
+        let root = crate::test_support::canonical_tempdir();
+        let directory = File::open(root.path()).unwrap();
+        rustix::fs::mkfifoat(
+            &directory,
+            "download.bundle",
+            Mode::RUSR | Mode::WUSR,
+        )
+        .unwrap();
+        let path = root.path().join("download.bundle");
+
+        let started = std::time::Instant::now();
+        let error = read_bundle_file(&path).unwrap_err().to_string();
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "FIFO bundle open blocked for {:?}",
+            started.elapsed()
+        );
+        assert!(error.contains("not a regular file"), "{error}");
+        assert!(error.contains("--bundle-stdin"), "{error}");
     }
 
     #[test]
