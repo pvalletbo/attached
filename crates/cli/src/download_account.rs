@@ -192,12 +192,7 @@ mod tests {
     fn fifo_bundle_file_is_rejected_without_waiting_for_a_writer() {
         let root = crate::test_support::canonical_tempdir();
         let directory = File::open(root.path()).unwrap();
-        rustix::fs::mkfifoat(
-            &directory,
-            "download.bundle",
-            Mode::RUSR | Mode::WUSR,
-        )
-        .unwrap();
+        rustix::fs::mkfifoat(&directory, "download.bundle", Mode::RUSR | Mode::WUSR).unwrap();
         let path = root.path().join("download.bundle");
 
         let started = std::time::Instant::now();
