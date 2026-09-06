@@ -60,15 +60,10 @@ impl Tracker {
         };
         Some(Notice {
             title: format!("{} {event}", text(agent, 80)),
-            body: format!(
-                "{} · {}{}",
-                text(&pane.workspace_id, 80),
-                text(&pane.pane_id, 80),
-                pane.title
-                    .as_deref()
-                    .map(|t| format!(" · {}", text(t, 160)))
-                    .unwrap_or_default()
-            ),
+            // Host/session is already shown by the desktop backend. Internal
+            // workspace/pane IDs and terminal metadata are routing details, not
+            // useful notification text (and metadata titles can be opaque).
+            body: "Click to open this session.".to_owned(),
         })
     }
 }
@@ -149,6 +144,29 @@ mod tests {
         tracker.apply(Message::Snapshot { panes: vec![] });
         assert!(event(&mut tracker, Status::Done).is_empty());
     }
+    #[test]
+    fn notifications_show_agent_and_action_without_internal_ids_or_metadata() {
+        for status in [Status::Done, Status::Blocked] {
+            let mut tracker = Tracker::default();
+            tracker.apply(Message::Snapshot {
+                panes: vec![pane(Status::Working)],
+            });
+            let mut updated = pane(status);
+            updated.title = Some("term_opaque-uuid · w1:p1 · internal-session-data".into());
+            let notices = tracker.apply(Message::State { pane: updated });
+            assert_eq!(notices.len(), 1);
+            assert_eq!(notices[0].body, "Click to open this session.");
+            let rendered = format!("{} {}", notices[0].title, notices[0].body);
+            assert!(rendered.starts_with("pi "));
+            for internal in ["w1", "p1", "term_", "uuid", "internal-session-data"] {
+                assert!(
+                    !rendered.contains(internal),
+                    "leaked {internal}: {rendered}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn presentation_changes_do_not_notify_and_controls_are_removed() {
         let mut tracker = Tracker::default();

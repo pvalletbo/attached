@@ -17,6 +17,9 @@ mod linux;
 
 use super::tracker::{Notice, text};
 
+#[path = "macos_terminal.rs"]
+mod macos_terminal;
+
 #[derive(Clone)]
 pub struct Launch {
     pub attached: PathBuf,
@@ -67,7 +70,14 @@ impl Launch {
 
     pub async fn open(&self, target: &str) -> Result<()> {
         crate::sync::attach::parse_target(target)?;
-        let mut command = self.terminal_command(target, cfg!(target_os = "macos"))?;
+        #[cfg(target_os = "macos")]
+        let launch = Self {
+            terminal: Some(macos_terminal::resolve(self.terminal.as_deref()).await?),
+            ..self.clone()
+        };
+        #[cfg(not(target_os = "macos"))]
+        let launch = self;
+        let mut command = launch.terminal_command(target, cfg!(target_os = "macos"))?;
         // A notification callback must not inherit the pane/session routing of
         // the terminal from which the watcher was originally started.
         for (name, _) in std::env::vars_os() {
@@ -87,7 +97,7 @@ impl Launch {
         match timeout(Duration::from_millis(500), child.wait()).await {
             Ok(status) => ensure!(
                 status?.success(),
-                "terminal launcher failed; check desktop/Terminal automation permissions"
+                "terminal launcher failed; check app installation and desktop/automation permissions"
             ),
             Err(_) => {
                 tokio::spawn(async move {
@@ -100,15 +110,13 @@ impl Launch {
 
     fn terminal_command(&self, target: &str, macos: bool) -> Result<Command> {
         if macos {
-            ensure!(
-                self.terminal.is_none(),
-                "--terminal is currently Linux-only; macOS uses Terminal.app"
+            return macos_terminal::command(
+                self.terminal
+                    .as_deref()
+                    .context("macOS terminal selection was not resolved")?,
+                &self.attached,
+                &self.attach_args(target),
             );
-            let shell = shell_command(&self.attached, &self.attach_args(target))?;
-            let mut command = Command::new("/usr/bin/osascript");
-            // The command is an AppleScript argument, never AppleScript source.
-            command.args(["-e", "on run argv\ntell application \"Terminal\"\nactivate\ndo script (item 1 of argv)\nend tell\nend run", "--", &format!("exec {shell}")]);
-            return Ok(command);
         }
         let terminal = match &self.terminal {
             Some(path) => path.clone(),
@@ -156,10 +164,8 @@ impl Desktop {
         }
         #[cfg(target_os = "macos")]
         {
-            ensure!(
-                launch.terminal.is_none(),
-                "--terminal is Linux-only; macOS uses Terminal.app"
-            );
+            let mut launch = launch;
+            launch.terminal = Some(macos_terminal::resolve(launch.terminal.as_deref()).await?);
             let helper = program(Path::new("terminal-notifier"))
                 .context("clickable notifications on macOS require `brew install terminal-notifier`; allow its notifications in System Settings")?;
             Ok(Self { helper, launch })
@@ -229,6 +235,7 @@ fn find_terminal() -> Result<PathBuf> {
         "x-terminal-emulator",
         "gnome-terminal",
         "konsole",
+        "ghostty",
         "kitty",
         "alacritty",
         "foot",
@@ -301,24 +308,55 @@ async fn run(command: &mut Command, deadline: Duration) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     #[test]
-    fn click_arguments_preserve_target_state_and_password_source() {
-        let launch = Launch {
-            attached: "/tmp/attached executable".into(),
-            state_dir: "/tmp/state dir".into(),
-            herdr_bin: "/tmp/herdr".into(),
-            terminal: None,
-            one_password: true,
-        };
-        let args = launch.attach_args("host/work");
-        assert_eq!(args.last().unwrap(), "host/work");
-        assert_eq!(args[args.len() - 2], "--");
-        assert!(args.contains(&OsString::from("--use-1password")));
-        assert!(args.contains(&OsString::from("/tmp/state dir")));
-        assert!(
-            !launch
-                .callback_args("host/work")
-                .contains(&OsString::from("--upgrade-remote"))
-        );
+    fn click_arguments_preserve_target_terminal_state_and_password_choice() {
+        for one_password in [false, true] {
+            let launch = Launch {
+                attached: "/tmp/attached executable".into(),
+                state_dir: "/tmp/state dir".into(),
+                herdr_bin: "/tmp/herdr".into(),
+                terminal: Some("ghostty".into()),
+                one_password,
+            };
+            let args = launch.attach_args("host/work");
+            let callback = launch.callback_args("host/work");
+            for args in [&args, &callback] {
+                assert_eq!(args.last().unwrap(), "host/work");
+                assert_eq!(args[args.len() - 2], "--");
+                assert_eq!(
+                    args.contains(&OsString::from("--use-1password")),
+                    one_password
+                );
+                assert!(args.contains(&OsString::from("/tmp/state dir")));
+                assert!(args.contains(&OsString::from("/tmp/herdr")));
+                assert!(!args.contains(&OsString::from("--upgrade-remote")));
+                assert!(
+                    <crate::cli::Cli as clap::Parser>::try_parse_from(
+                        std::iter::once(launch.attached.clone().into_os_string())
+                            .chain(args.iter().cloned())
+                    )
+                    .is_ok()
+                );
+            }
+            assert!(
+                !args.contains(&OsString::from("--terminal")),
+                "terminal selector belongs to the callback, not attach"
+            );
+            assert!(
+                callback
+                    .windows(2)
+                    .any(|pair| pair == ["--terminal", "ghostty"])
+            );
+            let terminal = launch.terminal_command("host/work", true).unwrap();
+            let initial = terminal
+                .as_std()
+                .get_args()
+                .last()
+                .unwrap()
+                .to_string_lossy();
+            assert!(initial.starts_with("--initial-command=shell:exec "));
+            assert!(initial.contains("'/tmp/attached executable' 'attach'"));
+            assert_eq!(initial.contains("'--use-1password'"), one_password);
+        }
     }
     #[test]
     fn macos_click_is_data_not_applescript_source_and_never_uses_notice_text() {
@@ -326,7 +364,7 @@ mod tests {
             attached: "/tmp/attached executable".into(),
             state_dir: "/tmp/state's dir".into(),
             herdr_bin: "/tmp/herdr".into(),
-            terminal: None,
+            terminal: Some("terminal".into()),
             one_password: true,
         };
         let target = "host/work'\";$(id)";

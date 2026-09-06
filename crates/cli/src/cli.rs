@@ -10,10 +10,8 @@ use clap_complete::Shell;
 use zeroize::Zeroizing;
 
 use crate::{
-    account_clipboard,
-    config::{self, PasswordSource},
-    download_account, herdr_version, installation, local_encryption, publish_account, secure_state,
-    server, session,
+    account_clipboard, config, download_account, herdr_version, installation, local_encryption,
+    publish_account, secure_state, server, session,
     session_picker::{self, SessionSelection},
     sync,
 };
@@ -22,7 +20,7 @@ use crate::{
 #[command(
     version,
     about = "Discover and attach to synchronized Herdr sessions over Iroh",
-    after_long_help = "CONFIGURATION:\n    Attached reads $HOME/.config/attached/config.toml when it exists. Supported TOML settings:\n\n        password_source = \"password\" # or \"1password\"\n        config_directory = \"/absolute/path\" # defaults to $HOME/.config/attached\n\n    --use-1password overrides password_source for the current invocation."
+    after_long_help = "CONFIGURATION:\n    Attached reads $HOME/.config/attached/config.toml when it exists. Supported TOML settings:\n\n        password_source = \"password\" # default; or \"1password\"\n        config_directory = \"/absolute/path\" # defaults to $HOME/.config/attached\n        notification_terminal = \"ghostty\" # optional notification-click override\n\n    --use-1password overrides password_source for the current invocation.\n    notifications watch --terminal overrides notification_terminal; macOS otherwise\n    uses its registered default terminal (Ghostty or Terminal.app supported)."
 )]
 pub struct Cli {
     /// Increase diagnostic verbosity (`-v` for lifecycle, `-vv` for debug details).
@@ -174,7 +172,17 @@ enum NotificationsCommand {
     /// Linux uses native D-Bus notifications and needs a graphical session with
     /// a notification daemon supporting actions. macOS needs terminal-notifier
     /// (`brew install terminal-notifier`) with notifications allowed in System Settings.
-    /// Clicks open attached attach in a new terminal; macOS uses Terminal.app.
+    /// Clicks open attached attach in a new terminal. Terminal precedence is
+    /// --terminal, notification_terminal in Attached config, then system selection.
+    /// macOS reads the registered default for Unix executables (Ghostty 1.2+ or
+    /// Terminal.app supported); Linux auto-detects a terminal executable. The selected
+    /// terminal is preserved in click callbacks. Recent Ghostty versions provide a
+    /// Ghostty > Make Ghostty the Default Terminal menu item. If it is unavailable,
+    /// use --terminal ghostty or notification_terminal = "ghostty" in Attached config.
+    ///
+    /// Credentials follow password_source in Attached config (password prompt if
+    /// unset). --use-1password overrides it and the effective choice is forwarded
+    /// to the click command. No new password-source default is introduced.
     /// Keep the watcher running for Linux click actions. Notices replace the previous
     /// notice for that session. Limits: 128 sessions per watcher, 64 event connections
     /// per serving host, and 256 panes per session. New panes and subscription changes
@@ -182,7 +190,8 @@ enum NotificationsCommand {
     Watch {
         #[arg(long, default_value = "herdr")]
         herdr_bin: PathBuf,
-        /// Linux terminal executable supporting -e PROGRAM ARGS; auto-detected by default.
+        /// Click terminal: macOS ghostty, terminal, or absolute Ghostty.app path;
+        /// Linux executable supporting -e PROGRAM ARGS. Overrides notification_terminal.
         #[arg(long, conflicts_with = "print")]
         terminal: Option<PathBuf>,
         /// Print live notification JSON instead of posting OS notifications (headless diagnostics).
@@ -288,9 +297,8 @@ impl Cli {
 
         let configuration =
             config::Config::load().context("could not load Attached configuration")?;
-        local_encryption::configure_use_one_password(
-            self.use_1password || configuration.password_source() == PasswordSource::OnePassword,
-        );
+        let one_password = configuration.use_one_password(self.use_1password);
+        local_encryption::configure_use_one_password(one_password);
         match self.command {
             Command::Account { command } => {
                 match command {
@@ -384,8 +392,6 @@ impl Cli {
                 }
             },
             Command::Notifications { command } => {
-                let one_password = self.use_1password
-                    || configuration.password_source() == PasswordSource::OnePassword;
                 match command {
                     NotificationsCommand::Watch {
                         herdr_bin,
@@ -397,7 +403,7 @@ impl Cli {
                         crate::notifications::watch(
                             state_dir,
                             herdr_bin,
-                            terminal,
+                            configuration.resolve_notification_terminal(terminal),
                             one_password,
                             print,
                         )
@@ -414,7 +420,7 @@ impl Cli {
                             attached: std::env::current_exe()?,
                             state_dir,
                             herdr_bin,
-                            terminal,
+                            terminal: configuration.resolve_notification_terminal(terminal),
                             one_password,
                         }
                         .open(&target)
@@ -733,6 +739,10 @@ mod tests {
         assert!(help.contains("terminal-notifier"));
         assert!(help.contains("D-Bus"));
         assert!(help.contains("not replayed"));
+        assert!(help.contains("notification_terminal"));
+        assert!(help.contains("registered default"));
+        assert!(help.contains("password prompt if"));
+        assert!(!help.contains("macOS uses Terminal.app"));
     }
 
     #[test]
