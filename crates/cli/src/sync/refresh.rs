@@ -24,6 +24,49 @@ use super::{
 };
 
 const RECORD_FETCH_CONCURRENCY: usize = 8;
+const ATTACH_CACHE_SECONDS: i64 = 5 * 60;
+
+/// Reuse recent, account-bound discovery without extending descriptor validity.
+pub async fn sessions_for_attach(
+    state_dir: &Path,
+    local_version: HerdrVersion,
+    no_cache: bool,
+) -> Result<RefreshResult> {
+    let now = super::utc_now_seconds();
+    if !no_cache {
+        let registry = crate::endpoint_registry::default_dir();
+        if let Ok(Some(mut cached)) =
+            cached_sessions(state_dir, registry.as_deref().unwrap_or(Path::new("")), now)
+        {
+            if registry.is_err() {
+                push_registry_warning(&mut cached.warnings);
+            }
+            return Ok(cached);
+        }
+    }
+    refresh_sessions(state_dir, local_version).await
+}
+
+fn cached_sessions(
+    state_dir: &Path,
+    registry_dir: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<RefreshResult>> {
+    let Some(account) = state::load_account_optional(state_dir, ApiKeyScope::Download)? else {
+        return Ok(None);
+    };
+    let catalog = state_catalog::load(state_dir, &account)?;
+    let fresh = catalog.refreshed_at.is_some_and(|refreshed_at| {
+        let age = now.signed_duration_since(refreshed_at).num_seconds();
+        (0..ATTACH_CACHE_SECONDS).contains(&age)
+    });
+    if !fresh {
+        return Ok(None);
+    }
+    let listing =
+        state_catalog::sessions_excluding_local_endpoints(state_dir, &account, now, registry_dir)?;
+    Ok(Some(finish_refresh(listing, Vec::new())))
+}
 
 #[derive(Debug)]
 pub struct RefreshResult {
@@ -229,6 +272,11 @@ async fn refresh_sessions_with_registry_at(
     }
     accepted.sort_by_key(|record| record.record_id);
     catalog.records = accepted;
+    // Partial refreshes should be retried rather than hiding unavailable records for minutes.
+    catalog.refreshed_at = (!warnings
+        .iter()
+        .any(|warning| matches!(warning, RefreshWarning::RecordUnavailable { .. })))
+    .then_some(now);
     state_catalog::save_refresh(
         state_dir,
         &account,
@@ -533,6 +581,51 @@ mod tests {
                 2
             );
             server.await.unwrap();
+            // The fixture service is now offline: a fresh attach must do no HTTP.
+            let cached = sessions_for_attach(&state_dir, HerdrVersion::new(3, 2, 1), false)
+                .await
+                .unwrap();
+            assert_eq!(cached.sessions, refreshed.sessions);
+            assert!(
+                sessions_for_attach(&state_dir, HerdrVersion::new(3, 2, 1), true)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                cached_sessions(&state_dir, &registry_dir, now + Duration::from_secs(299))
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                cached_sessions(&state_dir, &registry_dir, now + Duration::from_secs(300))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                cached_sessions(&state_dir, &registry_dir, now - Duration::from_secs(1))
+                    .unwrap()
+                    .is_none()
+            );
+
+            // A fresh discovery timestamp never prolongs an expired descriptor.
+            let mut catalog = state_catalog::load(&state_dir, &account).unwrap();
+            catalog.refreshed_at = Some(now + Duration::from_secs(299));
+            state_catalog::save(&state_dir, &account, &catalog).unwrap();
+            assert!(
+                cached_sessions(&state_dir, &registry_dir, now + Duration::from_secs(300))
+                    .unwrap()
+                    .unwrap()
+                    .sessions
+                    .is_empty()
+            );
+            // Catalogs written before caching was introduced require a refresh.
+            catalog.refreshed_at = None;
+            state_catalog::save(&state_dir, &account, &catalog).unwrap();
+            assert!(
+                cached_sessions(&state_dir, &registry_dir, now)
+                    .unwrap()
+                    .is_none()
+            );
         })
         .await
         .expect("publication race fixture timed out");

@@ -64,6 +64,8 @@ pub(super) struct Catalog {
     service_origin: String,
     #[serde(default)]
     generation: u64,
+    #[serde(default, with = "chrono::serde::ts_seconds_option")]
+    pub(super) refreshed_at: Option<DateTime<Utc>>,
     pub(super) records: Vec<CatalogRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pruned_revisions: Vec<PrunedRevision>,
@@ -101,6 +103,7 @@ impl Catalog {
             account_id: account.account_id(),
             service_origin: account.service_origin().to_owned(),
             generation: 0,
+            refreshed_at: None,
             records: Vec::new(),
             pruned_revisions: Vec::new(),
         }
@@ -202,6 +205,7 @@ pub(super) fn save_refresh(
             .map(|pruned| (pruned.record_id, pruned.service_revision))
             .collect::<std::collections::BTreeMap<_, _>>();
         let mut reconciled = Catalog::empty(account);
+        reconciled.refreshed_at = refreshed.refreshed_at;
         for candidate in &refreshed.records {
             if (current_generation != refreshed.generation
                 && !baseline_revisions.contains(&(candidate.record_id, candidate.service_revision))
