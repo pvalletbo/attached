@@ -17,3 +17,6 @@ Whenever you implement a new change you should do the following.
 4. create a new PR against main. The PR description must contain a brief explanation about what has been
 done, and all the required details if the feature is complex. A human will review the PR so leave 
 any required information for them.
+
+This only applies to new features. when the developr requests a change of a current feature, do not 
+create a new branch and PR. Update the existing one. 
