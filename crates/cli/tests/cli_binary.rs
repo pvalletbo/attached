@@ -353,8 +353,8 @@ esac
                 .all(|addr| addr.ip().is_loopback())
         );
         let ticket = EndpointTicket::new(endpoint.addr()).to_string();
-        // Normal exit, parent-connection loss, then an explicit user retry
-        // against a fresh publication. Ordinary attachment does not auto-reconnect.
+        // Populate discovery, reuse it for the connection-loss attempt, then
+        // explicitly refresh after pruning. Ordinary attachment does not auto-reconnect.
         for (attempt, mode) in ["exit", "drop", "exit"].into_iter().enumerate() {
             for marker in ["received", "proxy-socket", "herdr-pid"] {
                 let _ = fs::remove_file(fixture.path(marker));
@@ -363,14 +363,12 @@ esac
             let (index, record) = catalog(&ticket, revision);
             let http = async {
                 respond(&mut checked_request(&listener, false).await, &index, "").await;
-                if attempt != 1 {
-                    respond(
-                        &mut checked_request(&listener, true).await,
-                        &record,
-                        &format!("ETag: \"{revision}\"\r\n"),
-                    )
-                    .await;
-                }
+                respond(
+                    &mut checked_request(&listener, true).await,
+                    &record,
+                    &format!("ETag: \"{revision}\"\r\n"),
+                )
+                .await;
             };
             let peer = async {
                 let connection = endpoint.accept().await.unwrap().await.unwrap();
@@ -410,6 +408,11 @@ esac
             };
             let client = async {
                 let mut command = fixture.command(&["--use-1password", "attach", "remote/work"]);
+                if attempt == 2 {
+                    // The failed connection prunes this revision, but discovery is
+                    // still cached. Explicitly request the replacement publication.
+                    command.arg("--no-cache");
+                }
                 command.env("FIXTURE_MODE", mode);
                 let output = fixture.spawn(command).wait().await;
                 if mode == "exit" {
@@ -442,7 +445,26 @@ esac
                     "Herdr child survived CLI exit"
                 );
             };
-            tokio::join!(http, peer, client);
+            let exchange = async {
+                tokio::join!(peer, client);
+            };
+            timeout(DEADLINE, async {
+                if attempt == 1 {
+                    // Keep the service listening so any unintended refresh fails
+                    // immediately rather than leaving an HTTP fixture waiting forever.
+                    tokio::select! {
+                        biased;
+                        unexpected = listener.accept() => {
+                            panic!("cached attachment contacted the sync service: {unexpected:?}");
+                        }
+                        () = exchange => {}
+                    }
+                } else {
+                    tokio::join!(http, exchange);
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("remote attachment attempt {attempt} ({mode}) timed out"));
         }
         endpoint.close().await;
     })
