@@ -806,7 +806,10 @@ exit 9
             })
             .collect::<Vec<_>>();
         let payload = serde_json::to_vec(&serde_json::json!({ "sessions": sessions })).unwrap();
-        assert!(payload.len() > 4096, "fixture did not exceed the old discovery limit");
+        assert!(
+            payload.len() > 4096,
+            "fixture did not exceed the old discovery limit"
+        );
         assert!(payload.len() < MAX_SESSION_DISCOVERY_BYTES as usize);
         fs::write(&fixture, payload).unwrap();
         let herdr = fake_herdr(format!("cat '{}'\n", fixture.display()).as_bytes());
