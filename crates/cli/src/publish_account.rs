@@ -1,7 +1,14 @@
-use std::{env, ffi::OsString, fs::File, io::Read, path::Path};
+use std::{
+    env,
+    ffi::OsString,
+    fs::File,
+    io::{self, Read},
+    path::Path,
+};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use attached_session_sync_protocol::{account::ApiKeyScope, limits::MAX_BUNDLE_ENCODED_BYTES};
+use rustix::fs::{Mode, OFlags};
 use zeroize::Zeroizing;
 
 use crate::sync;
@@ -74,8 +81,25 @@ fn os_string_into_secret(value: OsString) -> Result<Zeroizing<String>> {
 }
 
 fn read_bundle_file(path: &Path) -> Result<Zeroizing<String>> {
-    let file = File::open(path)
-        .with_context(|| format!("could not open publish bundle file {}", path.display()))?;
+    // A FIFO at an explicitly supplied bundle path would block File::open until
+    // another process opens the writer end. Open nonblocking and accept regular
+    // files only; automation can use ATTACHED_PUBLISH_BUNDLE instead of a pipe.
+    let file = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(io::Error::from)
+    .with_context(|| format!("could not open publish bundle file {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("could not inspect publish bundle file {}", path.display()))?;
+    ensure!(
+        metadata.file_type().is_file(),
+        "publish bundle file {} is not a regular file; use {PUBLISH_BUNDLE_ENV} for piped or injected input",
+        path.display()
+    );
     let mut contents = Zeroizing::new(String::new());
     file.take((MAX_BUNDLE_INPUT_BYTES + 1) as u64)
         .read_to_string(&mut contents)
@@ -169,6 +193,26 @@ mod tests {
             "publish account state was not encrypted"
         );
         assert_ne!(stored.as_slice(), bundle.as_bytes());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn fifo_bundle_file_is_rejected_without_waiting_for_a_writer() {
+        let root = crate::test_support::canonical_tempdir();
+        let directory = File::open(root.path()).unwrap();
+        rustix::fs::mkfifoat(&directory, "publish.bundle", Mode::RUSR | Mode::WUSR).unwrap();
+        let path = root.path().join("publish.bundle");
+
+        let started = std::time::Instant::now();
+        let error = read_bundle_file(&path).unwrap_err().to_string();
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "FIFO bundle open blocked for {:?}",
+            started.elapsed()
+        );
+        assert!(error.contains("not a regular file"), "{error}");
+        assert!(error.contains(PUBLISH_BUNDLE_ENV), "{error}");
     }
 
     #[test]
