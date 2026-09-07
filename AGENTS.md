@@ -9,14 +9,40 @@ contributed to the document.
 
 ## Agentic contributions
 
-Whenever you implement a new change you should do the following. 
+This section was updated with AI assistance.
 
-1. create a new worktree for that new feature using a new branch
-2. make sure that the new feature/fix has the corresponding tests to verify it works as expected
-3. commit using conventional commits and push to the new branch
-4. create a new PR against main. The PR description must contain a brief explanation about what has been
-done, and all the required details if the feature is complex. A human will review the PR so leave 
-any required information for them.
+### Branch and worktree selection
 
-This only applies to new features. when the developr requests a change of a current feature, do not 
-create a new branch and PR. Update the existing one. 
+Before modifying any files, check the current branch and determine
+whether the request continues unmerged work or starts a new change.
+
+- Never modify files on `main` unless the human explicitly authorizes it.
+- For every new feature or standalone fix, create a new worktree and
+  branch from `main`. This also applies to documentation and maintenance changes.
+- A fix to functionality already merged into `main` is a new change:
+  create a new worktree, branch, and PR.
+- When the human requests follow-up changes to a feature or fix we are
+  currently implementing together, continue in its existing worktree
+  and branch and update its existing PR, provided it is still unmerged.
+- Once that work has merged, any further changes require a new worktree,
+  branch, and PR.
+- If it is unclear which ongoing branch the request belongs to, ask
+  before editing. Do not default to working on `main`.
+
+### Delivery requirements
+
+For every implementation change, including follow-up fixes:
+
+1. Add or update tests to verify the behavior.
+2. Run the relevant tests.
+3. Commit using conventional commits and push to the working branch.
+4. Create a PR against `main`, or update the existing unmerged PR.
+5. Include a brief explanation, test results, and any details needed
+   for human review in the PR description.
+6. Report the branch, worktree, and PR URL to the human.
+
+For documentation-only changes, review the diff and check formatting instead
+of adding or running behavior tests; the remaining delivery steps still apply.
+
+Do not consider the task complete until these steps are done. If a step
+is blocked, explain the blocker and what remains.
