@@ -162,7 +162,10 @@ async fn private_dbus_notification_click_replacement_and_dismissal() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let argv = std::fs::read_to_string(&output).unwrap();
-        assert_eq!(argv, "-e\n/tmp/attached with spaces\nattach\n-v\n--\nhost/work\n");
+        assert_eq!(
+            argv,
+            "-e\n/tmp/attached with spaces\nattach\n-v\n--\nhost/work\n"
+        );
         MockNotifications::action_invoked(emitter, 42, "default")
             .await
             .unwrap();
