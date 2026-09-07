@@ -80,7 +80,6 @@ pub async fn watch(
     state_dir: PathBuf,
     herdr_bin: PathBuf,
     terminal: Option<PathBuf>,
-    one_password: bool,
     print: bool,
 ) -> Result<()> {
     let _singleton = activity::singleton(&state_dir)?;
@@ -101,7 +100,6 @@ pub async fn watch(
                 state_dir: std::fs::canonicalize(&state_dir)?,
                 herdr_bin,
                 terminal,
-                one_password,
             })
             .await?,
         )

@@ -26,7 +26,6 @@ pub struct Launch {
     pub state_dir: PathBuf,
     pub herdr_bin: PathBuf,
     pub terminal: Option<PathBuf>,
-    pub one_password: bool,
 }
 
 impl Launch {
@@ -38,9 +37,7 @@ impl Launch {
             "--herdr-bin".into(),
             self.herdr_bin.clone().into_os_string(),
         ];
-        if self.one_password {
-            args.push("--use-1password".into());
-        }
+        // Let the new process resolve the user's configured password source.
         args.extend([OsString::from("--"), target.into()]);
         args
     }
@@ -60,9 +57,6 @@ impl Launch {
                 OsString::from("--terminal"),
                 terminal.clone().into_os_string(),
             ]);
-        }
-        if self.one_password {
-            args.push("--use-1password".into());
         }
         args.extend([OsString::from("--"), target.into()]);
         args
@@ -308,24 +302,20 @@ async fn run(command: &mut Command, deadline: Duration) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     #[test]
-    fn click_arguments_preserve_target_terminal_state_and_password_choice() {
-        for one_password in [false, true] {
+    fn click_arguments_preserve_routing_without_overriding_password_configuration() {
+        for terminal in ["ghostty", "terminal"] {
             let launch = Launch {
                 attached: "/tmp/attached executable".into(),
                 state_dir: "/tmp/state dir".into(),
                 herdr_bin: "/tmp/herdr".into(),
-                terminal: Some("ghostty".into()),
-                one_password,
+                terminal: Some(terminal.into()),
             };
             let args = launch.attach_args("host/work");
             let callback = launch.callback_args("host/work");
             for args in [&args, &callback] {
                 assert_eq!(args.last().unwrap(), "host/work");
                 assert_eq!(args[args.len() - 2], "--");
-                assert_eq!(
-                    args.contains(&OsString::from("--use-1password")),
-                    one_password
-                );
+                assert!(!args.contains(&OsString::from("--use-1password")));
                 assert!(args.contains(&OsString::from("/tmp/state dir")));
                 assert!(args.contains(&OsString::from("/tmp/herdr")));
                 assert!(!args.contains(&OsString::from("--upgrade-remote")));
@@ -344,7 +334,7 @@ mod tests {
             assert!(
                 callback
                     .windows(2)
-                    .any(|pair| pair == ["--terminal", "ghostty"])
+                    .any(|pair| pair == ["--terminal", terminal])
             );
             let terminal = launch.terminal_command("host/work", true).unwrap();
             let initial = terminal
@@ -353,9 +343,8 @@ mod tests {
                 .last()
                 .unwrap()
                 .to_string_lossy();
-            assert!(initial.starts_with("--initial-command=shell:'/tmp/attached executable' "));
             assert!(initial.contains("'/tmp/attached executable' 'attach'"));
-            assert_eq!(initial.contains("'--use-1password'"), one_password);
+            assert!(!initial.contains("--use-1password"));
         }
     }
     #[test]
@@ -365,7 +354,6 @@ mod tests {
             state_dir: "/tmp/state's dir".into(),
             herdr_bin: "/tmp/herdr".into(),
             terminal: Some("terminal".into()),
-            one_password: true,
         };
         let target = "host/work'\";$(id)";
         let terminal = launch.terminal_command(target, true).unwrap();
@@ -389,6 +377,7 @@ mod tests {
         assert!(!callback.contains("untrusted title"));
         assert!(!callback.contains("touch bad"));
         assert!(callback.contains("--state-dir"));
+        assert!(!callback.contains("--use-1password"));
     }
 
     #[test]
@@ -429,7 +418,6 @@ mod tests {
             state_dir: root.path().into(),
             herdr_bin: "/tmp/herdr".into(),
             terminal: Some(terminal),
-            one_password: false,
         };
         launch.open("host/session").await.unwrap();
         for _ in 0..100 {

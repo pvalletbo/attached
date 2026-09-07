@@ -404,7 +404,6 @@ impl Cli {
                             state_dir,
                             herdr_bin,
                             configuration.resolve_notification_terminal(terminal),
-                            one_password,
                             print,
                         )
                         .await?;
@@ -421,7 +420,6 @@ impl Cli {
                             state_dir,
                             herdr_bin,
                             terminal: configuration.resolve_notification_terminal(terminal),
-                            one_password,
                         }
                         .open(&target)
                         .await?;

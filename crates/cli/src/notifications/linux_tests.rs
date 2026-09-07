@@ -105,7 +105,6 @@ async fn private_dbus_notification_click_replacement_and_dismissal() {
             state_dir: root.path().into(),
             herdr_bin: "/tmp/herdr".into(),
             terminal: Some(terminal),
-            one_password: true,
         };
         let linux = Linux::from_connection(connection, launch).await.unwrap();
         let notice = Notice {
@@ -166,7 +165,7 @@ async fn private_dbus_notification_click_replacement_and_dismissal() {
         let argv = std::fs::read_to_string(&output).unwrap();
         assert!(argv.starts_with("-e\n/tmp/attached with spaces\nattach\n"));
         assert!(argv.contains("--state-dir\n"));
-        assert!(argv.contains("--use-1password\n"));
+        assert!(!argv.contains("--use-1password\n"));
         assert!(argv.ends_with("--\nhost/work\n"));
         MockNotifications::action_invoked(emitter, 42, "default")
             .await
