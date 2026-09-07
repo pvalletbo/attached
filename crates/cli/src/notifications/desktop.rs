@@ -353,7 +353,7 @@ mod tests {
                 .last()
                 .unwrap()
                 .to_string_lossy();
-            assert!(initial.starts_with("--initial-command=shell:exec "));
+            assert!(initial.starts_with("--initial-command=shell:'/tmp/attached executable' "));
             assert!(initial.contains("'/tmp/attached executable' 'attach'"));
             assert_eq!(initial.contains("'--use-1password'"), one_password);
         }

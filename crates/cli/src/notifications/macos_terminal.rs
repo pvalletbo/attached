@@ -85,8 +85,9 @@ pub(super) fn command(selection: &Path, executable: &Path, args: &[OsString]) ->
     // Ghostty instance and can ignore --args. Use one initial-command option so
     // AppKit doesn't interpret absolute executable/state paths as documents to
     // open (older Ghostty releases have that problem with separate -e arguments).
-    // The shell prefix is supported by Ghostty 1.2+. Every argument is quoted;
-    // these process-local options never change the user's Ghostty config.
+    // The shell prefix is supported by Ghostty 1.2+. Ghostty adds its own
+    // `exec -l` wrapper: supply only the quoted executable and arguments, not
+    // another `exec` builtin. These options never change the user's config.
     command.arg("-n");
     if selection == Path::new("ghostty") {
         command.args(["-b", "com.mitchellh.ghostty"]);
@@ -100,7 +101,7 @@ pub(super) fn command(selection: &Path, executable: &Path, args: &[OsString]) ->
             "--quit-after-last-window-closed=true",
             "--shell-integration=none",
         ])
-        .arg(format!("--initial-command=shell:exec {shell}"));
+        .arg(format!("--initial-command=shell:{shell}"));
     Ok(command)
 }
 
@@ -197,8 +198,10 @@ mod tests {
             .unwrap()
             .strip_prefix("--initial-command=shell:")
             .unwrap();
-        let output = std::process::Command::new("/bin/sh")
-            .args(["-c", initial])
+        // Reproduce Ghostty's login-shell wrapper, rather than executing the
+        // initial command directly (which would hide a duplicate `exec`).
+        let output = std::process::Command::new("/bin/bash")
+            .args(["--noprofile", "--norc", "-c", &format!("exec -l {initial}")])
             .output()
             .unwrap();
         assert!(output.status.success());
@@ -227,7 +230,7 @@ mod tests {
                 "--args",
                 "--quit-after-last-window-closed=true",
                 "--shell-integration=none",
-                "--initial-command=shell:exec '/tmp/attached'"
+                "--initial-command=shell:'/tmp/attached'"
             ]
         );
         for unsupported in [
