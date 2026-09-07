@@ -39,18 +39,18 @@ trait Notifications {
 }
 
 #[derive(Default)]
-struct Pending(BTreeMap<u32, String>);
+struct Pending(BTreeMap<u32, (String, Option<crate::pane_focus::PaneFocus>)>);
 
 impl Pending {
     fn id_for(&self, target: &str) -> u32 {
         self.0
             .iter()
-            .find_map(|(id, value)| (value == target).then_some(*id))
+            .find_map(|(id, value)| (value.0 == target).then_some(*id))
             .unwrap_or(0)
     }
-    fn insert(&mut self, id: u32, target: &str) {
-        self.0.retain(|_, value| value != target);
-        self.0.insert(id, target.to_owned());
+    fn insert(&mut self, id: u32, target: &str, pane: Option<crate::pane_focus::PaneFocus>) {
+        self.0.retain(|_, value| value.0 != target);
+        self.0.insert(id, (target.to_owned(), pane));
     }
 }
 
@@ -97,8 +97,8 @@ impl Linux {
                         let Ok(args) = signal.args() else { continue; };
                         if args.action_key != "default" { continue; }
                         let target = mappings.lock().await.0.remove(&args.id);
-                        if let Some(target) = target
-                            && let Err(error) = launch.open(&target).await
+                        if let Some((target, pane)) = target
+                            && let Err(error) = (Launch { pane, ..launch.clone() }).open(&target).await
                         { tracing::warn!(%error, "notification click could not open terminal"); }
                     }
                     signal = closed.next() => {
@@ -147,7 +147,7 @@ impl Linux {
                     0,
                 )
                 .await?;
-            pending.insert(id, target);
+            pending.insert(id, target, notice.pane.clone());
             Ok::<_, anyhow::Error>(())
         })
         .await
@@ -165,13 +165,17 @@ mod tests {
     #[test]
     fn replacements_and_actions_keep_one_mapping_per_session() {
         let mut pending = Pending::default();
-        pending.insert(1, "host/work");
-        pending.insert(2, "host/other");
+        pending.insert(1, "host/work", None);
+        pending.insert(2, "host/other", None);
         assert_eq!(pending.id_for("host/work"), 1);
-        pending.insert(3, "host/work");
+        let pane = crate::pane_focus::PaneFocus {
+            pane_id: "w1:p2".into(),
+            terminal_id: Some("term2".into()),
+        };
+        pending.insert(3, "host/work", Some(pane.clone()));
         assert_eq!(pending.0.len(), 2);
         assert!(!pending.0.contains_key(&1));
-        assert_eq!(pending.0.remove(&3).as_deref(), Some("host/work"));
+        assert_eq!(pending.0.remove(&3), Some(("host/work".into(), Some(pane))));
         assert_eq!(pending.id_for("host/work"), 0);
     }
 }

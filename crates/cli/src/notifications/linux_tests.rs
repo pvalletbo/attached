@@ -104,13 +104,20 @@ async fn private_dbus_notification_click_replacement_and_dismissal() {
             attached: "/tmp/attached with spaces".into(),
             terminal: Some(terminal),
             search_path: None,
+            pane: None,
         };
         let linux = Linux::from_connection(connection, launch).await.unwrap();
-        let notice = Notice {
+        let mut notice = Notice {
             title: "pi finished".into(),
             body: "<b>not markup</b>".into(),
+            pane: Some(crate::pane_focus::PaneFocus {
+                pane_id: "w1:p1".into(), terminal_id: Some("term1".into()),
+            }),
         };
         linux.show("host/work", &notice).await.unwrap();
+        notice.pane = Some(crate::pane_focus::PaneFocus {
+            pane_id: "w1:p2".into(), terminal_id: Some("term2".into()),
+        });
         linux.show("host/work", &notice).await.unwrap();
         {
             let posted = posted.lock().await;
@@ -164,7 +171,7 @@ async fn private_dbus_notification_click_replacement_and_dismissal() {
         let argv = std::fs::read_to_string(&output).unwrap();
         assert_eq!(
             argv,
-            "-e\n/tmp/attached with spaces\nattach\n-v\n--\nhost/work\n"
+            "-e\n/tmp/attached with spaces\nattach\n-v\n--pane\nw1:p2\n--pane-terminal\nterm2\n--\nhost/work\n"
         );
         MockNotifications::action_invoked(emitter, 42, "default")
             .await

@@ -16,6 +16,7 @@ mod installation;
 mod local_encryption;
 mod local_sockets;
 mod notifications;
+mod pane_focus;
 mod proxy;
 mod publish_account;
 mod secure_state;

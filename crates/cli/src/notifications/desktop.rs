@@ -26,6 +26,7 @@ pub struct Launch {
     pub terminal: Option<PathBuf>,
     /// Preserve executable discovery across macOS notification/app launches.
     pub search_path: Option<OsString>,
+    pub pane: Option<crate::pane_focus::PaneFocus>,
 }
 
 impl Launch {
@@ -33,7 +34,12 @@ impl Launch {
         // Match a manual attachment: resolve state, Herdr, and authentication
         // from the new process's configuration/defaults, not watcher overrides.
         // Verbosity exposes the underlying cause if loading the account fails.
-        vec!["attach".into(), "-v".into(), "--".into(), target.into()]
+        let mut args = vec!["attach".into(), "-v".into()];
+        if let Some(pane) = &self.pane {
+            pane.append_args(&mut args);
+        }
+        args.extend(["--".into(), target.into()]);
+        args
     }
 
     #[cfg(any(target_os = "macos", test))]
@@ -44,6 +50,9 @@ impl Launch {
                 OsString::from("--terminal"),
                 terminal.clone().into_os_string(),
             ]);
+        }
+        if let Some(pane) = &self.pane {
+            pane.append_args(&mut args);
         }
         args.extend([OsString::from("--"), target.into()]);
         args
@@ -66,6 +75,9 @@ impl Launch {
 
     pub async fn open(&self, target: &str) -> Result<()> {
         crate::sync::attach::parse_target(target)?;
+        if let Some(pane) = &self.pane {
+            pane.validate()?;
+        }
         #[cfg(target_os = "macos")]
         let launch = Self {
             terminal: Some(macos_terminal::resolve(self.terminal.as_deref()).await?),
@@ -190,6 +202,10 @@ fn mac_notification_command(
     target: &str,
     notice: &Notice,
 ) -> Result<Command> {
+    let launch = Launch {
+        pane: notice.pane.clone(),
+        ..launch.clone()
+    };
     let (executable, args) = launch.command_with_search_path(launch.callback_args(target));
     let callback = shell_command(&executable, &args)?;
     let mut command = Command::new(helper);
@@ -316,6 +332,7 @@ mod tests {
                 attached: "/tmp/attached executable".into(),
                 terminal: Some(terminal.into()),
                 search_path: None,
+                pane: None,
             };
             let args = launch.attach_args("host/work");
             let callback = launch.callback_args("host/work");
@@ -357,7 +374,7 @@ mod tests {
         }
     }
     #[test]
-    fn macos_shell_launch_delivers_the_minimal_attach_argv() {
+    fn macos_shell_launch_delivers_pane_metadata_as_literal_arguments() {
         let root = crate::test_support::canonical_tempdir();
         let attached = root.path().join("attached ' executable");
         std::fs::write(&attached, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
@@ -368,6 +385,10 @@ mod tests {
                 attached: attached.clone(),
                 terminal: Some(terminal.into()),
                 search_path: None,
+                pane: Some(crate::pane_focus::PaneFocus {
+                    pane_id: "w1:p2';$(id)".into(),
+                    terminal_id: Some("term ' $(false)".into()),
+                }),
             };
             let command = launch.terminal_command(target, true).unwrap();
             let initial = command
@@ -393,7 +414,7 @@ mod tests {
             assert!(output.status.success(), "{terminal}: {:?}", output.stderr);
             assert_eq!(
                 output.stdout,
-                format!("attach\n-v\n--\n{target}\n").as_bytes()
+                format!("attach\n-v\n--pane\nw1:p2';$(id)\n--pane-terminal\nterm ' $(false)\n--\n{target}\n").as_bytes()
             );
         }
     }
@@ -404,6 +425,7 @@ mod tests {
             attached: "/tmp/attached executable".into(),
             terminal: Some("terminal".into()),
             search_path: None,
+            pane: None,
         };
         let target = "host/work'\";$(id)";
         let terminal = launch.terminal_command(target, true).unwrap();
@@ -418,12 +440,17 @@ mod tests {
             &Notice {
                 title: "untrusted title".into(),
                 body: "$(touch bad)".into(),
+                pane: Some(crate::pane_focus::PaneFocus {
+                    pane_id: "w1:p2".into(),
+                    terminal_id: Some("term2".into()),
+                }),
             },
         )
         .unwrap();
         let args: Vec<_> = command.as_std().get_args().collect();
         let callback = args.last().unwrap().to_string_lossy();
         assert!(callback.contains("'notifications' 'open'"));
+        assert!(callback.contains("'--pane' 'w1:p2' '--pane-terminal' 'term2'"));
         assert!(!callback.contains("untrusted title"));
         assert!(!callback.contains("touch bad"));
         assert!(!callback.contains("--state-dir"));
@@ -468,6 +495,7 @@ mod tests {
             attached: "/tmp/attached with spaces".into(),
             terminal: Some(terminal),
             search_path: None,
+            pane: None,
         };
         launch.open("host/session").await.unwrap();
         for _ in 0..100 {

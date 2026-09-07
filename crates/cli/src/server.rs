@@ -336,6 +336,7 @@ async fn bind_server_endpoint(
         .secret_key(key.clone())
         .alpns(vec![
             TUNNEL_ALPN.to_vec(),
+            attached_tunnel_protocol::FOCUSED_TUNNEL_ALPN.to_vec(),
             EVENTS_ALPN.to_vec(),
             UPGRADE_ALPN.to_vec(),
             ATTACHED_UPDATE_ALPN.to_vec(),
@@ -1137,7 +1138,9 @@ async fn serve_endpoint(
                                 },
                             ).await;
                         }
-                        if connection.alpn() != TUNNEL_ALPN {
+                        if connection.alpn() != TUNNEL_ALPN
+                            && connection.alpn() != attached_tunnel_protocol::FOCUSED_TUNNEL_ALPN
+                        {
                             bail!("unsupported tunnel protocol");
                         }
                         let advertised_version = *version.borrow();

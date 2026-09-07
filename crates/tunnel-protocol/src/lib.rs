@@ -9,6 +9,12 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 pub const PROTOCOL_VERSION: u8 = 3;
 /// ALPN used by the interactive-only Herdr tunnel protocol.
 pub const TUNNEL_ALPN: &[u8] = b"herdr-tunnel/3";
+/// Interactive tunnel with one initial pane-focus request after ordinary
+/// identity/capability authentication. On a second bidirectional stream: u16-be
+/// JSON byte length (max 1024), then {pane_id, terminal_id}; response byte 0
+/// means focused, 1 means attach without focusing. Interactive framing is
+/// unchanged. This is never accepted under the read-only events ALPN.
+pub const FOCUSED_TUNNEL_ALPN: &[u8] = b"attached-focused-tunnel/1";
 /// Passive, fixed-operation Herdr agent events. Before application admission,
 /// a bidirectional stream proves the authorized consumer key by signing the
 /// TLS exporter (`attached-events-consumer-v1`, empty context, 32 bytes) prefixed

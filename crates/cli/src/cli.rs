@@ -87,6 +87,9 @@ enum Command {
         /// Synchronized `HOST/SESSION`; omit to choose local or synchronized with fzf.
         target: Option<String>,
 
+        #[command(flatten)]
+        focus: crate::pane_focus::FocusArgs,
+
         /// Path to the local Herdr executable.
         #[arg(long, default_value = "herdr")]
         herdr_bin: PathBuf,
@@ -182,7 +185,10 @@ enum NotificationsCommand {
     ///
     /// Credentials follow password_source in Attached config (password prompt if
     /// unset). --use-1password overrides it for the watcher only. Clicks run
-    /// `attached attach -v -- HOST/SESSION` using the current user configuration
+    /// `attached attach -v --pane ID --pane-terminal ID -- HOST/SESSION` when the
+    /// originating pane is known. Focus changes the shared session's selected
+    /// workspace/tab/pane, including other viewers. Missing/replaced panes or older
+    /// servers fall back to session attachment. Clicks use current configuration
     /// and defaults; watcher state-directory and Herdr-path overrides are not forwarded.
     /// Keep the watcher running for Linux click actions. Notices replace the previous
     /// notice for that session. Limits: 128 sessions per watcher, 64 event connections
@@ -205,6 +211,8 @@ enum NotificationsCommand {
     #[command(hide = true)]
     Open {
         target: String,
+        #[command(flatten)]
+        focus: crate::pane_focus::FocusArgs,
         #[arg(long, default_value = "herdr")]
         herdr_bin: PathBuf,
         #[arg(long)]
@@ -410,7 +418,10 @@ impl Cli {
                         .await?;
                     }
                     NotificationsCommand::Open {
-                        target, terminal, ..
+                        target,
+                        terminal,
+                        focus,
+                        ..
                     } => {
                         // Older notifications may still carry state/Herdr overrides.
                         // Accept them for compatibility, but use the same defaults
@@ -419,6 +430,7 @@ impl Cli {
                             attached: std::env::current_exe()?,
                             terminal: configuration.resolve_notification_terminal(terminal),
                             search_path: std::env::var_os("PATH"),
+                            pane: focus.resolve()?,
                         }
                         .open(&target)
                         .await?;
@@ -428,12 +440,14 @@ impl Cli {
             }
             Command::Attach {
                 target,
+                focus,
                 herdr_bin,
                 upgrade_remote,
                 no_cache,
                 state_dir,
             } => {
                 let state_dir = resolved_state_dir(state_dir, &configuration)?;
+                let pane = focus.resolve()?;
                 let local_sessions = if target.is_none() {
                     match session::discover_active(herdr_bin.clone()).await {
                         Ok(sessions) => sessions,
@@ -511,7 +525,8 @@ impl Cli {
                         selected.attach_local(&herdr_bin).await
                     }
                     SessionSelection::Synchronized(target) => {
-                        sync::attach::attach(&state_dir, &target, herdr_bin, upgrade_remote).await
+                        sync::attach::attach(&state_dir, &target, herdr_bin, upgrade_remote, pane)
+                            .await
                     }
                 }
             }
@@ -701,6 +716,7 @@ mod tests {
             assert!(!cli.use_1password);
             let Command::Attach {
                 target,
+                focus,
                 herdr_bin,
                 state_dir,
                 upgrade_remote,
@@ -709,12 +725,64 @@ mod tests {
             else {
                 panic!("expected attach");
             };
+            assert!(focus.resolve().unwrap().is_none());
             assert_eq!(target.as_deref(), Some("omarchy/default"));
             assert_eq!(herdr_bin, PathBuf::from("herdr"));
             assert!(state_dir.is_none());
             assert!(!upgrade_remote);
             assert!(!no_cache);
         }
+    }
+
+    #[test]
+    fn pane_focus_cli_preserves_metadata_and_requires_an_explicit_session() {
+        for prefix in [
+            vec!["attached", "attach"],
+            vec!["attached", "notifications", "open"],
+        ] {
+            let cli = Cli::try_parse_from(prefix.into_iter().chain([
+                "--pane",
+                "w1:p2",
+                "--pane-terminal",
+                "term2",
+                "--",
+                "host/work",
+            ]))
+            .unwrap();
+            let (target, focus) = match cli.command {
+                Command::Attach { target, focus, .. } => (target.unwrap(), focus),
+                Command::Notifications {
+                    command: NotificationsCommand::Open { target, focus, .. },
+                } => (target, focus),
+                _ => panic!("wrong command"),
+            };
+            assert_eq!(target, "host/work");
+            assert_eq!(
+                focus.resolve().unwrap(),
+                Some(crate::pane_focus::PaneFocus {
+                    pane_id: "w1:p2".into(),
+                    terminal_id: Some("term2".into()),
+                })
+            );
+        }
+        assert!(Cli::try_parse_from(["attached", "attach", "--pane", "w1:p2"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "attached",
+                "attach",
+                "host/work",
+                "--pane-terminal",
+                "term2"
+            ])
+            .is_err()
+        );
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("attach")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("shared session focus"));
     }
 
     #[test]

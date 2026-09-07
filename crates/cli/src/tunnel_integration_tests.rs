@@ -135,6 +135,7 @@ async fn authenticate_client(
         session,
         capability,
         herdr_version.unwrap_or(TEST_HERDR_VERSION),
+        None,
     )
     .await
 }

@@ -13,7 +13,11 @@ fn local_builder() -> iroh::endpoint::Builder {
         .unwrap()
         .relay_mode(RelayMode::Disabled)
         .clear_address_lookup()
-        .alpns(vec![EVENTS_ALPN.to_vec(), TUNNEL_ALPN.to_vec()])
+        .alpns(vec![
+            EVENTS_ALPN.to_vec(),
+            TUNNEL_ALPN.to_vec(),
+            attached_tunnel_protocol::FOCUSED_TUNNEL_ALPN.to_vec(),
+        ])
 }
 
 #[tokio::test]
@@ -80,13 +84,15 @@ async fn ephemeral_watchers_must_prove_the_consumer_key_before_dispatch_and_cann
         }
         // Even a watcher that can sign proofs cannot use its ephemeral transport
         // identity for interactive control: other ALPNs retain the original gate.
-        let (incoming, outgoing) = tokio::join!(
-            async { server.accept().await.unwrap().await },
-            client.connect(server.addr(), TUNNEL_ALPN)
-        );
-        assert!(incoming.is_err());
-        if let Ok(connection) = outgoing {
-            let _ = connection.closed().await;
+        for alpn in [TUNNEL_ALPN, attached_tunnel_protocol::FOCUSED_TUNNEL_ALPN] {
+            let (incoming, outgoing) = tokio::join!(
+                async { server.accept().await.unwrap().await },
+                client.connect(server.addr(), alpn)
+            );
+            assert!(incoming.is_err());
+            if let Ok(connection) = outgoing {
+                let _ = connection.closed().await;
+            }
         }
         client.close().await;
         server.close().await;

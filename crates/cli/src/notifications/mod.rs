@@ -1,6 +1,6 @@
 pub(crate) mod activity;
 pub(crate) mod desktop;
-mod protocol;
+pub(crate) mod protocol;
 mod tracker;
 pub(crate) mod transport;
 
@@ -99,6 +99,7 @@ pub async fn watch(
                 attached: std::env::current_exe()?,
                 terminal,
                 search_path: std::env::var_os("PATH"),
+                pane: None,
             })
             .await?,
         )
@@ -203,7 +204,7 @@ async fn run(
                     displays.spawn(async move { desktop.show(&queued.target, &queued.notice).await });
                 } else {
                     use std::io::Write;
-                    let value = serde_json::json!({"target":queued.target, "title":queued.notice.title, "body":queued.notice.body});
+                    let value = serde_json::json!({"target":queued.target, "title":queued.notice.title, "body":queued.notice.body, "pane":queued.notice.pane});
                     let output = (|| -> Result<()> {
                         let mut stdout = std::io::stdout().lock();
                         serde_json::to_writer(&mut stdout, &value)?;

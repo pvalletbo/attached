@@ -6,6 +6,7 @@ use super::protocol::{Message, Pane, Status};
 pub struct Notice {
     pub title: String,
     pub body: String,
+    pub pane: Option<crate::pane_focus::PaneFocus>,
 }
 
 #[derive(Default)]
@@ -58,12 +59,27 @@ impl Tracker {
             (Status::Working | Status::Idle | Status::Done, Status::Blocked) => "needs attention",
             _ => return None,
         };
+        // Without a known occupant, keep the safe session-only fallback.
+        let focus = pane
+            .terminal_id
+            .as_ref()
+            .filter(|id| !id.is_empty())
+            .map(|id| crate::pane_focus::PaneFocus {
+                pane_id: pane.pane_id.clone(),
+                terminal_id: Some(id.clone()),
+            });
         Some(Notice {
             title: format!("{} {event}", text(agent, 80)),
             // Host/session is already shown by the desktop backend. Internal
             // workspace/pane IDs and terminal metadata are routing details, not
             // useful notification text (and metadata titles can be opaque).
-            body: "Click to open this session.".to_owned(),
+            body: if focus.is_some() {
+                "Click to open this pane."
+            } else {
+                "Click to open this session."
+            }
+            .to_owned(),
+            pane: focus,
         })
     }
 }
@@ -155,7 +171,14 @@ mod tests {
             updated.title = Some("term_opaque-uuid · w1:p1 · internal-session-data".into());
             let notices = tracker.apply(Message::State { pane: updated });
             assert_eq!(notices.len(), 1);
-            assert_eq!(notices[0].body, "Click to open this session.");
+            assert_eq!(notices[0].body, "Click to open this pane.");
+            assert_eq!(
+                notices[0].pane,
+                Some(crate::pane_focus::PaneFocus {
+                    pane_id: "w1:p1".into(),
+                    terminal_id: Some("term_1".into())
+                })
+            );
             let rendered = format!("{} {}", notices[0].title, notices[0].body);
             assert!(rendered.starts_with("pi "));
             for internal in ["w1", "p1", "term_", "uuid", "internal-session-data"] {
@@ -165,6 +188,20 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn missing_terminal_identity_uses_session_only_fallback() {
+        let mut tracker = Tracker::default();
+        let mut baseline = pane(Status::Working);
+        baseline.terminal_id = None;
+        tracker.apply(Message::Snapshot {
+            panes: vec![baseline.clone()],
+        });
+        baseline.agent_status = Status::Done;
+        let notice = tracker.apply(Message::State { pane: baseline });
+        assert!(notice[0].pane.is_none());
+        assert_eq!(notice[0].body, "Click to open this session.");
     }
 
     #[test]

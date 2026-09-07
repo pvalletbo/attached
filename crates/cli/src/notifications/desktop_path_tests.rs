@@ -44,10 +44,12 @@ fn macos_callback_and_terminal_restore_tool_lookup_after_environment_loss() {
             attached: attached.clone(),
             terminal: Some(terminal.into()),
             search_path: Some(tools.clone().into_os_string()),
+            pane: None,
         };
         let notice = Notice {
             title: "finished".into(),
             body: "ready".into(),
+            pane: None,
         };
         let notification =
             mac_notification_command(Path::new("terminal-notifier"), &launch, target, &notice)
@@ -102,6 +104,7 @@ fn path_wrapper_preserves_unset_and_empty_paths_without_copying_other_variables(
         attached: "/tmp/attached".into(),
         terminal: Some("ghostty".into()),
         search_path: None,
+        pane: None,
     };
     let args = launch.attach_args("host/work");
     assert_eq!(

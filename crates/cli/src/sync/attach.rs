@@ -84,6 +84,7 @@ pub async fn attach(
     target: &str,
     herdr_bin: PathBuf,
     upgrade_remote: bool,
+    pane: Option<crate::pane_focus::PaneFocus>,
 ) -> Result<i32> {
     let (host, session) = parse_target(target)?;
     let account = state::load_account(state_dir, ApiKeyScope::Download)?;
@@ -172,6 +173,7 @@ pub async fn attach(
         CapabilitySecret::from_bytes(attachment.attach_capability),
         herdr_bin,
         local_version,
+        pane,
     )
     .await;
     finish_remote_operation(state_dir, &account, target, &attachment, connection)
