@@ -98,6 +98,7 @@ pub async fn watch(
             Desktop::detect(Launch {
                 attached: std::env::current_exe()?,
                 terminal,
+                search_path: std::env::var_os("PATH"),
             })
             .await?,
         )

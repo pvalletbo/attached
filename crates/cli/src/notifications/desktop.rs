@@ -24,6 +24,8 @@ mod macos_terminal;
 pub struct Launch {
     pub attached: PathBuf,
     pub terminal: Option<PathBuf>,
+    /// Preserve executable discovery across macOS notification/app launches.
+    pub search_path: Option<OsString>,
 }
 
 impl Launch {
@@ -45,6 +47,21 @@ impl Launch {
         }
         args.extend([OsString::from("--"), target.into()]);
         args
+    }
+
+    fn command_with_search_path(&self, args: Vec<OsString>) -> (PathBuf, Vec<OsString>) {
+        let Some(path) = &self.search_path else {
+            return (self.attached.clone(), args);
+        };
+        // Launch Services and the notification helper may not inherit the
+        // watcher's PATH. Restore only that search path, never credential
+        // variables or the rest of the watcher's environment. Shell quoting is
+        // applied by the caller, so path contents remain literal data.
+        let mut assignment = OsString::from("PATH=");
+        assignment.push(path);
+        let mut wrapped = vec![assignment, self.attached.clone().into_os_string()];
+        wrapped.extend(args);
+        (PathBuf::from("/usr/bin/env"), wrapped)
     }
 
     pub async fn open(&self, target: &str) -> Result<()> {
@@ -89,12 +106,13 @@ impl Launch {
 
     fn terminal_command(&self, target: &str, macos: bool) -> Result<Command> {
         if macos {
+            let (executable, args) = self.command_with_search_path(self.attach_args(target));
             return macos_terminal::command(
                 self.terminal
                     .as_deref()
                     .context("macOS terminal selection was not resolved")?,
-                &self.attached,
-                &self.attach_args(target),
+                &executable,
+                &args,
             );
         }
         let terminal = match &self.terminal {
@@ -172,7 +190,8 @@ fn mac_notification_command(
     target: &str,
     notice: &Notice,
 ) -> Result<Command> {
-    let callback = shell_command(&launch.attached, &launch.callback_args(target))?;
+    let (executable, args) = launch.command_with_search_path(launch.callback_args(target));
+    let callback = shell_command(&executable, &args)?;
     let mut command = Command::new(helper);
     command.args([
         "-title",
@@ -284,6 +303,10 @@ async fn run(command: &mut Command, deadline: Duration) -> Result<Vec<u8>> {
 }
 
 #[cfg(test)]
+#[path = "desktop_path_tests.rs"]
+mod path_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
@@ -292,6 +315,7 @@ mod tests {
             let launch = Launch {
                 attached: "/tmp/attached executable".into(),
                 terminal: Some(terminal.into()),
+                search_path: None,
             };
             let args = launch.attach_args("host/work");
             let callback = launch.callback_args("host/work");
@@ -343,6 +367,7 @@ mod tests {
             let launch = Launch {
                 attached: attached.clone(),
                 terminal: Some(terminal.into()),
+                search_path: None,
             };
             let command = launch.terminal_command(target, true).unwrap();
             let initial = command
@@ -378,6 +403,7 @@ mod tests {
         let launch = Launch {
             attached: "/tmp/attached executable".into(),
             terminal: Some("terminal".into()),
+            search_path: None,
         };
         let target = "host/work'\";$(id)";
         let terminal = launch.terminal_command(target, true).unwrap();
@@ -441,6 +467,7 @@ mod tests {
         let launch = Launch {
             attached: "/tmp/attached with spaces".into(),
             terminal: Some(terminal),
+            search_path: None,
         };
         launch.open("host/session").await.unwrap();
         for _ in 0..100 {

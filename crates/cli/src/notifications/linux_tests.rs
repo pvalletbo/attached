@@ -103,6 +103,7 @@ async fn private_dbus_notification_click_replacement_and_dismissal() {
         let launch = Launch {
             attached: "/tmp/attached with spaces".into(),
             terminal: Some(terminal),
+            search_path: None,
         };
         let linux = Linux::from_connection(connection, launch).await.unwrap();
         let notice = Notice {

@@ -418,6 +418,7 @@ impl Cli {
                         crate::notifications::desktop::Launch {
                             attached: std::env::current_exe()?,
                             terminal: configuration.resolve_notification_terminal(terminal),
+                            search_path: std::env::var_os("PATH"),
                         }
                         .open(&target)
                         .await?;
