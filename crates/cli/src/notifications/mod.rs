@@ -97,8 +97,6 @@ pub async fn watch(
         Some(
             Desktop::detect(Launch {
                 attached: std::env::current_exe()?,
-                state_dir: std::fs::canonicalize(&state_dir)?,
-                herdr_bin,
                 terminal,
             })
             .await?,

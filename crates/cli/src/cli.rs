@@ -181,8 +181,9 @@ enum NotificationsCommand {
     /// use --terminal ghostty or notification_terminal = "ghostty" in Attached config.
     ///
     /// Credentials follow password_source in Attached config (password prompt if
-    /// unset). --use-1password overrides it and the effective choice is forwarded
-    /// to the click command. No new password-source default is introduced.
+    /// unset). --use-1password overrides it for the watcher only. Clicks run
+    /// `attached attach -v -- HOST/SESSION` using the current user configuration
+    /// and defaults; watcher state-directory and Herdr-path overrides are not forwarded.
     /// Keep the watcher running for Linux click actions. Notices replace the previous
     /// notice for that session. Limits: 128 sessions per watcher, 64 event connections
     /// per serving host, and 256 panes per session. New panes and subscription changes
@@ -409,16 +410,13 @@ impl Cli {
                         .await?;
                     }
                     NotificationsCommand::Open {
-                        target,
-                        herdr_bin,
-                        terminal,
-                        state_dir,
+                        target, terminal, ..
                     } => {
-                        let state_dir = resolved_state_dir(state_dir, &configuration)?;
+                        // Older notifications may still carry state/Herdr overrides.
+                        // Accept them for compatibility, but use the same defaults
+                        // as a manual attachment in the newly opened terminal.
                         crate::notifications::desktop::Launch {
                             attached: std::env::current_exe()?,
-                            state_dir,
-                            herdr_bin,
                             terminal: configuration.resolve_notification_terminal(terminal),
                         }
                         .open(&target)
@@ -692,6 +690,33 @@ mod tests {
     }
 
     #[test]
+    fn notification_attach_arguments_match_manual_target_and_defaults() {
+        for args in [
+            vec!["attached", "attach", "omarchy/default", "-v"],
+            vec!["attached", "attach", "-v", "--", "omarchy/default"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert_eq!(cli.verbose, 1);
+            assert!(!cli.use_1password);
+            let Command::Attach {
+                target,
+                herdr_bin,
+                state_dir,
+                upgrade_remote,
+                no_cache,
+            } = cli.command
+            else {
+                panic!("expected attach");
+            };
+            assert_eq!(target.as_deref(), Some("omarchy/default"));
+            assert_eq!(herdr_bin, PathBuf::from("herdr"));
+            assert!(state_dir.is_none());
+            assert!(!upgrade_remote);
+            assert!(!no_cache);
+        }
+    }
+
+    #[test]
     fn notification_watcher_cli_and_click_callback_are_explicit() {
         for args in [
             vec!["attached", "notifications", "watch"],
@@ -740,6 +765,8 @@ mod tests {
         assert!(help.contains("notification_terminal"));
         assert!(help.contains("registered default"));
         assert!(help.contains("password prompt if"));
+        assert!(help.contains("watcher only"));
+        assert!(help.contains("overrides are not forwarded"));
         assert!(!help.contains("macOS uses Terminal.app"));
     }
 

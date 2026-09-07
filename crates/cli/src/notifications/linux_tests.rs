@@ -102,8 +102,6 @@ async fn private_dbus_notification_click_replacement_and_dismissal() {
         std::fs::set_permissions(&terminal, std::fs::Permissions::from_mode(0o700)).unwrap();
         let launch = Launch {
             attached: "/tmp/attached with spaces".into(),
-            state_dir: root.path().into(),
-            herdr_bin: "/tmp/herdr".into(),
             terminal: Some(terminal),
         };
         let linux = Linux::from_connection(connection, launch).await.unwrap();
@@ -163,10 +161,7 @@ async fn private_dbus_notification_click_replacement_and_dismissal() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let argv = std::fs::read_to_string(&output).unwrap();
-        assert!(argv.starts_with("-e\n/tmp/attached with spaces\nattach\n"));
-        assert!(argv.contains("--state-dir\n"));
-        assert!(!argv.contains("--use-1password\n"));
-        assert!(argv.ends_with("--\nhost/work\n"));
+        assert_eq!(argv, "-e\n/tmp/attached with spaces\nattach\n-v\n--\nhost/work\n");
         MockNotifications::action_invoked(emitter, 42, "default")
             .await
             .unwrap();

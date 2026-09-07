@@ -23,35 +23,20 @@ mod macos_terminal;
 #[derive(Clone)]
 pub struct Launch {
     pub attached: PathBuf,
-    pub state_dir: PathBuf,
-    pub herdr_bin: PathBuf,
     pub terminal: Option<PathBuf>,
 }
 
 impl Launch {
     fn attach_args(&self, target: &str) -> Vec<OsString> {
-        let mut args = vec![
-            OsString::from("attach"),
-            "--state-dir".into(),
-            self.state_dir.clone().into_os_string(),
-            "--herdr-bin".into(),
-            self.herdr_bin.clone().into_os_string(),
-        ];
-        // Let the new process resolve the user's configured password source.
-        args.extend([OsString::from("--"), target.into()]);
-        args
+        // Match a manual attachment: resolve state, Herdr, and authentication
+        // from the new process's configuration/defaults, not watcher overrides.
+        // Verbosity exposes the underlying cause if loading the account fails.
+        vec!["attach".into(), "-v".into(), "--".into(), target.into()]
     }
 
     #[cfg(any(target_os = "macos", test))]
     fn callback_args(&self, target: &str) -> Vec<OsString> {
-        let mut args = vec![
-            OsString::from("notifications"),
-            "open".into(),
-            "--state-dir".into(),
-            self.state_dir.clone().into_os_string(),
-            "--herdr-bin".into(),
-            self.herdr_bin.clone().into_os_string(),
-        ];
+        let mut args = vec!["notifications".into(), "open".into(), "-v".into()];
         if let Some(terminal) = &self.terminal {
             args.extend([
                 OsString::from("--terminal"),
@@ -302,22 +287,22 @@ async fn run(command: &mut Command, deadline: Duration) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     #[test]
-    fn click_arguments_preserve_routing_without_overriding_password_configuration() {
+    fn click_arguments_use_user_defaults_and_preserve_explicit_target() {
         for terminal in ["ghostty", "terminal"] {
             let launch = Launch {
                 attached: "/tmp/attached executable".into(),
-                state_dir: "/tmp/state dir".into(),
-                herdr_bin: "/tmp/herdr".into(),
                 terminal: Some(terminal.into()),
             };
             let args = launch.attach_args("host/work");
             let callback = launch.callback_args("host/work");
+            assert_eq!(args, ["attach", "-v", "--", "host/work"]);
             for args in [&args, &callback] {
                 assert_eq!(args.last().unwrap(), "host/work");
                 assert_eq!(args[args.len() - 2], "--");
                 assert!(!args.contains(&OsString::from("--use-1password")));
-                assert!(args.contains(&OsString::from("/tmp/state dir")));
-                assert!(args.contains(&OsString::from("/tmp/herdr")));
+                assert!(!args.contains(&OsString::from("--state-dir")));
+                assert!(!args.contains(&OsString::from("--herdr-bin")));
+                assert!(args.contains(&OsString::from("-v")));
                 assert!(!args.contains(&OsString::from("--upgrade-remote")));
                 assert!(
                     <crate::cli::Cli as clap::Parser>::try_parse_from(
@@ -348,11 +333,50 @@ mod tests {
         }
     }
     #[test]
+    fn macos_shell_launch_delivers_the_minimal_attach_argv() {
+        let root = crate::test_support::canonical_tempdir();
+        let attached = root.path().join("attached ' executable");
+        std::fs::write(&attached, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+        std::fs::set_permissions(&attached, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let target = "host/work';$(id)";
+        for terminal in ["ghostty", "terminal"] {
+            let launch = Launch {
+                attached: attached.clone(),
+                terminal: Some(terminal.into()),
+            };
+            let command = launch.terminal_command(target, true).unwrap();
+            let initial = command
+                .as_std()
+                .get_args()
+                .last()
+                .unwrap()
+                .to_str()
+                .unwrap();
+            let shell = if terminal == "ghostty" {
+                // Ghostty supplies this wrapper on macOS.
+                format!(
+                    "exec -l {}",
+                    initial.strip_prefix("--initial-command=shell:").unwrap()
+                )
+            } else {
+                initial.to_owned()
+            };
+            let output = std::process::Command::new("/bin/bash")
+                .args(["--noprofile", "--norc", "-c", &shell])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{terminal}: {:?}", output.stderr);
+            assert_eq!(
+                output.stdout,
+                format!("attach\n-v\n--\n{target}\n").as_bytes()
+            );
+        }
+    }
+
+    #[test]
     fn macos_click_is_data_not_applescript_source_and_never_uses_notice_text() {
         let launch = Launch {
             attached: "/tmp/attached executable".into(),
-            state_dir: "/tmp/state's dir".into(),
-            herdr_bin: "/tmp/herdr".into(),
             terminal: Some("terminal".into()),
         };
         let target = "host/work'\";$(id)";
@@ -376,7 +400,8 @@ mod tests {
         assert!(callback.contains("'notifications' 'open'"));
         assert!(!callback.contains("untrusted title"));
         assert!(!callback.contains("touch bad"));
-        assert!(callback.contains("--state-dir"));
+        assert!(!callback.contains("--state-dir"));
+        assert!(!callback.contains("--herdr-bin"));
         assert!(!callback.contains("--use-1password"));
     }
 
@@ -415,8 +440,6 @@ mod tests {
         std::fs::set_permissions(&terminal, std::fs::Permissions::from_mode(0o700)).unwrap();
         let launch = Launch {
             attached: "/tmp/attached with spaces".into(),
-            state_dir: root.path().into(),
-            herdr_bin: "/tmp/herdr".into(),
             terminal: Some(terminal),
         };
         launch.open("host/session").await.unwrap();
@@ -427,8 +450,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let args = std::fs::read_to_string(output).unwrap();
-        assert!(args.starts_with("-e\n/tmp/attached with spaces\nattach\n--state-dir\n"));
-        assert!(args.ends_with("--\nhost/session\n"));
+        assert_eq!(
+            args,
+            "-e\n/tmp/attached with spaces\nattach\n-v\n--\nhost/session\n"
+        );
     }
     #[tokio::test]
     async fn helper_failure_timeout_and_oversized_output_are_bounded() {
