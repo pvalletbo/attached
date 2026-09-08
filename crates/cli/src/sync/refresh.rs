@@ -65,6 +65,11 @@ fn cached_sessions(
     }
     let listing =
         state_catalog::sessions_excluding_local_endpoints(state_dir, &account, now, registry_dir)?;
+    // Empty discovery may be transient, or all cached sessions may have expired.
+    // Retry the service instead of hiding sessions for the rest of the cache TTL.
+    if listing.sessions.is_empty() {
+        return Ok(None);
+    }
     Ok(Some(finish_refresh(listing, Vec::new())))
 }
 
@@ -512,6 +517,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_discovery_is_refreshed_on_every_attach() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let root = crate::test_support::canonical_tempdir();
+            let state_dir = root.path().join("state");
+            state::test_support::create_account(
+                &state_dir,
+                &format!("http://{}", listener.local_addr().unwrap()),
+            )
+            .unwrap();
+            let account = state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
+            let index_path = format!("/v1/accounts/{}/records", account.account_id());
+            let index = serde_json::to_vec(&LiveRecordIndex::new(Vec::new()).unwrap()).unwrap();
+            let server = tokio::spawn(serve_sequence(
+                listener,
+                vec![
+                    (index_path.clone(), 200, None, index.clone()),
+                    (index_path, 200, None, index),
+                ],
+            ));
+            for _ in 0..2 {
+                let result = sessions_for_attach(&state_dir, HerdrVersion::new(3, 2, 1), false)
+                    .await
+                    .unwrap();
+                assert!(result.sessions.is_empty());
+                assert!(
+                    state_catalog::load(&state_dir, &account)
+                        .unwrap()
+                        .refreshed_at
+                        .is_some()
+                );
+            }
+            server.await.unwrap();
+        })
+        .await
+        .expect("empty discovery fixture timed out");
+    }
+
+    #[tokio::test]
     async fn publication_between_index_and_fetch_is_reconciled() {
         tokio::time::timeout(Duration::from_secs(5), async {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -614,9 +658,7 @@ mod tests {
             assert!(
                 cached_sessions(&state_dir, &registry_dir, now + Duration::from_secs(300))
                     .unwrap()
-                    .unwrap()
-                    .sessions
-                    .is_empty()
+                    .is_none()
             );
             // Catalogs written before caching was introduced require a refresh.
             catalog.refreshed_at = None;
