@@ -70,7 +70,7 @@ pub(crate) fn is_remote_unavailable(error: &anyhow::Error) -> bool {
     error.downcast_ref::<RemoteUnavailable>().is_some()
 }
 
-async fn bind_client_endpoint(local_identity: &iroh::SecretKey) -> Result<Endpoint> {
+pub(crate) async fn bind_client_endpoint(local_identity: &iroh::SecretKey) -> Result<Endpoint> {
     Endpoint::builder(presets::N0)
         .secret_key(local_identity.clone())
         .bind()
@@ -319,7 +319,13 @@ where
         if result.is_err() {
             let _ = timeout(Duration::from_secs(1), send.stopped()).await;
         }
-        result
+        let (session, admission) = result?;
+        if connection.alpn() == attached_tunnel_protocol::FOCUSED_TUNNEL_ALPN {
+            let (mut send, mut receive) = connection.accept_bi().await?;
+            crate::pane_focus::serve(&mut receive, &mut send, &session).await?;
+            send.finish()?;
+        }
+        Ok::<_, anyhow::Error>((session, admission))
     };
     let (session, _admission) = timeout(AUTHENTICATION_TIMEOUT, authentication)
         .await
@@ -436,6 +442,7 @@ pub async fn connect(
     capability: CapabilitySecret,
     herdr_bin: PathBuf,
     local_herdr_version: HerdrVersion,
+    pane: Option<crate::pane_focus::PaneFocus>,
 ) -> Result<i32> {
     // Tracing writes directly to stderr, which corrupts Herdr's alternate-screen
     // rendering if Iroh emits a warning while the interactive child is active.
@@ -465,10 +472,7 @@ pub async fn connect(
     let result = async {
         let connection = setup_remote_step(
             async {
-                endpoint
-                    .connect(endpoint_addr, TUNNEL_ALPN)
-                    .await
-                    .context("failed to connect to the Iroh endpoint")
+                connect_for_attachment(&endpoint, endpoint_addr, pane.is_some()).await
             },
             &mut ctrl_c,
             SETUP_TIMEOUT,
@@ -482,6 +486,7 @@ pub async fn connect(
                 &session,
                 &capability,
                 local_herdr_version,
+                pane.as_ref().filter(|_| connection.alpn() == attached_tunnel_protocol::FOCUSED_TUNNEL_ALPN),
             ),
             &mut ctrl_c,
             AUTHENTICATION_TIMEOUT,
@@ -534,6 +539,31 @@ pub async fn connect(
     .await;
     endpoint.close().await;
     result
+}
+
+async fn connect_for_attachment(
+    endpoint: &Endpoint,
+    address: iroh::EndpointAddr,
+    focused: bool,
+) -> Result<Connection> {
+    if focused {
+        match endpoint
+            .connect(
+                address.clone(),
+                attached_tunnel_protocol::FOCUSED_TUNNEL_ALPN,
+            )
+            .await
+        {
+            Ok(connection) => return Ok(connection),
+            Err(_) => eprintln!(
+                "Warning: pane-focused connection unavailable; trying normal session attachment."
+            ),
+        }
+    }
+    endpoint
+        .connect(address, TUNNEL_ALPN)
+        .await
+        .context("failed to connect to the Iroh endpoint")
 }
 
 async fn setup_remote_step<T, Operation, Shutdown, ShutdownError>(
@@ -657,6 +687,7 @@ async fn authenticate_client(
     session: &str,
     capability: &CapabilitySecret,
     local_herdr_version: HerdrVersion,
+    pane: Option<&crate::pane_focus::PaneFocus>,
 ) -> Result<()> {
     timeout(AUTHENTICATION_TIMEOUT, async {
         let (mut send, mut receive) = connection
@@ -664,7 +695,16 @@ async fn authenticate_client(
             .await
             .context("failed to open authentication stream")?;
         write_auth_request(&mut send, session, capability, Some(local_herdr_version)).await?;
-        read_auth_response(&mut receive, Some(local_herdr_version)).await
+        read_auth_response(&mut receive, Some(local_herdr_version)).await?;
+        if let Some(pane) = pane {
+            let (mut send, mut receive) = connection.open_bi().await?;
+            crate::pane_focus::write_request(&mut send, pane).await?;
+            send.finish()?;
+            if !crate::pane_focus::read_result(&mut receive).await? {
+                eprintln!("Warning: notification pane is unavailable or changed; attaching without changing focus.");
+            }
+        }
+        Ok::<_, anyhow::Error>(())
     })
     .await
     .context("authentication timed out")??;
@@ -842,6 +882,10 @@ fn exit_code(status: ExitStatus) -> i32 {
         .or_else(|| status.signal().map(|signal| 128 + signal))
         .unwrap_or(1)
 }
+
+#[cfg(test)]
+#[path = "pane_focus_tunnel_tests.rs"]
+mod pane_focus_tests;
 
 #[cfg(test)]
 #[path = "tunnel_integration_tests.rs"]

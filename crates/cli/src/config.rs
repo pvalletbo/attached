@@ -27,12 +27,14 @@ pub(crate) enum PasswordSource {
 struct FileConfig {
     password_source: PasswordSource,
     config_directory: Option<PathBuf>,
+    notification_terminal: Option<PathBuf>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct Config {
     password_source: PasswordSource,
     config_directory: PathBuf,
+    notification_terminal: Option<PathBuf>,
 }
 
 impl Config {
@@ -48,6 +50,7 @@ impl Config {
             return Ok(Self {
                 password_source: PasswordSource::default(),
                 config_directory: default_directory,
+                notification_terminal: None,
             });
         };
 
@@ -77,14 +80,30 @@ impl Config {
             path.display()
         );
 
+        ensure!(
+            parsed
+                .notification_terminal
+                .as_ref()
+                .is_none_or(|terminal| !terminal.as_os_str().is_empty()),
+            "`notification_terminal` in {} cannot be empty",
+            path.display()
+        );
         Ok(Self {
             password_source: parsed.password_source,
             config_directory,
+            notification_terminal: parsed.notification_terminal,
         })
     }
 
-    pub(crate) const fn password_source(&self) -> PasswordSource {
-        self.password_source
+    pub(crate) fn use_one_password(&self, cli_override: bool) -> bool {
+        cli_override || self.password_source == PasswordSource::OnePassword
+    }
+
+    pub(crate) fn resolve_notification_terminal(
+        &self,
+        cli_override: Option<PathBuf>,
+    ) -> Option<PathBuf> {
+        cli_override.or_else(|| self.notification_terminal.clone())
     }
 
     pub(crate) fn config_directory(&self) -> &Path {
@@ -142,6 +161,7 @@ mod tests {
             Config {
                 password_source: PasswordSource::Password,
                 config_directory: default_directory,
+                notification_terminal: None,
             }
         );
     }
@@ -170,6 +190,7 @@ mod tests {
             Config {
                 password_source: PasswordSource::OnePassword,
                 config_directory: configured_directory,
+                notification_terminal: None,
             }
         );
     }
@@ -195,6 +216,48 @@ mod tests {
     }
 
     #[test]
+    fn notification_terminal_and_password_overrides_follow_config_precedence() {
+        let root = crate::test_support::canonical_tempdir();
+        let path = root.path().join(CONFIG_FILE);
+        let missing = Config::load_from(&path, root.path().to_path_buf()).unwrap();
+        assert!(
+            !missing.use_one_password(false),
+            "password prompt remains the default"
+        );
+        assert!(missing.use_one_password(true));
+        assert_eq!(missing.resolve_notification_terminal(None), None);
+        for (source, use_one_password) in [("password", false), ("1password", true)] {
+            fs::write(
+                &path,
+                format!("password_source = {source:?}\nnotification_terminal = \"ghostty\"\n"),
+            )
+            .unwrap();
+            let config = Config::load_from(&path, root.path().to_path_buf()).unwrap();
+            assert_eq!(config.use_one_password(false), use_one_password);
+            assert!(config.use_one_password(true));
+            assert_eq!(
+                config.resolve_notification_terminal(None),
+                Some("ghostty".into())
+            );
+            assert_eq!(
+                config.resolve_notification_terminal(Some("terminal".into())),
+                Some("terminal".into())
+            );
+        }
+        fs::write(
+            &path,
+            "notification_terminal = \"/Users/me/My Apps/Ghostty.app\"\n",
+        )
+        .unwrap();
+        let config = Config::load_from(&path, root.path().to_path_buf()).unwrap();
+        assert_eq!(
+            config.resolve_notification_terminal(None),
+            Some("/Users/me/My Apps/Ghostty.app".into())
+        );
+        assert!(!config.use_one_password(false));
+    }
+
+    #[test]
     fn rejects_invalid_sources_unknown_fields_and_relative_directories() {
         let root = crate::test_support::canonical_tempdir();
         let default_directory = root.path().join("attached");
@@ -205,6 +268,8 @@ mod tests {
             "password_source = \"keychain\"\n",
             "unknown = true\n",
             "config_directory = \"relative\"\n",
+            "notification_terminal = \"\"\n",
+            "notification_terminal = true\n",
         ] {
             fs::write(&path, contents).unwrap();
             assert!(
@@ -244,6 +309,7 @@ mod tests {
             Config {
                 password_source: PasswordSource::OnePassword,
                 config_directory: default_directory,
+                notification_terminal: None,
             }
         );
         assert_eq!(
