@@ -13,7 +13,7 @@ use crate::{
     account_clipboard,
     config::{self, PasswordSource},
     download_account, herdr_version, installation, local_encryption, publish_account, secure_state,
-    server, session,
+    server, session, session_catalog,
     session_picker::{self, SessionSelection},
     sync,
 };
@@ -73,9 +73,22 @@ enum Command {
     },
 
     /// Inspect synchronized remote Herdr sessions.
+    #[command(subcommand_negates_reqs = true, args_conflicts_with_subcommands = true)]
     Sessions {
+        /// Read the encryption password as one newline-terminated value from standard input.
+        #[arg(long, hide = true)]
+        password_stdin: bool,
+
+        /// Path to the local Herdr executable used for version compatibility.
+        #[arg(long, default_value = "herdr")]
+        herdr_bin: PathBuf,
+
+        /// Override persistent state location (primarily for testing).
+        #[arg(long, hide = true)]
+        state_dir: Option<PathBuf>,
+
         #[command(subcommand)]
-        command: SessionsCommand,
+        command: Option<SessionsCommand>,
     },
 
     /// Select and attach to a local or synchronized Herdr session.
@@ -238,8 +251,20 @@ impl Cli {
 
         let configuration =
             config::Config::load().context("could not load Attached configuration")?;
-        local_encryption::configure_use_one_password(
-            self.use_1password || configuration.password_source() == PasswordSource::OnePassword,
+        let password_stdin = matches!(
+            &self.command,
+            Command::Sessions {
+                password_stdin: true,
+                ..
+            }
+        );
+        local_encryption::configure_password_provider(
+            effective_use_one_password(
+                self.use_1password,
+                configuration.password_source(),
+                password_stdin,
+            ),
+            password_stdin,
         );
         match self.command {
             Command::Account { command } => {
@@ -311,11 +336,16 @@ impl Cli {
                 server::serve(state_dir, herdr_bin, host_label).await?;
                 Ok(0)
             }
-            Command::Sessions { command } => match command {
-                SessionsCommand::List {
+            Command::Sessions {
+                password_stdin: _,
+                herdr_bin,
+                state_dir,
+                command,
+            } => match command {
+                Some(SessionsCommand::List {
                     herdr_bin,
                     state_dir,
-                } => {
+                }) => {
                     let state_dir = resolved_state_dir(state_dir, &configuration)?;
                     sync::state::load_account(&state_dir, ApiKeyScope::Download)
                         .context("`sessions list` requires a download account bundle")?;
@@ -330,6 +360,15 @@ impl Cli {
                     }
                     let rendered = session_picker::render_synchronized_list(&refreshed.sessions)?;
                     write_session_list(&mut stdout().lock(), &rendered)?;
+                    Ok(0)
+                }
+                None => {
+                    let state_dir = resolved_state_dir(state_dir, &configuration)?;
+                    let refreshed = session_catalog::refresh(&state_dir, &herdr_bin).await?;
+                    for warning in refresh_warnings_to_display(&refreshed.warnings, self.verbose) {
+                        eprintln!("Warning: {warning}");
+                    }
+                    session_catalog::write_json(stdout().lock(), &refreshed.sessions)?;
                     Ok(0)
                 }
             },
@@ -488,6 +527,14 @@ fn refresh_warnings_to_display(
         .filter(move |warning| verbosity > 0 || !warning.is_verbose_only())
 }
 
+fn effective_use_one_password(
+    explicitly_requested: bool,
+    configured: PasswordSource,
+    password_stdin: bool,
+) -> bool {
+    !password_stdin && (explicitly_requested || configured == PasswordSource::OnePassword)
+}
+
 fn resolved_state_dir(
     state_dir: Option<PathBuf>,
     configuration: &config::Config,
@@ -570,6 +617,7 @@ mod tests {
                 "--output",
                 "/tmp/publish.bundle",
             ],
+            vec!["attached", "sessions"],
             vec!["attached", "sessions", "list"],
             vec![
                 "attached",
@@ -911,6 +959,43 @@ mod tests {
             }
             server.await.unwrap();
         }).await.expect("outage fixture timed out");
+    }
+
+    #[test]
+    fn machine_catalog_accepts_password_stdin_without_exposing_it_in_help() {
+        let cli = Cli::try_parse_from(["attached", "sessions", "--password-stdin"]).unwrap();
+        let Command::Sessions { password_stdin, .. } = cli.command else {
+            unreachable!();
+        };
+        assert!(password_stdin);
+
+        assert!(Cli::try_parse_from(["attached", "sessions", "list", "--password-stdin"]).is_err());
+        assert!(effective_use_one_password(
+            false,
+            PasswordSource::OnePassword,
+            false
+        ));
+        assert!(effective_use_one_password(
+            true,
+            PasswordSource::Password,
+            false
+        ));
+        assert!(!effective_use_one_password(
+            false,
+            PasswordSource::OnePassword,
+            true
+        ));
+
+        let mut command = Cli::command();
+        let sessions_help = command
+            .find_subcommand_mut("sessions")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(
+            !sessions_help.contains("--password-stdin"),
+            "{sessions_help}"
+        );
     }
 
     #[test]
