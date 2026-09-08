@@ -10,10 +10,8 @@ use clap_complete::Shell;
 use zeroize::Zeroizing;
 
 use crate::{
-    account_clipboard,
-    config::{self, PasswordSource},
-    download_account, herdr_version, installation, local_encryption, publish_account, secure_state,
-    server, session,
+    account_clipboard, config, download_account, herdr_version, installation, local_encryption,
+    publish_account, secure_state, server, session,
     session_picker::{self, SessionSelection},
     sync,
 };
@@ -22,7 +20,7 @@ use crate::{
 #[command(
     version,
     about = "Discover and attach to synchronized Herdr sessions over Iroh",
-    after_long_help = "CONFIGURATION:\n    Attached reads $HOME/.config/attached/config.toml when it exists. Supported TOML settings:\n\n        password_source = \"password\" # or \"1password\"\n        config_directory = \"/absolute/path\" # defaults to $HOME/.config/attached\n\n    --use-1password overrides password_source for the current invocation."
+    after_long_help = "CONFIGURATION:\n    Attached reads $HOME/.config/attached/config.toml when it exists. Supported TOML settings:\n\n        password_source = \"password\" # default; or \"1password\"\n        config_directory = \"/absolute/path\" # defaults to $HOME/.config/attached\n        notification_terminal = \"ghostty\" # optional notification-click override\n\n    --use-1password overrides password_source for the current invocation.\n    notifications watch --terminal overrides notification_terminal; macOS otherwise\n    uses its registered default terminal (Ghostty or Terminal.app supported)."
 )]
 pub struct Cli {
     /// Increase diagnostic verbosity (`-v` for lifecycle, `-vv` for debug details).
@@ -76,6 +74,12 @@ enum Command {
     Sessions {
         #[command(subcommand)]
         command: SessionsCommand,
+    },
+
+    /// Watch remote agent activity without opening an interactive Herdr client.
+    Notifications {
+        #[command(subcommand)]
+        command: NotificationsCommand,
     },
 
     /// Select and attach to a local or synchronized Herdr session.
@@ -149,6 +153,62 @@ enum SessionsCommand {
         herdr_bin: PathBuf,
 
         /// Override persistent state location (primarily for testing).
+        #[arg(long, hide = true)]
+        state_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum NotificationsCommand {
+    /// Keep passive event tunnels to all synchronized remote sessions.
+    ///
+    /// Experimental; requires event-capable Attached on both ends. Official Herdr
+    /// 0.8.2 JSON API is supported without modification. Finished and needs-attention
+    /// transitions create notifications; existing idle/blocked state is not replayed.
+    /// Sessions refresh every 30 seconds; pane discovery every 5 seconds. Offline
+    /// events are not replayed. Same-state-directory interactive attachments suppress
+    /// notifications (other machines/SSH clients are not detected).
+    ///
+    /// Linux uses native D-Bus notifications and needs a graphical session with
+    /// a notification daemon supporting actions. macOS needs terminal-notifier
+    /// (`brew install terminal-notifier`) with notifications allowed in System Settings.
+    /// Clicks open attached attach in a new terminal. Terminal precedence is
+    /// --terminal, notification_terminal in Attached config, then system selection.
+    /// macOS reads the registered default for Unix executables (Ghostty 1.2+ or
+    /// Terminal.app supported); Linux auto-detects a terminal executable. The selected
+    /// terminal is preserved in click callbacks. Recent Ghostty versions provide a
+    /// Ghostty > Make Ghostty the Default Terminal menu item. If it is unavailable,
+    /// use --terminal ghostty or notification_terminal = "ghostty" in Attached config.
+    ///
+    /// Credentials follow password_source in Attached config (password prompt if
+    /// unset). --use-1password overrides it for the watcher only. Clicks run
+    /// `attached attach -v -- HOST/SESSION` using the current user configuration
+    /// and defaults; watcher state-directory and Herdr-path overrides are not forwarded.
+    /// Keep the watcher running for Linux click actions. Notices replace the previous
+    /// notice for that session. Limits: 128 sessions per watcher, 64 event connections
+    /// per serving host, and 256 panes per session. New panes and subscription changes
+    /// have a discovery window; this is a live best-effort feed, not a durable queue.
+    Watch {
+        #[arg(long, default_value = "herdr")]
+        herdr_bin: PathBuf,
+        /// Click terminal: macOS ghostty, terminal, or absolute Ghostty.app path;
+        /// Linux executable supporting -e PROGRAM ARGS. Overrides notification_terminal.
+        #[arg(long, conflicts_with = "print")]
+        terminal: Option<PathBuf>,
+        /// Print live notification JSON instead of posting OS notifications (headless diagnostics).
+        #[arg(long)]
+        print: bool,
+        #[arg(long, hide = true)]
+        state_dir: Option<PathBuf>,
+    },
+    /// Internal notification click callback; never contains account secrets.
+    #[command(hide = true)]
+    Open {
+        target: String,
+        #[arg(long, default_value = "herdr")]
+        herdr_bin: PathBuf,
+        #[arg(long)]
+        terminal: Option<PathBuf>,
         #[arg(long, hide = true)]
         state_dir: Option<PathBuf>,
     },
@@ -238,9 +298,8 @@ impl Cli {
 
         let configuration =
             config::Config::load().context("could not load Attached configuration")?;
-        local_encryption::configure_use_one_password(
-            self.use_1password || configuration.password_source() == PasswordSource::OnePassword,
-        );
+        let one_password = configuration.use_one_password(self.use_1password);
+        local_encryption::configure_use_one_password(one_password);
         match self.command {
             Command::Account { command } => {
                 match command {
@@ -333,6 +392,40 @@ impl Cli {
                     Ok(0)
                 }
             },
+            Command::Notifications { command } => {
+                match command {
+                    NotificationsCommand::Watch {
+                        herdr_bin,
+                        terminal,
+                        print,
+                        state_dir,
+                    } => {
+                        let state_dir = resolved_state_dir(state_dir, &configuration)?;
+                        crate::notifications::watch(
+                            state_dir,
+                            herdr_bin,
+                            configuration.resolve_notification_terminal(terminal),
+                            print,
+                        )
+                        .await?;
+                    }
+                    NotificationsCommand::Open {
+                        target, terminal, ..
+                    } => {
+                        // Older notifications may still carry state/Herdr overrides.
+                        // Accept them for compatibility, but use the same defaults
+                        // as a manual attachment in the newly opened terminal.
+                        crate::notifications::desktop::Launch {
+                            attached: std::env::current_exe()?,
+                            terminal: configuration.resolve_notification_terminal(terminal),
+                            search_path: std::env::var_os("PATH"),
+                        }
+                        .open(&target)
+                        .await?;
+                    }
+                }
+                Ok(0)
+            }
             Command::Attach {
                 target,
                 herdr_bin,
@@ -595,6 +688,87 @@ mod tests {
         for removed in ["connect", "remote", "session", "admin", "sync"] {
             assert!(Cli::try_parse_from(["attached", removed]).is_err());
         }
+    }
+
+    #[test]
+    fn notification_attach_arguments_match_manual_target_and_defaults() {
+        for args in [
+            vec!["attached", "attach", "omarchy/default", "-v"],
+            vec!["attached", "attach", "-v", "--", "omarchy/default"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert_eq!(cli.verbose, 1);
+            assert!(!cli.use_1password);
+            let Command::Attach {
+                target,
+                herdr_bin,
+                state_dir,
+                upgrade_remote,
+                no_cache,
+            } = cli.command
+            else {
+                panic!("expected attach");
+            };
+            assert_eq!(target.as_deref(), Some("omarchy/default"));
+            assert_eq!(herdr_bin, PathBuf::from("herdr"));
+            assert!(state_dir.is_none());
+            assert!(!upgrade_remote);
+            assert!(!no_cache);
+        }
+    }
+
+    #[test]
+    fn notification_watcher_cli_and_click_callback_are_explicit() {
+        for args in [
+            vec!["attached", "notifications", "watch"],
+            vec!["attached", "notifications", "watch", "--print"],
+            vec![
+                "attached",
+                "notifications",
+                "watch",
+                "--terminal",
+                "/usr/bin/kitty",
+            ],
+            vec![
+                "attached",
+                "notifications",
+                "open",
+                "--use-1password",
+                "--",
+                "office/work",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok());
+        }
+        assert!(Cli::try_parse_from(["attached", "notifications"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "attached",
+                "notifications",
+                "watch",
+                "--print",
+                "--terminal",
+                "kitty"
+            ])
+            .is_err()
+        );
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("notifications")
+            .unwrap()
+            .find_subcommand_mut("watch")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("terminal-notifier"));
+        assert!(help.contains("D-Bus"));
+        assert!(help.contains("not replayed"));
+        assert!(help.contains("notification_terminal"));
+        assert!(help.contains("registered default"));
+        assert!(help.contains("password prompt if"));
+        assert!(help.contains("watcher only"));
+        assert!(help.contains("overrides are not forwarded"));
+        assert!(!help.contains("macOS uses Terminal.app"));
     }
 
     #[test]
