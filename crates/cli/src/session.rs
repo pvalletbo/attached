@@ -16,7 +16,11 @@ use tracing::{info, warn};
 use crate::{bounded_process, secure_state};
 
 const SESSION_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
-const MAX_SESSION_DISCOVERY_BYTES: u64 = 4096;
+// Herdr emits both API and session-directory paths for every session. A 4 KiB
+// capture limit rejects legitimate catalogs with only a few dozen sessions,
+// well below Attached's supported synchronized-session count. Keep discovery
+// bounded, but leave enough room for large local catalogs and long paths.
+const MAX_SESSION_DISCOVERY_BYTES: u64 = 1024 * 1024;
 const DEFAULT_SESSION_START_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_SESSION_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const DEFAULT_SESSION_BOOTSTRAP_LOCK: &str = "herdr-bootstrap.lock";
@@ -785,6 +789,41 @@ exit 9
     }
 
     #[test]
+    fn active_session_discovery_accepts_catalogs_larger_than_four_kibibytes() {
+        let root = crate::test_support::canonical_tempdir();
+        let fixture = root.path().join("sessions.json");
+        let sessions = (0..64)
+            .map(|index| {
+                let name = format!("session-{index:02}");
+                let session_dir = root.path().join("sessions").join(&name);
+                serde_json::json!({
+                    "name": name,
+                    "default": false,
+                    "running": true,
+                    "socket_path": session_dir.join("herdr.sock"),
+                    "session_dir": session_dir,
+                })
+            })
+            .collect::<Vec<_>>();
+        let payload = serde_json::to_vec(&serde_json::json!({ "sessions": sessions })).unwrap();
+        assert!(
+            payload.len() > 4096,
+            "fixture did not exceed the old discovery limit"
+        );
+        assert!(payload.len() < MAX_SESSION_DISCOVERY_BYTES as usize);
+        fs::write(&fixture, payload).unwrap();
+        let herdr = fake_herdr(format!("cat '{}'\n", fixture.display()).as_bytes());
+
+        let discovered = SessionManager::new(herdr.to_path_buf())
+            .active_sessions()
+            .unwrap();
+
+        assert_eq!(discovered.len(), 64);
+        assert_eq!(discovered.first().unwrap().name(), "session-00");
+        assert_eq!(discovered.last().unwrap().name(), "session-63");
+    }
+
+    #[test]
     fn active_session_discovery_times_out_and_reaps_hanging_process_group() {
         let hanging = fake_herdr(b"(sleep 60) &\nsleep 3\nprintf '{\"sessions\":[]}'\n");
         let manager = SessionManager::new(hanging.to_path_buf());
@@ -847,8 +886,11 @@ exit 9
 
     #[test]
     fn active_session_discovery_rejects_excessive_output() {
-        let excessive =
-            fake_herdr(b"dd if=/dev/zero bs=8192 count=1 2>/dev/null\nprintf diagnostic >&2\n");
+        let body = format!(
+            "dd if=/dev/zero bs={} count=1 2>/dev/null\nprintf diagnostic >&2\n",
+            MAX_SESSION_DISCOVERY_BYTES + 1
+        );
+        let excessive = fake_herdr(body.as_bytes());
         let manager = SessionManager::new(excessive.to_path_buf());
         let error = manager.active_sessions().unwrap_err().to_string();
         assert!(error.contains("more than"), "{error}");

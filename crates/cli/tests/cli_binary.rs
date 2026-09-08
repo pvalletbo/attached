@@ -451,7 +451,7 @@ esac
             timeout(DEADLINE, async {
                 if attempt == 1 {
                     // Keep the service listening so any unintended refresh fails
-                    // immediately rather than leaving the HTTP fixture waiting forever.
+                    // immediately rather than leaving an HTTP fixture waiting forever.
                     tokio::select! {
                         biased;
                         unexpected = listener.accept() => {
