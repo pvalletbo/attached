@@ -6,13 +6,36 @@ on:
     paths:
       - images/application-runtime/**
       - .github/workflows/application-runtime-image.yml
+  pull_request:
+    paths:
+      - images/application-runtime/**
+      - .github/workflows/application-runtime-image.yml
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: python3 images/application-runtime/test_start_service.py
+      - name: Build runtime and verify restricted-container supervision
+        run: |
+          docker build --tag attached-publisher:test images/application-runtime
+          docker run --rm --read-only --user 101:101 \
+            --tmpfs /tmp:rw,nosuid,exec,mode=1777 --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --entrypoint /usr/bin/python3 \
+            --volume "$PWD/images/application-runtime:/tests:ro" \
+            attached-publisher:test /tests/test_start_service.py
+
   build-and-push:
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -37,7 +60,7 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ghcr.io/pvalletbo/attached-application-runtime:attached-0.2.9-herdr-0.8.2
+            ghcr.io/pvalletbo/attached-application-runtime:attached-0.2.9-herdr-0.8.2-publisher-v1
             ghcr.io/pvalletbo/attached-application-runtime:${{ github.sha }}
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
