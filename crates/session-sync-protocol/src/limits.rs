@@ -32,11 +32,26 @@ pub fn validate_session_name(value: &str) -> bool {
     let bytes = value.as_bytes();
     !bytes.is_empty()
         && bytes.len() <= MAX_SESSION_NAME_BYTES
-        && !bytes.iter().any(|byte| {
-            *byte == 0
-                || *byte == b'/'
-                || *byte == 0x7f
-                || *byte < 0x20
-                || (0x80..=0x9f).contains(byte)
-        })
+        && !value
+            .chars()
+            .any(|character| character == '/' || character.is_control())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_names_accept_unicode_whose_utf8_contains_control_range_bytes() {
+        for value in ["euro-€", "rocket-🚀"] {
+            assert!(validate_session_name(value), "rejected {value:?}");
+        }
+    }
+
+    #[test]
+    fn session_names_reject_actual_control_characters() {
+        for value in ["line\nbreak", "delete\u{7f}", "next\u{0085}line", "host/session"] {
+            assert!(!validate_session_name(value), "accepted {value:?}");
+        }
+    }
 }
