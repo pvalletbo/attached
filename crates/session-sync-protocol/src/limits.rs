@@ -50,7 +50,12 @@ mod tests {
 
     #[test]
     fn session_names_reject_actual_control_characters() {
-        for value in ["line\nbreak", "delete\u{7f}", "next\u{0085}line", "host/session"] {
+        for value in [
+            "line\nbreak",
+            "delete\u{7f}",
+            "next\u{0085}line",
+            "host/session",
+        ] {
             assert!(!validate_session_name(value), "accepted {value:?}");
         }
     }
