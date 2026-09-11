@@ -134,7 +134,10 @@ mod tests {
     async fn read_request_headers(stream: &mut tokio::net::TcpStream) -> String {
         let mut bytes = Vec::new();
         loop {
-            let byte = stream.read_u8().await.expect("request ended before headers");
+            let byte = stream
+                .read_u8()
+                .await
+                .expect("request ended before headers");
             bytes.push(byte);
             assert!(bytes.len() <= 8192, "oversized fixture request");
             if bytes.ends_with(b"\r\n\r\n") {
@@ -206,13 +209,11 @@ mod tests {
         let first = tokio::spawn(async move {
             create_with_store(&first_state, &first_origin, active_store()).await
         });
-        let (mut request, _) = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            listener.accept(),
-        )
-        .await
-        .expect("first account creation never reached the service")
-        .unwrap();
+        let (mut request, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
+                .await
+                .expect("first account creation never reached the service")
+                .unwrap();
         let headers = read_request_headers(&mut request).await;
         assert_eq!(headers.lines().next(), Some("POST /v1/accounts HTTP/1.1"));
 
@@ -223,12 +224,9 @@ mod tests {
         });
 
         assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                listener.accept(),
-            )
-            .await
-            .is_err(),
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept(),)
+                .await
+                .is_err(),
             "a concurrent creator reached the service before the first account was installed"
         );
 
@@ -241,12 +239,9 @@ mod tests {
             "{error}"
         );
         assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                listener.accept(),
-            )
-            .await
-            .is_err(),
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept(),)
+                .await
+                .is_err(),
             "the losing creator still created a remote account"
         );
         assert!(state_dir.join("sync-account.bundle").exists());
