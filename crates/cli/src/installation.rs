@@ -274,6 +274,7 @@ fn run_installer(
 struct UninstallPlan {
     executable: PathBuf,
     data_directories: Vec<PathBuf>,
+    configuration_file: PathBuf,
     installer_files: Vec<PathBuf>,
 }
 
@@ -284,6 +285,7 @@ impl UninstallPlan {
         let home = PathBuf::from(home);
         ensure!(!home.as_os_str().is_empty(), "HOME is empty");
         ensure!(home.is_absolute(), "HOME must be an absolute path");
+        let configuration_file = identity::state_dir_for_home(&home)?.join("config.toml");
 
         Ok(Self {
             executable,
@@ -292,6 +294,7 @@ impl UninstallPlan {
                 env::var_os("XDG_CONFIG_HOME"),
                 Some(configured_directory),
             )?,
+            configuration_file,
             installer_files: vec![home.join(".config/fish/conf.d/attached.env.fish")],
         })
     }
@@ -305,6 +308,7 @@ impl UninstallPlan {
         for cleanup_path in self
             .data_directories
             .iter()
+            .chain(std::iter::once(&self.configuration_file))
             .chain(self.installer_files.iter())
         {
             ensure!(
@@ -326,8 +330,14 @@ impl UninstallPlan {
                     )
                 })?;
             }
+            remove_owned_file(&self.configuration_file).with_context(|| {
+                format!(
+                    "could not delete Attached configuration from {}",
+                    self.configuration_file.display()
+                )
+            })?;
             for file in &self.installer_files {
-                remove_installer_file(file).with_context(|| {
+                remove_owned_file(file).with_context(|| {
                     format!(
                         "could not delete installer metadata from {}",
                         file.display()
@@ -406,7 +416,9 @@ fn ensure_install_directory_is_writable(executable: &Path) -> Result<()> {
 
 // Exact names only: neither a directory name nor an installer receipt proves
 // ownership of other contents. Unknown files (including abandoned temporaries)
-// and directories are deliberately retained for manual inspection.
+// and directories are deliberately retained for manual inspection. The user
+// configuration file is removed separately from its fixed default location so
+// a custom state directory can safely contain an unrelated `config.toml`.
 const OWNED_STATE_FILES: &[&str] = &[
     "admin-identity.key",
     "sync-account.bundle",
@@ -415,7 +427,6 @@ const OWNED_STATE_FILES: &[&str] = &[
     "sync-catalog.lock",
     "encryption-salt.argon2id-v1",
     "one-password-item.json",
-    "config.toml",
     "attached-receipt.json",
 ];
 
@@ -482,9 +493,9 @@ fn remove_owned_state(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn remove_installer_file(path: &Path) -> Result<()> {
-    let parent = path.parent().context("installer file has no parent")?;
-    let name = path.file_name().context("installer file has no name")?;
+fn remove_owned_file(path: &Path) -> Result<()> {
+    let parent = path.parent().context("owned file has no parent")?;
+    let name = path.file_name().context("owned file has no name")?;
     if let Some(directory) = open_cleanup_directory(parent)? {
         unlink_cleanup_file(&directory, name)?;
     }
@@ -501,6 +512,11 @@ fn confirm_uninstall(
         "This permanently removes Attached and its managed local state:"
     )?;
     writeln!(output, "  binary: {}", plan.executable.display())?;
+    writeln!(
+        output,
+        "  configuration: {}",
+        plan.configuration_file.display()
+    )?;
     for directory in &plan.data_directories {
         writeln!(output, "  managed files in: {}", directory.display())?;
     }
@@ -754,6 +770,7 @@ mod tests {
         let executable = executable(root.path());
         let home = root.path().join("home");
         let state = home.join(".config/attached");
+        let configuration_file = state.join("config.toml");
         let xdg_state = root.path().join("xdg/attached");
         let fish_configuration = home.join(".config/fish/conf.d/attached.env.fish");
         fs::create_dir_all(&state).unwrap();
@@ -762,6 +779,7 @@ mod tests {
         for name in OWNED_STATE_FILES {
             fs::write(state.join(name), b"synthetic state").unwrap();
         }
+        fs::write(&configuration_file, b"synthetic config").unwrap();
         fs::write(xdg_state.join("attached-receipt.json"), b"receipt").unwrap();
         fs::write(&fish_configuration, b"installer path setup").unwrap();
 
@@ -773,6 +791,7 @@ mod tests {
                 None,
             )
             .unwrap(),
+            configuration_file,
             installer_files: vec![fish_configuration.clone()],
         };
         let store = RemovalStore::default();
@@ -788,18 +807,31 @@ mod tests {
     #[test]
     fn uninstall_preserves_unrelated_custom_directory_contents() {
         let root = crate::test_support::canonical_tempdir();
+        let home = root.path().join("home");
+        let default_state = home.join(".config/attached");
+        let configuration_file = default_state.join("config.toml");
+        fs::create_dir_all(&default_state).unwrap();
+        fs::write(&configuration_file, b"owned configuration").unwrap();
+
         let state = root.path().join("shared");
         fs::create_dir(&state).unwrap();
         fs::write(state.join("sync-account.bundle"), b"synthetic credential").unwrap();
+        fs::write(state.join("config.toml"), b"unrelated custom configuration").unwrap();
         fs::write(state.join("sentinel"), b"unrelated").unwrap();
         fs::create_dir(state.join("unrelated-directory")).unwrap();
         fs::write(state.join("unrelated-directory/keep"), b"keep").unwrap();
         let plan = UninstallPlan {
             executable: executable(root.path()),
-            data_directories: vec![state.clone()],
+            data_directories: attached_data_directories(&home, None, Some(&state)).unwrap(),
+            configuration_file: configuration_file.clone(),
             installer_files: Vec::new(),
         };
         plan.execute_with_store(&RemovalStore::default()).unwrap();
+        assert!(!configuration_file.exists());
+        assert_eq!(
+            fs::read(state.join("config.toml")).unwrap(),
+            b"unrelated custom configuration"
+        );
         assert_eq!(fs::read(state.join("sentinel")).unwrap(), b"unrelated");
         assert_eq!(
             fs::read(state.join("unrelated-directory/keep")).unwrap(),
@@ -820,6 +852,7 @@ mod tests {
         let plan = UninstallPlan {
             executable,
             data_directories: vec![managed_state],
+            configuration_file: root.path().join("missing-config.toml"),
             installer_files: Vec::new(),
         };
         let store = RemovalStore::default();
@@ -843,6 +876,7 @@ mod tests {
         let plan = UninstallPlan {
             executable: executable.clone(),
             data_directories: vec![state.clone()],
+            configuration_file: root.path().join("missing-config.toml"),
             installer_files: Vec::new(),
         };
         let store = RemovalStore {
@@ -869,6 +903,7 @@ mod tests {
         let plan = UninstallPlan {
             executable: executable.clone(),
             data_directories: vec![linked_state.clone()],
+            configuration_file: root.path().join("missing-config.toml"),
             installer_files: Vec::new(),
         };
         plan.execute_with_store(&RemovalStore::default()).unwrap();
@@ -900,7 +935,7 @@ mod tests {
         symlink(root.path(), root.path().join("linked")).unwrap();
         assert!(remove_owned_state(&root.path().join("linked/state")).is_err());
         assert!(remove_owned_state(&state).is_err());
-        assert!(remove_installer_file(&state.join("sync-account.bundle")).is_err());
+        assert!(remove_owned_file(&state.join("sync-account.bundle")).is_err());
         assert_eq!(
             fs::read(state.join("sync-account.bundle/keep")).unwrap(),
             b"keep"
@@ -914,6 +949,7 @@ mod tests {
         let error = UninstallPlan {
             executable: executable.clone(),
             data_directories: vec![executable.clone()],
+            configuration_file: root.path().join("missing-config.toml"),
             installer_files: Vec::new(),
         }
         .execute()
@@ -929,6 +965,7 @@ mod tests {
         let plan = UninstallPlan {
             executable: PathBuf::from("/home/person/.local/bin/attached"),
             data_directories: vec![PathBuf::from("/home/person/.config/attached")],
+            configuration_file: PathBuf::from("/home/person/.config/attached/config.toml"),
             installer_files: Vec::new(),
         };
 
@@ -938,6 +975,7 @@ mod tests {
             let output = String::from_utf8(output).unwrap();
             assert!(output.contains("permanently"), "{output}");
             assert!(output.contains("bundle files"), "{output}");
+            assert!(output.contains("config.toml"), "{output}");
         }
         for rejected in ["\n", "n\n", "anything else\n"] {
             assert!(
