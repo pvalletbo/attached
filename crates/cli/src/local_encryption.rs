@@ -1,5 +1,8 @@
 use std::{
+    io::Read as _,
+    os::unix::process::CommandExt as _,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::{
         Mutex,
         atomic::{AtomicBool, Ordering},
@@ -7,10 +10,7 @@ use std::{
 };
 
 #[cfg(not(test))]
-use std::{
-    process::{Command, Stdio},
-    sync::{LazyLock, OnceLock},
-};
+use std::sync::{LazyLock, OnceLock};
 
 use anyhow::{Context as _, Result, bail, ensure};
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -278,6 +278,51 @@ trait OpRunner: Send + Sync {
     fn run(&self, arguments: &[String]) -> Result<OpOutput>;
 }
 
+fn terminate_op_process(child: &mut std::process::Child) {
+    crate::bounded_process::terminate_process_group(child.id());
+    let _ = child.wait();
+}
+
+fn run_bounded_op_command(mut command: Command, output_limit: usize) -> Result<OpOutput> {
+    let read_limit = output_limit
+        .checked_add(1)
+        .and_then(|limit| u64::try_from(limit).ok())
+        .context("1Password CLI output limit is invalid")?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0);
+    let mut child = command.spawn().context("could not run the 1Password CLI")?;
+    let Some(stdout_pipe) = child.stdout.take() else {
+        terminate_op_process(&mut child);
+        bail!("could not capture 1Password CLI output");
+    };
+    let mut stdout = Zeroizing::new(Vec::with_capacity(output_limit.min(8192)));
+    let mut limited = stdout_pipe.take(read_limit);
+    if let Err(error) = limited.read_to_end(&mut stdout) {
+        drop(limited);
+        terminate_op_process(&mut child);
+        return Err(error).context("could not read 1Password CLI output");
+    }
+    drop(limited);
+    if stdout.len() > output_limit {
+        terminate_op_process(&mut child);
+        bail!("1Password CLI output exceeded the local limit");
+    }
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(error) => {
+            terminate_op_process(&mut child);
+            return Err(error).context("could not wait for the 1Password CLI");
+        }
+    };
+    Ok(OpOutput {
+        success: status.success(),
+        stdout,
+    })
+}
+
 #[cfg(not(test))]
 struct ProcessOpRunner {
     executable: PathBuf,
@@ -289,22 +334,9 @@ impl OpRunner for ProcessOpRunner {
         let operation = arguments.get(1).map_or("unknown", String::as_str);
         let span = tracing::debug_span!("one_password_cli", operation);
         let _entered = span.enter();
-        let output = Command::new(&self.executable)
-            .args(arguments)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            .context("could not run the 1Password CLI")?;
-        let stdout = Zeroizing::new(output.stdout);
-        ensure!(
-            stdout.len() <= MAX_ONE_PASSWORD_OUTPUT_BYTES,
-            "1Password CLI output exceeded the local limit"
-        );
-        Ok(OpOutput {
-            success: output.status.success(),
-            stdout,
-        })
+        let mut command = Command::new(&self.executable);
+        command.args(arguments);
+        run_bounded_op_command(command, MAX_ONE_PASSWORD_OUTPUT_BYTES)
     }
 }
 
@@ -946,6 +978,30 @@ mod tests {
             success: true,
             stdout: Zeroizing::new(stdout.as_ref().to_vec()),
         }
+    }
+
+    #[test]
+    fn one_password_process_output_is_bounded_while_the_child_is_running() {
+        let mut normal = Command::new("/bin/sh");
+        normal.args(["-c", "printf 'ok'"]);
+        let output = run_bounded_op_command(normal, 8).unwrap();
+        assert!(output.success);
+        assert_eq!(output.stdout.as_slice(), b"ok");
+
+        let mut oversized = Command::new("/bin/sh");
+        oversized.args(["-c", "printf '123456789'; sleep 30"]);
+        let started = std::time::Instant::now();
+        let error = match run_bounded_op_command(oversized, 8) {
+            Ok(_) => panic!("oversized 1Password output was accepted"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("output exceeded"), "{error}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "oversized producer was not terminated promptly: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
