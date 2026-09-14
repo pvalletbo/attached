@@ -4,6 +4,10 @@ use std::{
     os::unix::process::CommandExt,
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -54,12 +58,22 @@ pub fn run_command(
         .stderr
         .take()
         .with_context(|| format!("failed to capture stderr from {command_display}"))?;
-    let stdout_reader = bounded_reader(stdout, capture_limit);
-    let stderr_reader = bounded_reader(stderr, capture_limit);
+    let capture_exceeded = Arc::new(AtomicBool::new(false));
+    let stdout_reader = bounded_reader(stdout, capture_limit, Arc::clone(&capture_exceeded));
+    let stderr_reader = bounded_reader(stderr, capture_limit, Arc::clone(&capture_exceeded));
 
     let deadline = Instant::now() + runtime_limit;
     let mut timed_out = false;
+    let mut output_limit_exceeded = false;
     let status = loop {
+        if capture_exceeded.load(Ordering::Acquire) {
+            terminate_process_group(child.id());
+            let status = child
+                .wait()
+                .with_context(|| format!("failed to reap oversized-output {command_display}"))?;
+            output_limit_exceeded = true;
+            break status;
+        }
         if let Some(status) = child
             .try_wait()
             .with_context(|| format!("failed to poll {command_display}"))?
@@ -80,6 +94,11 @@ pub fn run_command(
 
     let stdout = join_reader(stdout_reader, "stdout", &command_display)?;
     let stderr = join_reader(stderr_reader, "stderr", &command_display)?;
+    if output_limit_exceeded {
+        bail!(
+            "{command_display} produced more than {capture_limit} bytes on stdout or stderr"
+        );
+    }
     if timed_out {
         bail!(
             "{command_display} timed out after {} seconds",
@@ -156,13 +175,20 @@ async fn retry_executable_busy_async_with<T>(
     }
 }
 
-fn bounded_reader<R>(reader: R, capture_limit: u64) -> thread::JoinHandle<std::io::Result<Vec<u8>>>
+fn bounded_reader<R>(
+    reader: R,
+    capture_limit: u64,
+    capture_exceeded: Arc<AtomicBool>,
+) -> thread::JoinHandle<std::io::Result<Vec<u8>>>
 where
     R: Read + Send + 'static,
 {
     thread::spawn(move || {
         let mut bytes = Vec::new();
         reader.take(capture_limit + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > capture_limit as usize {
+            capture_exceeded.store(true, Ordering::Release);
+        }
         Ok(bytes)
     })
 }
@@ -316,5 +342,27 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn output_limit_terminates_lingering_process_promptly() {
+        for (stream, redirect) in [("stdout", ""), ("stderr", " >&2")] {
+            let mut command = Command::new("sh");
+            command.arg("-c").arg(format!(
+                "printf '0123456789abcdefX'{redirect}\nsleep 30\n"
+            ));
+            let started = Instant::now();
+
+            let error = run_command(command, Duration::from_secs(3), 16)
+                .unwrap_err()
+                .to_string();
+
+            assert!(error.contains("more than 16 bytes"), "{stream}: {error}");
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "{stream} overflow waited {:?} instead of terminating the process",
+                started.elapsed()
+            );
+        }
     }
 }
