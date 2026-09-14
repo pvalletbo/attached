@@ -100,9 +100,9 @@ async fn open(
             .context("publisher does not support SSH or is unavailable; update Attached and enable `attached ssh-access enable` on the publisher")?;
         let (mut send, mut receive) = connection.open_bi().await?;
         write_frame(&mut send, &Request { capability: attachment.attach_capability, public_key: public_key.to_owned() }).await?;
-        let response: Response = read_frame(&mut receive).await.context("publisher rejected SSH access; run `attached ssh-access enable` there")?;
+        let response: Response = read_frame(&mut receive).await.context("publisher rejected SSH access; enable `attached ssh-access enable` there, or retry with `--no-cache` after a publisher restart")?;
         // Parsing prevents setup metadata from injecting arbitrary known_hosts entries.
-        russh::keys::PublicKey::from_openssh(&response.host_key)?;
+        canonical_host_key(&response.host_key)?;
         ensure!(!response.username.is_empty() && response.username.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)), "publisher supplied an unsupported OS username");
         Ok((connection, send, receive, response))
     }).await.context("SSH publisher setup timed out")?
@@ -165,7 +165,7 @@ async fn run(
     let (first_connection, _, _, response) = open(endpoint, &attachment, &public_key).await?;
     let peer = first_connection.remote_id();
     first_connection.close(0u32.into(), b"SSH metadata verified");
-    let host_key = russh::keys::PublicKey::from_openssh(&response.host_key)?.to_openssh()?;
+    let host_key = canonical_host_key(&response.host_key)?;
     state::pin_host(
         path,
         &peer,
@@ -217,9 +217,14 @@ async fn run(
                             _ = token.cancelled() => return Ok::<_, anyhow::Error>(()),
                         };
                         let result = async {
-                            ensure!(metadata.username == expected_username && russh::keys::PublicKey::from_openssh(&metadata.host_key)?.to_openssh()? == expected_host_key, "publisher SSH identity changed");
+                            ensure!(metadata.username == expected_username && canonical_host_key(&metadata.host_key)? == expected_host_key, "publisher SSH identity changed");
                             let (read, write) = stream.into_split();
-                            proxy::copy_until_cancelled(read, write, receive, send, token).await?;
+                            if let Err(error) = proxy::copy_until_cancelled(read, write, receive, send, token).await {
+                                // OpenSSH owns command/transport exit reporting. QUIC can
+                                // close normally just after SSH's final exit/disconnect;
+                                // do not contaminate successful command stderr with it.
+                                tracing::debug!(%error, "SSH byte proxy ended");
+                            }
                             Ok(())
                         }.await;
                         connection.close(0u32.into(), b"OpenSSH proxy ended");
@@ -240,8 +245,8 @@ async fn run(
         // OpenSSH at this file; no changes to ~/.ssh/config or background key agents.
         println!("{}", config_path.display());
         eprintln!(
-            "Ready: ssh -F '{}' {alias} [command]. Keep this process running; Ctrl-C removes the configuration and invalidates its keys.",
-            config_path.display()
+            "Ready: ssh -F {} {alias} [command]. Keep this process running; Ctrl-C removes the configuration and invalidates its keys.",
+            shell_word(&config_path)?
         );
         tokio::select! {
             result = &mut broker => result?,
@@ -268,6 +273,17 @@ async fn run(
     cancellation.cancel();
     broker.await?;
     Ok(status.code().unwrap_or(255))
+}
+
+fn canonical_host_key(encoded: &str) -> Result<String> {
+    let parsed = russh::keys::PublicKey::from_openssh(encoded)?;
+    ensure!(
+        parsed.algorithm() == russh::keys::Algorithm::Ed25519,
+        "unsupported publisher SSH host key algorithm"
+    );
+    // Comments are untrusted metadata, not part of key identity. Do not allow
+    // them into known_hosts (including newlines accepted by a future parser).
+    Ok(russh::keys::PublicKey::new(parsed.key_data().clone(), "").to_openssh()?)
 }
 
 fn config_path(path: &Path) -> Result<String> {
@@ -338,6 +354,22 @@ mod tests {
             );
         }
         assert!(config.contains("Attached'\\''s binary"));
+    }
+
+    #[test]
+    fn host_identity_discards_untrusted_key_comments() {
+        let key = state::ephemeral_key().unwrap();
+        let public = russh::keys::PublicKey::new(
+            key.public_key().key_data().clone(),
+            "untrusted publisher metadata",
+        );
+        let canonical = canonical_host_key(&public.to_openssh().unwrap()).unwrap();
+        assert!(!canonical.contains("untrusted"));
+        assert_eq!(canonical.split_whitespace().count(), 2);
+        let injected = format!("{canonical} comment\nother-host key");
+        if let Ok(clean) = canonical_host_key(&injected) {
+            assert_eq!(clean, canonical);
+        }
     }
 
     #[test]
