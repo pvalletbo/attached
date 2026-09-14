@@ -27,8 +27,52 @@ use crate::{
 /// It never loads credentials or emits anything except SSH bytes to stdout.
 pub(crate) async fn local_proxy(socket: PathBuf) -> Result<i32> {
     let stream = tokio::time::timeout(SETUP_TIMEOUT, UnixStream::connect(socket)).await??;
-    let (read, write) = stream.into_split();
-    proxy::copy_bidirectional_split(tokio::io::stdin(), tokio::io::stdout(), read, write).await?;
+    let (mut read, mut write) = stream.into_split();
+    // This is a dedicated helper process. Tokio's stdin uses an uncancellable
+    // blocking-pool read and can prevent runtime shutdown forever when the peer
+    // closes while OpenSSH still holds stdin open. A bounded ordinary thread is
+    // intentionally not joined; process exit disposes of an outstanding read.
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
+    std::thread::Builder::new()
+        .name("ssh-proxy-stdin".into())
+        .spawn(move || {
+            use std::io::Read;
+            let stdin = std::io::stdin();
+            let mut stdin = stdin.lock();
+            loop {
+                let mut bytes = vec![0; 16 * 1024];
+                let message = match stdin.read(&mut bytes) {
+                    Ok(0) => break,
+                    Ok(length) => {
+                        bytes.truncate(length);
+                        Ok(bytes)
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => Err(error),
+                };
+                let failed = message.is_err();
+                if sender.blocking_send(message).is_err() || failed {
+                    break;
+                }
+            }
+        })?;
+    use tokio::io::AsyncWriteExt;
+    let upload = async {
+        while let Some(bytes) = receiver.recv().await {
+            write.write_all(&bytes?).await?;
+        }
+        write.shutdown().await
+    };
+    let download = async {
+        let mut stdout = tokio::io::stdout();
+        tokio::io::copy(&mut read, &mut stdout).await?;
+        stdout.flush().await
+    };
+    tokio::pin!(upload, download);
+    tokio::select! {
+        result = &mut upload => { result?; download.await?; },
+        result = &mut download => result?,
+    }
     Ok(0)
 }
 

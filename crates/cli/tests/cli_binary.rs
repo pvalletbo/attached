@@ -314,6 +314,38 @@ async fn ssh_local_proxy_preserves_binary_and_half_close_without_loading_credent
 }
 
 #[tokio::test]
+async fn ssh_local_proxy_exits_on_peer_eof_even_when_openssh_keeps_stdin_open() {
+    use std::process::Stdio;
+    let fixture = CliFixture::new();
+    let socket = fixture.path("ssh.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let mut command = fixture.command(&["__ssh-local-proxy", socket.to_str().unwrap()]);
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Keep the write end alive through process exit, as OpenSSH does while waiting
+    // for ProxyCommand stdout EOF after a remote disconnect.
+    let held_stdin = child.stdin.take().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        stream.write_all(b"final-output").await.unwrap();
+        stream.shutdown().await.unwrap();
+    });
+    let output = timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(held_stdin);
+    server.await.unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(output.stdout, b"final-output");
+    assert!(output.stderr.is_empty());
+}
+
+#[tokio::test]
 async fn help_version_completions_and_usage_errors_are_real_process_contracts() {
     let fixture = CliFixture::new();
     // These commands must bypass even invalid user configuration.
