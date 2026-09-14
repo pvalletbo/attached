@@ -322,6 +322,43 @@ async fn iroh_rejects_pty_env_subsystems_and_forwarding() {
 }
 
 #[tokio::test]
+async fn pipelined_environment_denials_preserve_exec_reply_over_iroh() {
+    let harness = Harness::new(|_| {}).await;
+    let client = harness.authenticated().await;
+    for want_reply in [false, true] {
+        let mut channel = client.channel_open_session().await.unwrap();
+        channel
+            .set_env(want_reply, "ATTACHED_SSH_TEST_ENV", "forbidden")
+            .await
+            .unwrap();
+        channel
+            .set_env(false, "ATTACHED_SSH_TEST_ENV", "also-forbidden")
+            .await
+            .unwrap();
+        channel
+            .exec(true, "printf '%s' \"${ATTACHED_SSH_TEST_ENV-unset}\"")
+            .await
+            .unwrap();
+        channel.eof().await.unwrap();
+        if want_reply {
+            assert!(matches!(
+                timeout(DEADLINE, channel.wait()).await.unwrap(),
+                Some(ChannelMsg::Failure)
+            ));
+        }
+        assert!(matches!(
+            timeout(DEADLINE, channel.wait()).await.unwrap(),
+            Some(ChannelMsg::Success)
+        ));
+        assert_eq!(
+            command_output(channel).await,
+            (b"unset".to_vec(), vec![], Some(0))
+        );
+    }
+    harness.close().await;
+}
+
+#[tokio::test]
 async fn revocation_cancels_active_command_process_group() {
     let mut harness = Harness::new(|_| {}).await;
     let client = harness.authenticated().await;
