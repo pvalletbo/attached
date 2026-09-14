@@ -8,7 +8,7 @@ use anyhow::{Context as _, Result, ensure};
 use attached_session_sync_protocol::{
     account::{ApiKeyScope, RecordId},
     api::LiveRecordIndexEntry,
-    canonical::HerdrVersion as SessionAccessHerdrVersion,
+    canonical::{HerdrVersion as SessionAccessHerdrVersion, SessionAccessError},
     crypto::{
         Envelope as CryptoEnvelope, VerificationContext,
         open_session_access_descriptor_cursorless_for_native_upgrade,
@@ -195,12 +195,14 @@ async fn refresh_sessions_with_registry_at(
         .collect::<BTreeMap<_, _>>();
     let mut accepted = Vec::with_capacity(index.records.len());
     let mut changed = Vec::new();
+    let mut saw_expired_record = false;
     for indexed in index.records {
         let previous = existing.remove(&indexed.record_id);
         if let Some(previous) = previous
             && previous.service_revision == indexed.revision
         {
             if previous.is_expired_at(now) {
+                saw_expired_record = true;
                 let error = anyhow::anyhow!("session access descriptor expired");
                 tracing::debug!(
                     record_id = %indexed.record_id,
@@ -257,6 +259,7 @@ async fn refresh_sessions_with_registry_at(
         ) {
             Ok(opened) => opened,
             Err(error) => {
+                saw_expired_record |= error == SessionAccessError::Expired;
                 tracing::debug!(
                     record_id = %indexed.record_id,
                     reason = %error,
@@ -277,10 +280,12 @@ async fn refresh_sessions_with_registry_at(
     }
     accepted.sort_by_key(|record| record.record_id);
     catalog.records = accepted;
-    // Partial refreshes should be retried rather than hiding unavailable records for minutes.
-    catalog.refreshed_at = (!warnings
-        .iter()
-        .any(|warning| matches!(warning, RefreshWarning::RecordUnavailable { .. })))
+    // Expired descriptors may be republished immediately. Do not cache a partial
+    // listing for minutes when the service can already have a replacement revision.
+    catalog.refreshed_at = (!saw_expired_record
+        && !warnings
+            .iter()
+            .any(|warning| matches!(warning, RefreshWarning::RecordUnavailable { .. })))
     .then_some(now);
     state_catalog::save_refresh(
         state_dir,
@@ -746,12 +751,26 @@ mod tests {
                 }
                 responses.push((format!("{index_path}/{stable}"), 200, Some(1), serde_json::to_vec(&sealed(stable, false)).unwrap()));
                 let server = tokio::spawn(serve_sequence(listener, responses));
+                let registry_dir = root.path().join("registry");
                 let refreshed = refresh_sessions_with_registry_at(
-                    &state_dir, HerdrVersion::new(3, 2, 1), &root.path().join("registry"), now,
+                    &state_dir, HerdrVersion::new(3, 2, 1), &registry_dir, now,
                 ).await.unwrap();
                 assert_eq!(refreshed.sessions.len(), 1, "{scenario}: {:?}", refreshed.sessions);
                 assert_eq!(refreshed.sessions[0].target, "stable/work", "{scenario}");
-                assert!(state_catalog::load(&state_dir, &account).unwrap().records.iter().all(|record| record.record_id == stable), "{scenario}");
+                let persisted = state_catalog::load(&state_dir, &account).unwrap();
+                assert!(persisted.records.iter().all(|record| record.record_id == stable), "{scenario}");
+                if scenario == "expired" {
+                    assert!(persisted.refreshed_at.is_none(), "expired partial catalog was cached");
+                    assert!(
+                        cached_sessions(&state_dir, &registry_dir, now).unwrap().is_none(),
+                        "expired host was hidden behind a fresh partial catalog"
+                    );
+                } else if scenario == "invalid" {
+                    assert!(
+                        persisted.refreshed_at.is_some(),
+                        "permanently invalid records should not disable cache reuse"
+                    );
+                }
                 if !matches!(scenario, "invalid" | "expired" | "pruned-replay") {
                     assert!(refreshed.warnings.iter().any(|warning| matches!(warning, RefreshWarning::RecordUnavailable { record_id, .. } if *record_id == changing)), "{scenario}");
                 }
@@ -1089,6 +1108,16 @@ mod tests {
                 refreshed_after_expiration.warnings
             );
             let persisted_catalog = state_catalog::load(&state_dir, &account).unwrap();
+            assert!(
+                persisted_catalog.refreshed_at.is_none(),
+                "a partial catalog with an expired host was marked fresh"
+            );
+            assert!(
+                cached_sessions(&state_dir, &registry_dir, now + Duration::from_secs(2))
+                    .unwrap()
+                    .is_none(),
+                "an expired host was hidden behind a reusable partial catalog"
+            );
             assert!(
                 persisted_catalog.records.iter().all(|record| {
                     ![
