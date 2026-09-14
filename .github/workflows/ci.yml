@@ -151,6 +151,15 @@ jobs:
           --exclude herdr-tui-protocol
       - name: Check dependency, license, and source policy
         run: cargo deny check bans licenses sources
+      # Keep unmaintained dependencies visible without waiving vulnerability
+      # or yanked-release advisories. Experimental crates are out of scope.
+      - name: Check core dependency security advisories
+        run: >-
+          cargo deny --locked
+          --exclude attached-browser-iroh
+          --exclude attached-browser-sync
+          --exclude herdr-tui-protocol
+          check advisories --warn unmaintained
       - name: Check whitespace
         run: git diff --check
 
@@ -326,5 +335,12 @@ jobs:
           --exclude herdr-tui-protocol
       - name: Check dependency, license, and source policy on macOS
         run: cargo deny check bans licenses sources
+      - name: Check core dependency security advisories on macOS
+        run: >-
+          cargo deny --locked
+          --exclude attached-browser-iroh
+          --exclude attached-browser-sync
+          --exclude herdr-tui-protocol
+          check advisories --warn unmaintained
       - name: Check whitespace on macOS
         run: git diff --check
