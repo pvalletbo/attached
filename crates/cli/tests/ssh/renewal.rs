@@ -35,7 +35,9 @@ fn snapshot(
             "renamed-publisher"
         }
         .into(),
-        now - Duration::from_secs(1),
+        // Model an already-aged lease: the protocol requires a total lifetime
+        // of at least 60 seconds even when only 15 seconds remain at discovery.
+        now - Duration::from_secs(75),
         expires,
         ticket.into(),
         CapabilitySecret::from_bytes([capability; 32]),
@@ -416,6 +418,17 @@ async fn broker_case(expire: bool) {
     timeout(DEADLINE, http_task).await.unwrap().unwrap();
     timeout(DEADLINE, ssh_task).await.unwrap().unwrap();
     publisher.close().await;
+}
+
+#[test]
+fn near_expiry_snapshot_has_a_valid_protocol_lifetime() {
+    let ticket = EndpointTicket::new(iroh::EndpointAddr::new(
+        iroh::SecretKey::generate().public(),
+    ))
+    .to_string();
+    let expires = chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp(), 0).unwrap()
+        + Duration::from_secs(15);
+    assert!(!snapshot(&ticket, 1, 46, expires).record.is_empty());
 }
 
 #[tokio::test]
