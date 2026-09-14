@@ -95,9 +95,7 @@ pub fn run_command(
     let stdout = join_reader(stdout_reader, "stdout", &command_display)?;
     let stderr = join_reader(stderr_reader, "stderr", &command_display)?;
     if output_limit_exceeded {
-        bail!(
-            "{command_display} produced more than {capture_limit} bytes on stdout or stderr"
-        );
+        bail!("{command_display} produced more than {capture_limit} bytes on stdout or stderr");
     }
     if timed_out {
         bail!(
@@ -348,9 +346,9 @@ mod tests {
     fn output_limit_terminates_lingering_process_promptly() {
         for (stream, redirect) in [("stdout", ""), ("stderr", " >&2")] {
             let mut command = Command::new("sh");
-            command.arg("-c").arg(format!(
-                "printf '0123456789abcdefX'{redirect}\nsleep 30\n"
-            ));
+            command
+                .arg("-c")
+                .arg(format!("printf '0123456789abcdefX'{redirect}\nsleep 30\n"));
             let started = Instant::now();
 
             let error = run_command(command, Duration::from_secs(3), 16)
