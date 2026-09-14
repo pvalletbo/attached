@@ -133,10 +133,16 @@ pub(crate) async fn connect(
             .consumer_identity_secret()
             .context("download bundle has no consumer identity")?,
     );
-    let endpoint = Endpoint::builder(presets::N0)
-        .secret_key(consumer)
-        .bind()
-        .await?;
+    let ticket = EndpointTicket::from_str(&attachment.endpoint_ticket)?;
+    let mut builder = Endpoint::builder(presets::N0).secret_key(consumer);
+    if loopback_only(ticket.endpoint_addr()) {
+        // A strictly local descriptor needs no public relay registration or
+        // address lookup. Keep local operation (and disposable fixtures) offline.
+        builder = builder
+            .relay_mode(iroh::RelayMode::Disabled)
+            .clear_address_lookup();
+    }
+    let endpoint = builder.bind().await?;
     let result = run(
         &endpoint,
         path,
@@ -275,6 +281,12 @@ async fn run(
     Ok(status.code().unwrap_or(255))
 }
 
+fn loopback_only(address: &iroh::EndpointAddr) -> bool {
+    !address.addrs.is_empty() && address.addrs.iter().all(|address| {
+        matches!(address, iroh::TransportAddr::Ip(socket) if socket.ip().is_loopback())
+    })
+}
+
 fn canonical_host_key(encoded: &str) -> Result<String> {
     let parsed = russh::keys::PublicKey::from_openssh(encoded)?;
     ensure!(
@@ -354,6 +366,23 @@ mod tests {
             );
         }
         assert!(config.contains("Attached'\\''s binary"));
+    }
+
+    #[test]
+    fn only_strictly_loopback_descriptors_disable_public_relays() {
+        let id = iroh::SecretKey::generate().public();
+        let empty = iroh::EndpointAddr::new(id);
+        assert!(!loopback_only(&empty));
+        let local = empty
+            .clone()
+            .with_ip_addr("127.0.0.1:1234".parse::<std::net::SocketAddr>().unwrap());
+        assert!(loopback_only(&local));
+        let remote = local
+            .clone()
+            .with_ip_addr("192.0.2.1:1234".parse::<std::net::SocketAddr>().unwrap());
+        assert!(!loopback_only(&remote));
+        let relayed = local.with_relay_url("https://relay.example".parse().unwrap());
+        assert!(!loopback_only(&relayed));
     }
 
     #[test]

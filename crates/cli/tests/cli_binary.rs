@@ -30,14 +30,14 @@ const TOKEN: [u8; 32] = [43; 32];
 const IDENTITY: [u8; 32] = [44; 32];
 const RECORD: RecordId = RecordId::from_bytes([45; 16]);
 
-fn bundle(origin: &str) -> String {
+fn bundle(origin: &str, identity: [u8; 32]) -> String {
     AccountBundle::Scoped(
         ScopedAccountBundle::from_download_parts(
             ServiceOrigin::parse(origin).unwrap(),
             AccountId::parse(ACCOUNT).unwrap(),
             ApiToken::from_bytes(TOKEN),
             AccountRootKey::from_bytes(ROOT_KEY),
-            ConsumerIdentitySecret::from_bytes(IDENTITY),
+            ConsumerIdentitySecret::from_bytes(identity),
         )
         .unwrap(),
     )
@@ -45,7 +45,11 @@ fn bundle(origin: &str) -> String {
 }
 
 async fn import(fixture: &CliFixture, origin: &str) -> String {
-    let encoded = bundle(origin);
+    import_with_identity(fixture, origin, IDENTITY).await
+}
+
+async fn import_with_identity(fixture: &CliFixture, origin: &str, identity: [u8; 32]) -> String {
+    let encoded = bundle(origin, identity);
     fs::write(fixture.path("download.bundle"), format!("{encoded}\n")).unwrap();
     let output = fixture
         .run(&[
@@ -174,7 +178,10 @@ async fn ssh_command_provisions_credentials_invokes_openssh_and_preserves_exit_s
     let fixture = CliFixture::new();
     let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", http.local_addr().unwrap());
-    import(&fixture, &origin).await;
+    // Each fixture owns a relay identity. Reusing the attachment fixture's
+    // identity would let parallel test processes displace one another at n0.
+    let consumer_identity = iroh::SecretKey::generate().to_bytes();
+    import_with_identity(&fixture, &origin, consumer_identity).await;
     let publisher = Endpoint::builder(presets::N0)
         .clear_ip_transports()
         .bind_addr_with_opts(
@@ -209,7 +216,7 @@ async fn ssh_command_provisions_credentials_invokes_openssh_and_preserves_exit_s
             let connection = endpoint.accept().await.unwrap().await.unwrap();
             assert_eq!(
                 connection.remote_id(),
-                iroh::SecretKey::from_bytes(&IDENTITY).public()
+                iroh::SecretKey::from_bytes(&consumer_identity).public()
             );
             let (mut send, mut receive) = connection.accept_bi().await.unwrap();
             let length = receive.read_u32().await.unwrap() as usize;

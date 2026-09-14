@@ -112,6 +112,9 @@ enum Command {
     ///
     /// Uses system OpenSSH and automatic, connection-scoped keys. Publisher consent:
     /// `attached ssh-access enable`. Commands run as the publisher's OS account.
+    /// For concurrent relayed connections, use one --expose-config broker: separate
+    /// Attached processes share the consumer Iroh identity and can displace one
+    /// another on relays.
     Ssh {
         /// Publisher host label or stable endpoint ID (not HOST/SESSION).
         target: String,
