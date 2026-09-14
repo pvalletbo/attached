@@ -7,7 +7,6 @@ use anyhow::{Context, Result, ensure};
 use attached_session_sync_protocol::account::ApiKeyScope;
 use russh::keys::{PrivateKey, ssh_key::private::Ed25519Keypair};
 use serde::{Deserialize, Serialize};
-use uzers::os::unix::UserExt;
 use zeroize::Zeroizing;
 
 use crate::{
@@ -52,13 +51,8 @@ pub(crate) fn set_access(path: &Path, enabled: bool) -> Result<()> {
         .authorized_consumer_identity()
         .context("publish bundle has no consumer identity")?
         .as_bytes();
-    let user = uzers::get_user_by_uid(rustix::process::geteuid().as_raw())
-        .context("could not resolve publisher OS account")?;
-    let username = user
-        .name()
-        .to_str()
-        .context("OS username is not UTF-8")?
-        .to_owned();
+    let user = super::account::lookup(rustix::process::geteuid().as_raw())?;
+    let username = user.username;
     ensure!(
         !username.is_empty()
             && username
@@ -70,10 +64,10 @@ pub(crate) fn set_access(path: &Path, enabled: bool) -> Result<()> {
     getrandom::fill(&mut generation)?;
     let policy = Policy {
         consumer,
-        uid: user.uid(),
+        uid: user.uid,
         username,
-        home: user.home_dir().to_owned(),
-        shell: user.shell().to_owned(),
+        home: user.home,
+        shell: user.shell,
         generation,
         enabled,
     };

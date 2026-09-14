@@ -1,5 +1,6 @@
 //! Account-authorized SSH over its own versioned Iroh ALPN, independent of Herdr.
 //! russh implements SSH; Attached implements the deliberately limited exec/shell service.
+mod account;
 mod client;
 mod descriptor;
 mod exec;
