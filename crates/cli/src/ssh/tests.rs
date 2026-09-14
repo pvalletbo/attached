@@ -17,6 +17,14 @@ fn test_policy() -> state::Policy {
 /// Test-only loopback listener to exercise an actual system OpenSSH client against
 /// the same byte-stream server used on Iroh. Production has no TCP SSH listener.
 async fn openssh(command: &str, input: &[u8]) -> std::process::Output {
+    openssh_with_options(command, input, &[]).await
+}
+
+async fn openssh_with_options(
+    command: &str,
+    input: &[u8],
+    options: &[&str],
+) -> std::process::Output {
     let temporary = crate::test_support::canonical_tempdir();
     let client = state::ephemeral_key().unwrap();
     let host = state::ephemeral_key().unwrap();
@@ -81,6 +89,8 @@ async fn openssh(command: &str, input: &[u8]) -> std::process::Output {
         .arg(temporary.path().join("key"))
         .arg("-p")
         .arg(port.to_string())
+        .args(options)
+        .env("ATTACHED_SSH_TEST_ENV", "must-not-inherit")
         .arg("attached-test@127.0.0.1")
         .arg(command)
         .stdin(Stdio::piped())
@@ -125,6 +135,26 @@ async fn openssh_exec_stdout_stderr_and_exit_status() {
     assert_eq!(output.stdout, b"hello");
     assert_eq!(output.stderr, b"error");
     assert_eq!(output.status.code(), Some(7));
+}
+
+#[tokio::test]
+async fn openssh_environment_requests_do_not_reject_the_following_exec() {
+    // OpenSSH sends env with want_reply=false, then immediately sends exec
+    // with want_reply=true. The env denial must not consume exec's reply.
+    for option in [
+        "SetEnv=ATTACHED_SSH_TEST_ENV=must-not-inherit",
+        "SendEnv=ATTACHED_SSH_TEST_ENV",
+    ] {
+        let output = openssh_with_options(
+            "cat; printf '%s' \"${ATTACHED_SSH_TEST_ENV-unset}\"; printf error >&2; exit 7",
+            b"input\0\xff",
+            &["-o", option],
+        )
+        .await;
+        assert_eq!(output.status.code(), Some(7), "{option}: {output:?}");
+        assert_eq!(output.stdout, b"input\0\xffunset");
+        assert_eq!(output.stderr, b"error");
+    }
 }
 
 #[tokio::test]

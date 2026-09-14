@@ -89,9 +89,22 @@ impl Handler for Service {
         }
         Ok(())
     }
-    // Request messages are handled in the bounded channel task, never by blocking the
-    // shared SSH event loop on a child's stdin/stdout. All other channel/global opens
-    // retain russh's deny-by-default policy.
+    async fn env_request(
+        &mut self,
+        channel: ChannelId,
+        _: &str,
+        _: &str,
+        session: &mut Session,
+    ) -> Result<()> {
+        // russh 0.63 queues SetEnv with want_reply=true even when OpenSSH sent
+        // false. Its Session tracks only the latest request's reply flag, so an
+        // asynchronous denial can accidentally reject the following exec. Deny
+        // here while the wire request is current; Session suppresses unasked replies.
+        session.channel_failure(channel)?;
+        Ok(())
+    }
+    // Process I/O remains in bounded channel tasks, never blocking the shared SSH
+    // event loop. Other channel/global opens retain russh's deny-by-default policy.
 }
 
 impl Drop for Service {
@@ -226,9 +239,10 @@ async fn reject_request(msg: &ChannelMsg, handle: &server::Handle, id: ChannelId
         | ChannelMsg::RequestShell { want_reply }
         | ChannelMsg::RequestPty { want_reply, .. }
         | ChannelMsg::RequestSubsystem { want_reply, .. }
-        | ChannelMsg::SetEnv { want_reply, .. }
         | ChannelMsg::RequestX11 { want_reply, .. }
         | ChannelMsg::AgentForward { want_reply } => *want_reply,
+        // Already rejected synchronously in Handler::env_request.
+        ChannelMsg::SetEnv { .. } => false,
         _ => false,
     };
     if reply {
