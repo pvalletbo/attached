@@ -1,5 +1,7 @@
 //! Black-box tests: only the public protocol crates are linked here. All CLI
 //! behavior (including production encryption/KDF) runs in CARGO_BIN_EXE_attached.
+#[path = "ssh/renewal.rs"]
+mod ssh_renewal;
 mod support;
 
 use std::{fs, net::Ipv4Addr, time::Duration};

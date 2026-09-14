@@ -16,7 +16,9 @@ use tokio::{
     task::JoinSet,
 };
 
-use super::{ALPN, Request, Response, SETUP_TIMEOUT, read_frame, state, write_frame};
+use super::{
+    ALPN, Request, Response, SETUP_TIMEOUT, descriptor::Descriptors, read_frame, state, write_frame,
+};
 use crate::{
     proxy,
     secure_state::{self, StateDir},
@@ -88,7 +90,7 @@ async fn open(
 )> {
     ensure!(
         sync::utc_now_seconds() < attachment.expires_at,
-        "publisher descriptor expired; restart `attached ssh`"
+        "SSH publisher descriptor expired during connection setup"
     );
     let ticket = EndpointTicket::from_str(&attachment.endpoint_ticket)?;
     ensure!(
@@ -106,6 +108,40 @@ async fn open(
         ensure!(!response.username.is_empty() && response.username.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)), "publisher supplied an unsupported OS username");
         Ok((connection, send, receive, response))
     }).await.context("SSH publisher setup timed out")?
+}
+
+/// Renew only connection setup data, never replay SSH commands. No SSH bytes
+/// reach the caller until setup succeeds and the caller checks the pinned host.
+async fn open_current(
+    endpoint: &Endpoint,
+    descriptors: &Descriptors,
+    account: &sync::state::AccountCredentials,
+    public_key: &str,
+) -> Result<(
+    iroh::endpoint::Connection,
+    iroh::endpoint::SendStream,
+    iroh::endpoint::RecvStream,
+    Response,
+)> {
+    tokio::time::timeout(SETUP_TIMEOUT, async {
+        let attachment = descriptors.get(account, None).await?;
+        match open(endpoint, &attachment, public_key).await {
+            Ok(connection) => Ok(connection),
+            Err(error) => {
+                // A publisher restart may rotate its capability/address before
+                // the old lease expires. Refresh once, sharing concurrent retries.
+                let refreshed = descriptors.get(account, Some(&attachment)).await?;
+                if refreshed == attachment {
+                    return Err(error);
+                }
+                open(endpoint, &refreshed, public_key)
+                    .await
+                    .context("SSH setup failed after refreshing publisher discovery")
+            }
+        }
+    })
+    .await
+    .context("SSH connection setup or discovery refresh timed out")?
 }
 
 pub(crate) async fn connect(
@@ -147,6 +183,7 @@ pub(crate) async fn connect(
         &endpoint,
         path,
         attachment,
+        account,
         command,
         expose_config,
         trust_new_host_key,
@@ -160,6 +197,7 @@ async fn run(
     endpoint: &Endpoint,
     path: &Path,
     attachment: sync::state_catalog::SyncedAttachment,
+    account: sync::state::AccountCredentials,
     command: Vec<String>,
     expose_config: bool,
     trust_new_host_key: bool,
@@ -168,7 +206,10 @@ async fn run(
     // connection, never persisted on the publisher, and dies with that connection.
     let key = state::ephemeral_key()?;
     let public_key = key.public_key().to_openssh()?;
-    let (first_connection, _, _, response) = open(endpoint, &attachment, &public_key).await?;
+    let descriptors = Arc::new(Descriptors::new(attachment));
+    let account = Arc::new(account);
+    let (first_connection, _, _, response) =
+        open_current(endpoint, &descriptors, &account, &public_key).await?;
     let peer = first_connection.remote_id();
     first_connection.close(0u32.into(), b"SSH metadata verified");
     let host_key = canonical_host_key(&response.host_key)?;
@@ -211,7 +252,8 @@ async fn run(
                     let (stream, _) = accepted?;
                     let Ok(permit) = limit.clone().try_acquire_owned() else { continue; };
                     let endpoint = endpoint.clone();
-                    let attachment = attachment.clone();
+                    let descriptors = descriptors.clone();
+                    let account = account.clone();
                     let public_key = public_key.clone();
                     let expected_username = response.username.clone();
                     let expected_host_key = host_key.clone();
@@ -219,7 +261,7 @@ async fn run(
                     tasks.spawn(async move {
                         let _permit = permit;
                         let (connection, send, receive, metadata) = tokio::select! {
-                            result = open(&endpoint, &attachment, &public_key) => result?,
+                            result = open_current(&endpoint, &descriptors, &account, &public_key) => result?,
                             _ = token.cancelled() => return Ok::<_, anyhow::Error>(()),
                         };
                         let result = async {

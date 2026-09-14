@@ -46,8 +46,8 @@ pub(super) struct SessionListing {
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct SyncedAttachment {
-    pub(super) record_id: RecordId,
-    pub(super) service_revision: u64,
+    pub(crate) record_id: RecordId,
+    pub(crate) service_revision: u64,
     pub endpoint_ticket: String,
     pub endpoint_identity: [u8; 32],
     pub attach_capability: [u8; 32],
@@ -121,6 +121,20 @@ impl CatalogRecord {
         self.expires_at <= now
     }
 
+    pub(super) fn ssh_attachment(&self) -> SyncedAttachment {
+        SyncedAttachment {
+            record_id: self.record_id,
+            service_revision: self.service_revision,
+            endpoint_ticket: self.endpoint_ticket.clone(),
+            endpoint_identity: self.endpoint_identity,
+            attach_capability: self.attach_capability,
+            attached_version: self.attached_version,
+            herdr_version: self.herdr_version,
+            expires_at: self.expires_at,
+            session: String::new(),
+        }
+    }
+
     pub(super) fn from_opened(
         record_id: RecordId,
         service_revision: u64,
@@ -171,17 +185,7 @@ pub(crate) fn ssh_host(
         matches.next().is_none(),
         "ambiguous publisher label; use its stable endpoint ID"
     );
-    Ok(SyncedAttachment {
-        record_id: record.record_id,
-        service_revision: record.service_revision,
-        endpoint_ticket: record.endpoint_ticket.clone(),
-        endpoint_identity: record.endpoint_identity,
-        attach_capability: record.attach_capability,
-        attached_version: record.attached_version,
-        herdr_version: record.herdr_version,
-        expires_at: record.expires_at,
-        session: String::new(),
-    })
+    Ok(record.ssh_attachment())
 }
 
 #[tracing::instrument(name = "load_sync_catalog", level = "debug", skip_all)]
