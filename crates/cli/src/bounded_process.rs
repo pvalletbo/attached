@@ -351,9 +351,10 @@ mod tests {
                 .arg(format!("printf '0123456789abcdefX'{redirect}\nsleep 30\n"));
             let started = Instant::now();
 
-            let error = run_command(command, Duration::from_secs(3), 16)
-                .unwrap_err()
-                .to_string();
+            let error = match run_command(command, Duration::from_secs(3), 16) {
+                Ok(_) => panic!("{stream} overflow was accepted"),
+                Err(error) => error.to_string(),
+            };
 
             assert!(error.contains("more than 16 bytes"), "{stream}: {error}");
             assert!(
