@@ -22,6 +22,7 @@ mod serve_handoff;
 mod server;
 mod session;
 mod session_picker;
+mod ssh;
 mod sync;
 mod tunnel;
 

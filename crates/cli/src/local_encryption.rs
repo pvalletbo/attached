@@ -51,6 +51,11 @@ const COORDINATION_DIRECTORY: &str = "attached-encryption";
 const MASTER_KEY_LOCK: &str = "local-master-key.lock";
 
 static USE_ONE_PASSWORD: AtomicBool = AtomicBool::new(false);
+static NONINTERACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn configure_noninteractive(enabled: bool) {
+    NONINTERACTIVE.store(enabled, Ordering::SeqCst);
+}
 
 #[cfg(not(test))]
 struct HandoffMasterKeyStore(Zeroizing<[u8; MASTER_KEY_BYTES]>);
@@ -107,6 +112,10 @@ struct TtyPasswordPrompt;
 #[cfg(not(test))]
 impl PasswordPrompt for TtyPasswordPrompt {
     fn read_password(&self, prompt: &str) -> Result<Zeroizing<Vec<u8>>> {
+        ensure!(
+            !NONINTERACTIVE.load(Ordering::SeqCst),
+            "Attached credentials are locked; run `attached ssh --expose-config HOST` in a terminal, or configure an unlocked 1Password CLI for noninteractive SSH"
+        );
         let password = rpassword::prompt_password(prompt)
             .context("could not read the encryption password from the controlling terminal")?;
         Ok(Zeroizing::new(password.into_bytes()))
@@ -710,6 +719,7 @@ pub(crate) enum Purpose {
     AdminIdentity,
     SyncAccount,
     SyncCatalog,
+    SshHost,
 }
 
 impl Purpose {
@@ -718,6 +728,7 @@ impl Purpose {
             Self::AdminIdentity => b"attached/local-secret/v1/admin-identity",
             Self::SyncAccount => b"attached/local-secret/v1/sync-account",
             Self::SyncCatalog => b"attached/local-secret/v1/sync-catalog",
+            Self::SshHost => b"attached/local-secret/v1/ssh-host",
         }
     }
 
@@ -726,6 +737,7 @@ impl Purpose {
             Self::AdminIdentity => "admin_identity",
             Self::SyncAccount => "sync_account",
             Self::SyncCatalog => "sync_catalog",
+            Self::SshHost => "ssh_host",
         }
     }
 }

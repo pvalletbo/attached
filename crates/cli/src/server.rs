@@ -317,6 +317,7 @@ async fn bind_server_endpoint(
             TUNNEL_ALPN.to_vec(),
             UPGRADE_ALPN.to_vec(),
             ATTACHED_UPDATE_ALPN.to_vec(),
+            crate::ssh::ALPN.to_vec(),
         ])
         .hooks(ConsumerIdentityAuthorization::new(
             authorized_consumer_identity,
@@ -1082,6 +1083,12 @@ async fn serve_endpoint(
                         let connection = timeout(AUTHENTICATION_TIMEOUT, incoming)
                             .await
                             .context("Iroh connection handshake timed out")??;
+                        if connection.alpn() == crate::ssh::ALPN {
+                            drop(pending_permit);
+                            let _permit = authenticated.try_acquire_owned()
+                                .context("authenticated connection capacity is exhausted")?;
+                            return crate::ssh::serve(connection, update_resources.config.state_dir.clone(), capability, child_cancellation, update_resources.master_key.clone()).await;
+                        }
                         if connection.alpn() == ATTACHED_UPDATE_ALPN {
                             drop(pending_permit);
                             return serve_attached_update_connection(

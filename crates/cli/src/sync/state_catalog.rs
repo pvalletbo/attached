@@ -149,6 +149,41 @@ impl CatalogRecord {
     }
 }
 
+/// Resolve a publisher independent of its session list or Herdr version.
+/// Stable endpoint IDs are accepted; ambiguous human labels fail closed.
+pub(crate) fn ssh_host(
+    state_dir: &Path,
+    account: &AccountCredentials,
+    target: &str,
+    now: DateTime<Utc>,
+) -> Result<SyncedAttachment> {
+    let catalog = load(state_dir, account)?;
+    let mut matches = catalog.records.iter().filter(|record| {
+        !record.is_expired_at(now)
+            && (record.host_label == target
+                || iroh::EndpointId::from_bytes(&record.endpoint_identity)
+                    .is_ok_and(|id| id.to_string() == target))
+    });
+    let record = matches
+        .next()
+        .context("SSH publisher not found; use its host label or stable endpoint ID")?;
+    ensure!(
+        matches.next().is_none(),
+        "ambiguous publisher label; use its stable endpoint ID"
+    );
+    Ok(SyncedAttachment {
+        record_id: record.record_id,
+        service_revision: record.service_revision,
+        endpoint_ticket: record.endpoint_ticket.clone(),
+        endpoint_identity: record.endpoint_identity,
+        attach_capability: record.attach_capability,
+        attached_version: record.attached_version,
+        herdr_version: record.herdr_version,
+        expires_at: record.expires_at,
+        session: String::new(),
+    })
+}
+
 #[tracing::instrument(name = "load_sync_catalog", level = "debug", skip_all)]
 pub(super) fn load(state_dir: &Path, account: &AccountCredentials) -> Result<Catalog> {
     with_locked_existing(state_dir, CATALOG_LOCK, |directory| {
@@ -598,6 +633,37 @@ mod tests {
             herdr_version: [1, 2, 3],
             sessions: vec![session.to_owned()],
         }
+    }
+
+    #[test]
+    fn ssh_resolves_publishers_without_sessions_and_rejects_ambiguous_or_expired_hosts() {
+        let root = crate::test_support::canonical_tempdir();
+        let state_dir = root.path().join("state");
+        super::super::state::test_support::create_account(&state_dir, "https://sync.example")
+            .unwrap();
+        let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
+        let mut catalog = Catalog::empty(&account);
+        let mut host = record(0x51, "office", "work");
+        host.sessions.clear();
+        let id = iroh::EndpointId::from_bytes(&host.endpoint_identity)
+            .unwrap()
+            .to_string();
+        catalog.records.push(host);
+        save(&state_dir, &account, &catalog).unwrap();
+        let now = timestamp(1_700_000_000);
+        assert!(
+            ssh_host(&state_dir, &account, "office", now)
+                .unwrap()
+                .session
+                .is_empty()
+        );
+        assert!(ssh_host(&state_dir, &account, &id, now).is_ok());
+        assert!(ssh_host(&state_dir, &account, "office/work", now).is_err());
+        catalog.records.push(record(0x52, "office", "another"));
+        save(&state_dir, &account, &catalog).unwrap();
+        assert!(ssh_host(&state_dir, &account, "office", now).is_err());
+        assert!(ssh_host(&state_dir, &account, &id, now).is_ok());
+        assert!(ssh_host(&state_dir, &account, &id, timestamp(1_900_000_000)).is_err());
     }
 
     #[test]

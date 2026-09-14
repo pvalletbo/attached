@@ -123,6 +123,196 @@ async fn checked_request(listener: &TcpListener, record: bool) -> tokio::net::Tc
     stream
 }
 
+struct MockSsh {
+    key: russh::keys::PublicKey,
+}
+impl russh::server::Handler for MockSsh {
+    type Error = anyhow::Error;
+    async fn auth_publickey(
+        &mut self,
+        user: &str,
+        key: &russh::keys::PublicKey,
+    ) -> anyhow::Result<russh::server::Auth> {
+        Ok(
+            if user == "ssh-test" && key.key_data() == self.key.key_data() {
+                russh::server::Auth::Accept
+            } else {
+                russh::server::Auth::reject()
+            },
+        )
+    }
+    async fn channel_open_session(
+        &mut self,
+        _: russh::Channel<russh::server::Msg>,
+        reply: russh::server::ChannelOpenHandle,
+        _: &mut russh::server::Session,
+    ) -> anyhow::Result<()> {
+        reply.accept().await;
+        Ok(())
+    }
+    async fn exec_request(
+        &mut self,
+        channel: russh::ChannelId,
+        command: &[u8],
+        session: &mut russh::server::Session,
+    ) -> anyhow::Result<()> {
+        assert_eq!(command, b"printf expected");
+        session.channel_success(channel)?;
+        session.data(channel, b"expected".to_vec())?;
+        session.extended_data(channel, 1, b"expected-error".to_vec())?;
+        session.exit_status_request(channel, 7)?;
+        session.eof(channel)?;
+        session.close(channel)?;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn ssh_command_provisions_credentials_invokes_openssh_and_preserves_exit_status() {
+    use std::sync::Arc;
+    use tokio::io::AsyncReadExt;
+    let fixture = CliFixture::new();
+    let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", http.local_addr().unwrap());
+    import(&fixture, &origin).await;
+    let publisher = Endpoint::builder(presets::N0)
+        .clear_ip_transports()
+        .bind_addr_with_opts(
+            (Ipv4Addr::LOCALHOST, 0),
+            BindOpts::default().set_prefix_len(8),
+        )
+        .unwrap()
+        .relay_mode(RelayMode::Disabled)
+        .clear_address_lookup()
+        .alpns(vec![attached_tunnel_protocol::SSH_ALPN.to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let (index, record) = catalog(&EndpointTicket::new(publisher.addr()).to_string(), 1);
+    let http_task = tokio::spawn(async move {
+        respond(&mut checked_request(&http, false).await, &index, "").await;
+        respond(
+            &mut checked_request(&http, true).await,
+            &record,
+            "ETag: \"1\"\r\n",
+        )
+        .await;
+    });
+    let endpoint = publisher.clone();
+    let ssh_task = tokio::spawn(async move {
+        let key = russh::keys::PrivateKey::new(
+            russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[77; 32]).into(),
+            "test",
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let connection = endpoint.accept().await.unwrap().await.unwrap();
+            assert_eq!(
+                connection.remote_id(),
+                iroh::SecretKey::from_bytes(&IDENTITY).public()
+            );
+            let (mut send, mut receive) = connection.accept_bi().await.unwrap();
+            let length = receive.read_u32().await.unwrap() as usize;
+            assert!(length <= 8192);
+            let mut bytes = vec![0; length];
+            receive.read_exact(&mut bytes).await.unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(request["capability"], serde_json::json!([46; 32].to_vec()));
+            let public_key =
+                russh::keys::PublicKey::from_openssh(request["public_key"].as_str().unwrap())
+                    .unwrap();
+            let response = serde_json::to_vec(&serde_json::json!({ "username": "ssh-test", "host_key": key.public_key().to_openssh().unwrap() })).unwrap();
+            send.write_u32(response.len() as u32).await.unwrap();
+            send.write_all(&response).await.unwrap();
+            let config = russh::server::Config {
+                keys: vec![key.clone()],
+                ..Default::default()
+            };
+            if let Ok(session) = russh::server::run_stream(
+                Arc::new(config),
+                tokio::io::join(receive, send),
+                MockSsh { key: public_key },
+            )
+            .await
+            {
+                let _ = session.await;
+            }
+            connection.close(0u32.into(), b"test completed");
+        }
+    });
+    let output = fixture
+        .run(&[
+            "--use-1password",
+            "ssh",
+            "--no-cache",
+            "remote",
+            "printf expected",
+        ])
+        .await;
+    output.assert_code(7);
+    assert_eq!(output.stdout, "expected");
+    assert_eq!(output.stderr, "expected-error");
+    timeout(DEADLINE, http_task).await.unwrap().unwrap();
+    timeout(DEADLINE, ssh_task).await.unwrap().unwrap();
+    publisher.close().await;
+    assert_private(&fixture.path("home/.config/attached/ssh-pins.json"));
+    assert!(!fs::read_dir(fixture.path("tmp")).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("attached-ssh-")
+    }));
+}
+
+#[tokio::test]
+async fn ssh_local_proxy_preserves_binary_and_half_close_without_loading_credentials() {
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+    let fixture = CliFixture::new();
+    fs::create_dir_all(fixture.path("home/.config/attached")).unwrap();
+    fs::write(
+        fixture.path("home/.config/attached/config.toml"),
+        "invalid = [",
+    )
+    .unwrap();
+    let socket = fixture.path("ssh.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let mut command = fixture.command(&["__ssh-local-proxy", socket.to_str().unwrap()]);
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let payload = (0..256 * 1024).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+    let input = payload.clone();
+    let mut stdin = child.stdin.take().unwrap();
+    let writer = tokio::spawn(async move {
+        stdin.write_all(&input).await.unwrap();
+        drop(stdin);
+    });
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).await.unwrap();
+        bytes.extend_from_slice(b"after-eof");
+        stream.write_all(&bytes).await.unwrap();
+        stream.shutdown().await.unwrap();
+    });
+    let output = timeout(DEADLINE, child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    writer.await.unwrap();
+    server.await.unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert!(output.stderr.is_empty());
+    let mut expected = payload;
+    expected.extend_from_slice(b"after-eof");
+    assert_eq!(output.stdout, expected);
+}
+
 #[tokio::test]
 async fn help_version_completions_and_usage_errors_are_real_process_contracts() {
     let fixture = CliFixture::new();
