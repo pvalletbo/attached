@@ -172,11 +172,16 @@ pub(crate) fn ssh_host(
     now: DateTime<Utc>,
 ) -> Result<SyncedAttachment> {
     let catalog = load(state_dir, account)?;
+    // An explicit endpoint identity must never fall back to a mutable label.
+    // Otherwise another publisher can name itself after an absent/expired host's
+    // ID and bypass the caller's identity selection (and its existing host pin).
+    let target_identity = target.parse::<iroh::EndpointId>().ok();
     let mut matches = catalog.records.iter().filter(|record| {
         !record.is_expired_at(now)
-            && (record.host_label == target
-                || iroh::EndpointId::from_bytes(&record.endpoint_identity)
-                    .is_ok_and(|id| id.to_string() == target))
+            && match target_identity {
+                Some(identity) => &record.endpoint_identity == identity.as_bytes(),
+                None => record.host_label == target,
+            }
     });
     let record = matches
         .next()
@@ -668,6 +673,47 @@ mod tests {
         assert!(ssh_host(&state_dir, &account, "office", now).is_err());
         assert!(ssh_host(&state_dir, &account, &id, now).is_ok());
         assert!(ssh_host(&state_dir, &account, &id, timestamp(1_900_000_000)).is_err());
+    }
+
+    #[test]
+    fn explicit_ssh_endpoint_identity_never_matches_another_publishers_label() {
+        let root = crate::test_support::canonical_tempdir();
+        let state_dir = root.path().join("state");
+        super::super::state::test_support::create_account(&state_dir, "https://sync.example")
+            .unwrap();
+        let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
+        let mut catalog = Catalog::empty(&account);
+        let intended = record(0x61, "office", "work");
+        let identity = iroh::EndpointId::from_bytes(&intended.endpoint_identity).unwrap();
+        let target = identity.to_string();
+        let other = record(0x62, &target, "other");
+        let now = timestamp(1_700_000_000);
+
+        // A label cannot impersonate an absent endpoint, even on first use.
+        catalog.records = vec![other.clone()];
+        save(&state_dir, &account, &catalog).unwrap();
+        assert!(ssh_host(&state_dir, &account, &target, now).is_err());
+
+        // Nor may an expired descriptor redirect a previously pinned identity.
+        let mut expired = intended.clone();
+        expired.published_at = Some(now - chrono::Duration::seconds(90));
+        expired.expires_at = now;
+        catalog.records = vec![expired, other.clone()];
+        save(&state_dir, &account, &catalog).unwrap();
+        assert!(ssh_host(&state_dir, &account, &target, now).is_err());
+
+        // When the intended endpoint is present, its identity takes precedence
+        // over a colliding label; normal human-label selection still works.
+        catalog.records = vec![intended, other];
+        save(&state_dir, &account, &catalog).unwrap();
+        for target in [&*target, "office"] {
+            assert_eq!(
+                ssh_host(&state_dir, &account, target, now)
+                    .unwrap()
+                    .endpoint_identity,
+                *identity.as_bytes(),
+            );
+        }
     }
 
     #[test]

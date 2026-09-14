@@ -302,12 +302,7 @@ async fn run(
         }
         return Ok(0);
     }
-    let mut child = tokio::process::Command::new("ssh")
-        .arg("-F")
-        .arg(&config_path)
-        .arg("-T")
-        .arg(&alias)
-        .args(command)
+    let mut child = openssh_command(&config_path, &alias, &command)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -321,6 +316,23 @@ async fn run(
     cancellation.cancel();
     broker.await?;
     Ok(status.code().unwrap_or(255))
+}
+
+fn openssh_command(
+    config: &Path,
+    alias: &str,
+    remote_command: &[String],
+) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("ssh");
+    // OpenSSH also parses options after the destination. End option parsing
+    // before it so remote command arguments cannot override local SSH policy
+    // or select a different local ProxyCommand.
+    command
+        .args(["-F"])
+        .arg(config)
+        .args(["-T", "--", alias])
+        .args(remote_command);
+    command
 }
 
 fn loopback_only(address: &iroh::EndpointAddr) -> bool {
@@ -408,6 +420,58 @@ mod tests {
             );
         }
         assert!(config.contains("Attached'\\''s binary"));
+    }
+
+    #[test]
+    fn remote_command_arguments_cannot_override_local_openssh_options() {
+        let root = crate::test_support::canonical_tempdir();
+        let config = root.path().join("config");
+        std::fs::write(
+            &config,
+            configuration(
+                "attached-stable-id",
+                "account",
+                root.path(),
+                Path::new("/bin/attached"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let remote = vec![
+            "-oIdentityAgent=/tmp/unwanted-agent".to_owned(),
+            "-oStrictHostKeyChecking=no".to_owned(),
+            "-oProxyCommand=unwanted-local-command".to_owned(),
+            "argument with spaces".to_owned(),
+        ];
+        let command = openssh_command(&config, "attached-stable-id", &remote);
+        let args = command.as_std().get_args().collect::<Vec<_>>();
+        assert_eq!(args[3], "--");
+        assert_eq!(args[4], "attached-stable-id");
+        assert_eq!(
+            args[5..],
+            remote.iter().map(std::ffi::OsStr::new).collect::<Vec<_>>()
+        );
+        // Ask real OpenSSH to parse the production argv without connecting or
+        // executing anything. These remote arguments must remain remote data.
+        let output = std::process::Command::new(command.as_std().get_program())
+            .arg("-G")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let effective = String::from_utf8(output.stdout).unwrap();
+        assert!(effective.lines().any(|line| line == "identityagent none"));
+        assert!(
+            effective
+                .lines()
+                .any(|line| line == "stricthostkeychecking true")
+        );
+        assert!(!effective.contains("unwanted-local-command"));
+        assert!(effective.contains("__ssh-local-proxy"));
     }
 
     #[test]
