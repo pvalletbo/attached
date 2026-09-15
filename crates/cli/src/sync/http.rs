@@ -354,10 +354,7 @@ mod content_type_tests {
             "private=\"x, no-store, y\"",
             "private=\"unterminated, no-store",
         ] {
-            assert!(
-                !cache_control_value_has_no_store(value),
-                "accepted {value}"
-            );
+            assert!(!cache_control_value_has_no_store(value), "accepted {value}");
         }
 
         let mut headers = HeaderMap::new();
