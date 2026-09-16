@@ -108,6 +108,45 @@ enum Command {
         state_dir: Option<PathBuf>,
     },
 
+    /// Execute a command or a non-PTY shell through an authorized publisher tunnel.
+    ///
+    /// Uses system OpenSSH and automatic, connection-scoped keys. Publisher consent:
+    /// `attached ssh-access enable`. Commands run as the publisher's OS account.
+    /// For concurrent relayed connections, use one --expose-config broker: separate
+    /// Attached processes share the consumer Iroh identity and can displace one
+    /// another on relays.
+    Ssh {
+        /// Publisher host label or stable endpoint ID (not HOST/SESSION).
+        target: String,
+        /// Print an OpenSSH configuration path and serve it in the foreground until Ctrl-C.
+        /// Use `ssh -F PATH attached-ENDPOINT-ID`; nothing modifies ~/.ssh/config.
+        #[arg(long, conflicts_with = "command")]
+        expose_config: bool,
+        /// Refresh publisher discovery before connecting.
+        #[arg(long)]
+        no_cache: bool,
+        /// Deliberately replace this stable publisher's pinned SSH host identity.
+        /// Use only after independently verifying the publisher's key/account change.
+        #[arg(long)]
+        trust_new_host_key: bool,
+        #[arg(long, hide = true)]
+        state_dir: Option<PathBuf>,
+        /// Command interpreted by the publisher's account shell; omit for a non-PTY shell.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+
+    /// Grant or revoke persistent account-level SSH access for the configured consumer.
+    SshAccess {
+        #[command(subcommand)]
+        command: SshAccessCommand,
+        #[arg(long, hide = true, global = true)]
+        state_dir: Option<PathBuf>,
+    },
+
+    #[command(name = "__ssh-local-proxy", hide = true)]
+    SshLocalProxy { socket: PathBuf },
+
     /// Update Attached to the latest release locally or on a synchronized host.
     #[command(visible_alias = "upgrade")]
     Update {
@@ -136,6 +175,14 @@ enum Command {
         #[arg(short = 'y', long)]
         yes: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum SshAccessCommand {
+    /// Permit arbitrary shell execution as this publisher OS account. Persists until disabled.
+    Enable,
+    /// Reject new SSH connections and cancel existing ones within one second.
+    Disable,
 }
 
 const DEFAULT_SERVICE_ORIGIN: &str = "https://herdr.attached.sh";
@@ -236,12 +283,45 @@ impl Cli {
             return Ok(0);
         }
 
+        if let Command::SshLocalProxy { socket } = &self.command {
+            return crate::ssh::local_proxy(socket.clone()).await;
+        }
+
         let configuration =
             config::Config::load().context("could not load Attached configuration")?;
         local_encryption::configure_use_one_password(
             self.use_1password || configuration.password_source() == PasswordSource::OnePassword,
         );
         match self.command {
+            Command::Ssh {
+                target,
+                command,
+                expose_config,
+                no_cache,
+                trust_new_host_key,
+                state_dir,
+            } => {
+                use std::io::IsTerminal;
+                local_encryption::configure_noninteractive(
+                    !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal(),
+                );
+                let state_dir = resolved_state_dir(state_dir, &configuration)?;
+                crate::ssh::connect(
+                    &state_dir,
+                    &target,
+                    command,
+                    expose_config,
+                    no_cache,
+                    trust_new_host_key,
+                )
+                .await
+            }
+            Command::SshAccess { command, state_dir } => {
+                let state_dir = resolved_state_dir(state_dir, &configuration)?;
+                crate::ssh::set_access(&state_dir, matches!(command, SshAccessCommand::Enable))?;
+                Ok(0)
+            }
+            Command::SshLocalProxy { .. } => unreachable!(),
             Command::Account { command } => {
                 match command {
                     AccountCommand::Create { service, state_dir } => {
@@ -523,6 +603,38 @@ mod tests {
     use clap::{CommandFactory, Parser};
 
     use super::*;
+
+    #[test]
+    fn ssh_cli_preserves_openssh_style_commands_and_explicit_consent() {
+        let cli = Cli::try_parse_from(["attached", "ssh", "host", "printf", "%s", "--remote-flag"])
+            .unwrap();
+        assert!(
+            matches!(cli.command, Command::Ssh { target, command, .. } if target == "host" && command == ["printf", "%s", "--remote-flag"])
+        );
+        let cli = Cli::try_parse_from([
+            "attached",
+            "ssh",
+            "--expose-config",
+            "--trust-new-host-key",
+            "host",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Ssh {
+                expose_config: true,
+                trust_new_host_key: true,
+                ..
+            }
+        ));
+        assert!(
+            Cli::try_parse_from(["attached", "ssh", "--expose-config", "host", "cmd"]).is_err()
+        );
+        for action in ["enable", "disable"] {
+            assert!(Cli::try_parse_from(["attached", "ssh-access", action]).is_ok());
+        }
+        assert!(Cli::try_parse_from(["attached", "ssh-access"]).is_err());
+    }
 
     #[test]
     fn attach_cache_is_enabled_by_default_and_can_be_bypassed() {
