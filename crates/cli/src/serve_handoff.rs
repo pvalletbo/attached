@@ -17,7 +17,7 @@ use tokio::{
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
-use zeroize::Zeroize as _;
+use zeroize::{Zeroize as _, Zeroizing};
 
 pub(crate) const INTERNAL_COMMAND: &str = "__handoff-serve";
 const MAX_IPC_MESSAGE_BYTES: usize = 16 * 1024;
@@ -326,13 +326,17 @@ impl CandidateIpc {
     }
 }
 
+fn message_buffer() -> Zeroizing<Vec<u8>> {
+    Zeroizing::new(Vec::new())
+}
+
 async fn write_message<W, T>(writer: &mut W, message: &T) -> Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
     T: Serialize,
 {
-    let mut encoded =
-        serde_json::to_vec(message).context("could not encode handoff IPC message")?;
+    let mut encoded = message_buffer();
+    serde_json::to_writer(&mut *encoded, message).context("could not encode handoff IPC message")?;
     ensure!(
         encoded.len() <= MAX_IPC_MESSAGE_BYTES,
         "handoff IPC message is too large"
@@ -353,9 +357,9 @@ where
     R: tokio::io::AsyncBufRead + Unpin,
     T: DeserializeOwned,
 {
-    let mut encoded = Vec::new();
+    let mut encoded = message_buffer();
     let read = reader
-        .read_until(b'\n', &mut encoded)
+        .read_until(b'\n', &mut *encoded)
         .await
         .context("could not read handoff IPC message")?;
     if read == 0 {
@@ -439,6 +443,13 @@ mod tests {
         assert!(!shutdown_requires_exit(Signal::HUP));
         assert!(shutdown_requires_exit(Signal::INT));
         assert!(shutdown_requires_exit(Signal::TERM));
+    }
+
+    #[test]
+    fn ipc_message_buffers_are_zeroizing() {
+        fn assert_zeroizing(_: &Zeroizing<Vec<u8>>) {}
+
+        assert_zeroizing(&message_buffer());
     }
 
     #[tokio::test]
