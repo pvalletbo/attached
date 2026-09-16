@@ -23,6 +23,11 @@ allow = [
 multiple-versions = "warn"
 wildcards = "allow"
 highlight = "all"
+# Keep the panic-safety regression blocked even if an advisory scanner treats
+# RUSTSEC-2026-0253 as informational rather than a vulnerability.
+deny = [
+    { name = "lru", version = "<0.18.2", reason = "RUSTSEC-2026-0253: LruCache::pop is not panic-safe" },
+]
 
 [sources]
 unknown-registry = "deny"
