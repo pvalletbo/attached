@@ -11,8 +11,14 @@ packages = ["attached"]
 precise-builds = true
 # Reuse dependency build artifacts between releases.
 cache-builds = true
-# Generate the GitHub release workflow and publish to GitHub Releases.
+# Use cargo-dist's GitHub artifact plan, with a maintained release.yml input boundary.
 ci = "github"
+# cargo-dist 0.32 interpolates dispatch tags into shell source and runs plan-jobs
+# concurrently with privileged planning. Preserve our validation dependency and
+# environment/argv handling: ordinary `dist generate` skips CI; explicit CI
+# generation is refused. scripts/test_release_workflow.py guards this customization.
+# Revisit this CI-only opt-out when upgrading cargo-dist; other checks stay enabled.
+allow-dirty = ["ci"]
 # Release tags created by the cut-release workflow use GITHUB_TOKEN, so launch
 # cargo-dist through an explicit workflow dispatch instead of a tag-push event.
 dispatch-releases = true
@@ -33,7 +39,7 @@ targets = [
 ]
 # Validate the release plan on pull requests without building or publishing artifacts.
 pr-run-mode = "plan"
-# Reject anything except stable vX.Y.Z tags before release builds start.
+# release.yml additionally requires this check BEFORE its built-in plan job.
 plan-jobs = ["./release-tag-check"]
 # Generate checksums and attest every artifact before creating the GitHub Release.
 checksum = "sha256"
