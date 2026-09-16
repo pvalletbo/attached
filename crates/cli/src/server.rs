@@ -1022,6 +1022,23 @@ async fn serve_attached_update_connection(
     }
 }
 
+async fn with_authenticated_admission<Serve>(
+    pending_permit: OwnedSemaphorePermit,
+    authenticated: Arc<Semaphore>,
+    serve: Serve,
+) -> Result<()>
+where
+    Serve: std::future::Future<Output = Result<()>>,
+{
+    // Admit before polling any handler work, and retain the connection slot through
+    // framing, preparation and confirmation. The update-operation permit is separate.
+    let _admission = authenticated
+        .try_acquire_owned()
+        .context("authenticated connection capacity is exhausted")?;
+    drop(pending_permit);
+    serve.await
+}
+
 async fn shutdown_connections(connections: &mut JoinSet<Result<()>>) {
     // Admission has stopped and tunnel cancellation has been signalled. Drain every accepted
     // connection so fixed updater work remains owned until bounded_process completes or kills
@@ -1083,11 +1100,14 @@ async fn serve_endpoint(
                             .await
                             .context("Iroh connection handshake timed out")??;
                         if connection.alpn() == ATTACHED_UPDATE_ALPN {
-                            drop(pending_permit);
-                            return serve_attached_update_connection(
-                                connection,
-                                update_resources,
-                                handoff_tx,
+                            return with_authenticated_admission(
+                                pending_permit,
+                                authenticated,
+                                serve_attached_update_connection(
+                                    connection,
+                                    update_resources,
+                                    handoff_tx,
+                                ),
                             )
                             .await;
                         }
@@ -1695,19 +1715,113 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepted_updater_work_remains_owned_during_shutdown() {
-        tokio::time::timeout(Duration::from_secs(1), async {
-            let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let task_completed = completed.clone();
-            let mut connections = JoinSet::new();
-            connections.spawn(async move {
-                tokio::time::sleep(Duration::from_millis(30)).await;
-                task_completed.store(true, Ordering::SeqCst);
-                Ok(())
-            });
+    async fn attached_update_admission_bounds_connections_before_handler_work() {
+        timeout(Duration::from_secs(1), async {
+            let pending = Arc::new(Semaphore::new(2));
+            let authenticated = Arc::new(Semaphore::new(1));
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let (finish, finished) = tokio::sync::oneshot::channel();
+            let accepted = tokio::spawn(with_authenticated_admission(
+                pending.clone().try_acquire_owned().unwrap(),
+                authenticated.clone(),
+                async move {
+                    started.send(()).unwrap();
+                    // Model an admitted update waiting for a capability frame or confirmation.
+                    finished.await.unwrap();
+                    Ok(())
+                },
+            ));
+            ready.await.unwrap();
+            assert_eq!(pending.available_permits(), 2);
+            assert_eq!(authenticated.available_permits(), 0);
 
-            shutdown_connections(&mut connections).await;
+            let handler_started = AtomicBool::new(false);
+            let rejected = with_authenticated_admission(
+                pending.clone().try_acquire_owned().unwrap(),
+                authenticated.clone(),
+                async {
+                    handler_started.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await;
+            assert!(
+                rejected
+                    .unwrap_err()
+                    .to_string()
+                    .contains("capacity is exhausted")
+            );
+            assert!(
+                !handler_started.load(Ordering::SeqCst),
+                "rejection polled handler work"
+            );
+            assert_eq!(pending.available_permits(), 2);
+            assert_eq!(authenticated.available_permits(), 0);
+
+            finish.send(()).unwrap();
+            accepted.await.unwrap().unwrap();
+            assert_eq!(authenticated.available_permits(), 1);
+
+            // Capacity becomes reusable, including when the next admitted handler fails.
+            let result = with_authenticated_admission(
+                pending.clone().try_acquire_owned().unwrap(),
+                authenticated.clone(),
+                async {
+                    assert_eq!(authenticated.available_permits(), 0);
+                    bail!("synthetic handler failure")
+                },
+            )
+            .await;
+            assert_eq!(result.unwrap_err().to_string(), "synthetic handler failure");
+            assert_eq!(pending.available_permits(), 2);
+            assert_eq!(authenticated.available_permits(), 1);
+        })
+        .await
+        .expect("Attached update admission scenario timed out");
+    }
+
+    #[tokio::test]
+    async fn accepted_updater_work_remains_owned_during_shutdown() {
+        timeout(Duration::from_secs(1), async {
+            let completed = Arc::new(AtomicBool::new(false));
+            let task_completed = completed.clone();
+            let pending = Arc::new(Semaphore::new(1));
+            let authenticated = Arc::new(Semaphore::new(1));
+            let updater = Arc::new(Semaphore::new(1));
+            let task_updater = updater.clone();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let (finish, finished) = tokio::sync::oneshot::channel();
+            let mut connections = JoinSet::new();
+            connections.spawn(with_authenticated_admission(
+                pending.clone().try_acquire_owned().unwrap(),
+                authenticated.clone(),
+                async move {
+                    let _operation = task_updater.try_acquire_owned().unwrap();
+                    started.send(()).unwrap();
+                    finished.await.unwrap();
+                    task_completed.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+            ));
+            ready.await.unwrap();
+
+            let shutdown = shutdown_connections(&mut connections);
+            tokio::pin!(shutdown);
+            tokio::select! {
+                biased;
+                () = &mut shutdown => panic!("shutdown abandoned accepted updater work"),
+                () = tokio::task::yield_now() => {}
+            }
+            assert!(!completed.load(Ordering::SeqCst));
+            assert_eq!(pending.available_permits(), 1);
+            assert_eq!(authenticated.available_permits(), 0);
+            assert_eq!(updater.available_permits(), 0);
+
+            finish.send(()).unwrap();
+            shutdown.await;
             assert!(completed.load(Ordering::SeqCst));
+            assert_eq!(authenticated.available_permits(), 1);
+            assert_eq!(updater.available_permits(), 1);
         })
         .await
         .expect("shutdown ownership scenario timed out");
