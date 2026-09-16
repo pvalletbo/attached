@@ -58,8 +58,6 @@ pub(super) struct Catalog {
     service_origin: String,
     #[serde(default)]
     generation: u64,
-    #[serde(default, with = "chrono::serde::ts_seconds_option")]
-    pub(super) refreshed_at: Option<DateTime<Utc>>,
     pub(super) records: Vec<CatalogRecord>,
 }
 
@@ -86,7 +84,6 @@ impl Catalog {
             account_id: account.account_id(),
             service_origin: account.service_origin().to_owned(),
             generation: 0,
-            refreshed_at: None,
             records: Vec::new(),
         }
     }
@@ -215,11 +212,6 @@ pub(super) fn save_refresh(
             .map(|record| (record.record_id, record))
             .collect::<std::collections::BTreeMap<_, _>>();
         let mut reconciled = Catalog::empty(account);
-        // A concurrent refresh may have removed hosts or invalidated freshness.
-        // Reconcile conservatively without caching a potentially partial result.
-        reconciled.refreshed_at = (current_generation == refreshed.generation)
-            .then_some(refreshed.refreshed_at)
-            .flatten();
         for candidate in &refreshed.records {
             // A newer completed refresh may have removed this record. Do not
             // resurrect it from an older in-flight index observation.
@@ -749,7 +741,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_refresh_cannot_resurrect_a_host_or_cache_a_partial_listing() {
+    fn stale_refresh_cannot_resurrect_a_host_without_a_fresh_observation() {
         let root = crate::test_support::canonical_tempdir();
         let state_dir = root.path().join("state");
         super::super::state::test_support::create_account(&state_dir, "https://sync.example")
@@ -758,18 +750,15 @@ mod tests {
         let mut initial = Catalog::empty(&account);
         initial.records.push(record(0x51, "office"));
         save(&state_dir, &account, &initial).unwrap();
-        let mut stale = load(&state_dir, &account).unwrap();
-        stale.refreshed_at = Some(timestamp(1_700_000_000));
+        let stale = load(&state_dir, &account).unwrap();
         let baseline = HashSet::from([(stale.records[0].record_id, 1)]);
         // A newer completed refresh saw the publisher disappear.
         save(&state_dir, &account, &Catalog::empty(&account)).unwrap();
         save_refresh(&state_dir, &account, &baseline, &stale).unwrap();
         let mut current = load(&state_dir, &account).unwrap();
         assert!(current.records.is_empty());
-        assert!(current.refreshed_at.is_none());
         // A fresh observation can discover the host again.
         current.records.push(record(0x51, "office"));
-        current.refreshed_at = Some(timestamp(1_700_000_001));
         save_refresh(&state_dir, &account, &HashSet::new(), &current).unwrap();
         assert_eq!(load(&state_dir, &account).unwrap().records.len(), 1);
     }

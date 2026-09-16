@@ -152,21 +152,7 @@ pub(crate) async fn connect(
     trust_new_host_key: bool,
 ) -> Result<i32> {
     let account = sync::state::load_account(path, ApiKeyScope::Download)?;
-    let refreshed = sync::refresh::hosts_for_connect(path, no_cache).await?;
-    for warning in refreshed.warnings {
-        if !warning.is_verbose_only() {
-            eprintln!("Warning: {warning}");
-        }
-    }
-    // A newly added or renamed target may not be in an otherwise fresh catalog.
-    if sync::state_catalog::host(path, &account, target, sync::utc_now_seconds()).is_err() {
-        sync::refresh::refresh_hosts(path).await?;
-    }
-    let attachment = sync::state_catalog::host(path, &account, target, sync::utc_now_seconds())?;
-    ensure!(
-        attachment.ssh_enabled,
-        "SSH access is disabled on this publisher; run `attached ssh-access enable` there"
-    );
+    let attachment = sync::refresh::ssh_host(path, &account, target, no_cache).await?;
     let consumer = iroh::SecretKey::from_bytes(
         account
             .consumer_identity_secret()

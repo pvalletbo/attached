@@ -8,7 +8,6 @@ use anyhow::{Context as _, Result, ensure};
 use attached_session_sync_protocol::{
     account::{ApiKeyScope, RecordId},
     api::LiveRecordIndexEntry,
-    canonical::HostAccessError,
     crypto::{Envelope as CryptoEnvelope, VerificationContext, open_host_access_descriptor},
 };
 use futures_util::{StreamExt as _, stream};
@@ -20,49 +19,35 @@ use super::{
 };
 
 const RECORD_FETCH_CONCURRENCY: usize = 8;
-const DISCOVERY_CACHE_TTL: chrono::Duration = chrono::Duration::minutes(5);
 
-/// Reuse recent, account-bound discovery without extending descriptor validity.
-pub async fn hosts_for_connect(state_dir: &Path, no_cache: bool) -> Result<RefreshResult> {
-    let now = super::utc_now_seconds();
-    if !no_cache {
-        let registry = crate::endpoint_registry::default_dir();
-        if let Ok(Some(mut cached)) =
-            cached_hosts(state_dir, registry.as_deref().unwrap_or(Path::new("")), now)
-        {
-            if registry.is_err() {
-                push_registry_warning(&mut cached.warnings);
-            }
-            return Ok(cached);
-        }
-    }
-    refresh_hosts(state_dir).await
-}
-
-fn cached_hosts(
+/// Reuse only the selected publisher's unexpired descriptor. An outage or
+/// another host's expired record must not prevent an otherwise valid SSH setup.
+pub(crate) async fn ssh_host(
     state_dir: &Path,
-    registry_dir: &Path,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<Option<RefreshResult>> {
-    let Some(account) = state::load_account_optional(state_dir, ApiKeyScope::Download)? else {
-        return Ok(None);
-    };
-    let catalog = state_catalog::load(state_dir, &account)?;
-    let fresh = catalog.refreshed_at.is_some_and(|refreshed_at| {
-        let age = now.signed_duration_since(refreshed_at);
-        (chrono::Duration::zero()..DISCOVERY_CACHE_TTL).contains(&age)
-    });
-    if !fresh {
-        return Ok(None);
+    account: &state::AccountCredentials,
+    target: &str,
+    no_cache: bool,
+) -> Result<state_catalog::HostConnection> {
+    if !no_cache
+        && let Ok(host) = state_catalog::host(state_dir, account, target, super::utc_now_seconds())
+        && host.ssh_enabled
+    {
+        return Ok(host);
     }
-    let listing =
-        state_catalog::hosts_excluding_local_endpoints(state_dir, &account, now, registry_dir)?;
-    // Empty discovery may be transient, or all cached hosts may have expired.
-    // Retry the service instead of hiding hosts for the rest of the cache TTL.
-    if listing.hosts.is_empty() {
-        return Ok(None);
+    let refreshed = refresh_hosts(state_dir).await?;
+    for warning in refreshed
+        .warnings
+        .iter()
+        .filter(|warning| !warning.is_verbose_only())
+    {
+        eprintln!("Warning: {warning}");
     }
-    Ok(Some(finish_refresh(listing, Vec::new())))
+    let host = state_catalog::host(state_dir, account, target, super::utc_now_seconds())?;
+    ensure!(
+        host.ssh_enabled,
+        "SSH access is disabled on this publisher; run `attached ssh-access enable` there"
+    );
+    Ok(host)
 }
 
 #[derive(Debug)]
@@ -171,14 +156,12 @@ async fn refresh_hosts_with_registry_at(
         .collect::<BTreeMap<_, _>>();
     let mut accepted = Vec::with_capacity(index.records.len());
     let mut changed = Vec::new();
-    let mut saw_expired_record = false;
     for indexed in index.records {
         let previous = existing.remove(&indexed.record_id);
         if let Some(previous) = previous
             && previous.service_revision == indexed.revision
         {
             if previous.is_expired_at(now) {
-                saw_expired_record = true;
                 let error = anyhow::anyhow!("host access descriptor expired");
                 tracing::debug!(
                     record_id = %indexed.record_id,
@@ -231,7 +214,6 @@ async fn refresh_hosts_with_registry_at(
             match open_host_access_descriptor(&envelope, account.account_root_key(), &context) {
                 Ok(opened) => opened,
                 Err(error) => {
-                    saw_expired_record |= error == HostAccessError::Expired;
                     tracing::debug!(
                         record_id = %indexed.record_id,
                         reason = %error,
@@ -252,13 +234,6 @@ async fn refresh_hosts_with_registry_at(
     }
     accepted.sort_by_key(|record| record.record_id);
     catalog.records = accepted;
-    // Expired descriptors may be republished immediately. Do not cache a partial
-    // listing for minutes when the service can already have a replacement revision.
-    catalog.refreshed_at = (!saw_expired_record
-        && !warnings
-            .iter()
-            .any(|warning| matches!(warning, RefreshWarning::RecordUnavailable { .. })))
-    .then_some(now);
     state_catalog::save_refresh(state_dir, &account, &baseline_revisions, &catalog)
         .context("could not save synchronized host catalog")?;
 
@@ -636,13 +611,10 @@ mod tests {
                 ],
             ));
             for _ in 0..2 {
-                let result = hosts_for_connect(&state_dir, false).await.unwrap();
-                assert!(result.hosts.is_empty());
                 assert!(
-                    state_catalog::load(&state_dir, &account)
-                        .unwrap()
-                        .refreshed_at
-                        .is_some()
+                    ssh_host(&state_dir, &account, "missing", false)
+                        .await
+                        .is_err()
                 );
             }
             server.await.unwrap();
@@ -715,42 +687,33 @@ mod tests {
                 2
             );
             server.await.unwrap();
-            // The fixture service is now offline: a fresh attach must do no HTTP.
-            let cached = hosts_for_connect(&state_dir, false).await.unwrap();
-            assert_eq!(cached.hosts, refreshed.hosts);
-            assert!(hosts_for_connect(&state_dir, true).await.is_err());
+            // A valid selected descriptor remains usable with discovery offline.
+            let cached = ssh_host(&state_dir, &account, "publisher", false)
+                .await
+                .unwrap();
+            assert_eq!(cached.service_revision, 2);
             assert!(
-                cached_hosts(&state_dir, &registry_dir, now + Duration::from_secs(299))
-                    .unwrap()
-                    .is_some()
+                ssh_host(&state_dir, &account, "publisher", true)
+                    .await
+                    .is_err()
             );
             assert!(
-                cached_hosts(&state_dir, &registry_dir, now + Duration::from_secs(300))
-                    .unwrap()
-                    .is_none()
+                state_catalog::host(
+                    &state_dir,
+                    &account,
+                    "publisher",
+                    now + Duration::from_secs(299)
+                )
+                .is_ok()
             );
             assert!(
-                cached_hosts(&state_dir, &registry_dir, now - Duration::from_secs(1))
-                    .unwrap()
-                    .is_none()
-            );
-
-            // A fresh discovery timestamp never prolongs an expired descriptor.
-            let mut catalog = state_catalog::load(&state_dir, &account).unwrap();
-            catalog.refreshed_at = Some(now + Duration::from_secs(299));
-            state_catalog::save(&state_dir, &account, &catalog).unwrap();
-            assert!(
-                cached_hosts(&state_dir, &registry_dir, now + Duration::from_secs(300))
-                    .unwrap()
-                    .is_none()
-            );
-            // Catalogs written before caching was introduced require a refresh.
-            catalog.refreshed_at = None;
-            state_catalog::save(&state_dir, &account, &catalog).unwrap();
-            assert!(
-                cached_hosts(&state_dir, &registry_dir, now)
-                    .unwrap()
-                    .is_none()
+                state_catalog::host(
+                    &state_dir,
+                    &account,
+                    "publisher",
+                    now + Duration::from_secs(300)
+                )
+                .is_err()
             );
         })
         .await
@@ -825,22 +788,14 @@ mod tests {
                 assert_eq!(refreshed.hosts[0].host, "stable", "{scenario}");
                 let persisted = state_catalog::load(&state_dir, &account).unwrap();
                 assert!(persisted.records.iter().all(|record| record.record_id == stable), "{scenario}");
-                if scenario == "expired" {
-                    assert!(persisted.refreshed_at.is_none(), "expired partial catalog was cached");
-                    assert!(
-                        cached_hosts(&state_dir, &registry_dir, now).unwrap().is_none(),
-                        "expired host was hidden behind a fresh partial catalog"
-                    );
-                } else if scenario == "invalid" {
-                    assert!(
-                        persisted.refreshed_at.is_some(),
-                        "permanently invalid records should not disable cache reuse"
-                    );
-                }
                 if !matches!(scenario, "invalid" | "expired") {
                     assert!(refreshed.warnings.iter().any(|warning| matches!(warning, RefreshWarning::RecordUnavailable { record_id, .. } if *record_id == changing)), "{scenario}");
                 }
                 server.await.unwrap();
+                // The service has gone offline. Unavailable or expired neighbors
+                // must not invalidate the healthy publisher's cached SSH lease.
+                assert!(ssh_host(&state_dir, &account, "stable", false).await.is_ok(), "{scenario}");
+                assert!(ssh_host(&state_dir, &account, "changing", false).await.is_err(), "{scenario}");
             }
         }).await.expect("bounded reconciliation scenarios timed out");
     }
@@ -1171,16 +1126,6 @@ mod tests {
                 refreshed_after_expiration.warnings
             );
             let persisted_catalog = state_catalog::load(&state_dir, &account).unwrap();
-            assert!(
-                persisted_catalog.refreshed_at.is_none(),
-                "a partial catalog with an expired host was marked fresh"
-            );
-            assert!(
-                cached_hosts(&state_dir, &registry_dir, now + Duration::from_secs(2))
-                    .unwrap()
-                    .is_none(),
-                "an expired host was hidden behind a reusable partial catalog"
-            );
             assert!(
                 persisted_catalog.records.iter().all(|record| {
                     ![

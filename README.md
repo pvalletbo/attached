@@ -96,8 +96,9 @@ a listed machine is not a guarantee that a live connection will succeed. Locally
 endpoints are omitted from the remote listing. Labels can collide: use the full endpoint ID to
 select a particular machine. Ambiguous labels are rejected rather than selected arbitrarily.
 
-`attached ssh` reuses recent discovery without extending a publisher's lease. Use `--no-cache`
-to force a refresh. Long-lived brokers renew their selected publisher by stable identity when a
+`attached ssh` reuses its selected publisher's unexpired descriptor, even during a discovery outage
+or when another host is unavailable. It never extends the lease; use `--no-cache` to force a refresh.
+Long-lived brokers renew their selected publisher by stable identity when a
 new SSH connection needs fresh connection details; existing byte streams do not depend on renewal.
 
 For clients that already know how to invoke OpenSSH, expose a temporary configuration:
