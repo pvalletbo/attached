@@ -360,7 +360,7 @@ where
 {
     let mut encoded = message_buffer();
     let read = reader
-        .read_until(b'\n', &mut *encoded)
+        .read_until(b'\n', &mut encoded)
         .await
         .context("could not read handoff IPC message")?;
     if read == 0 {
