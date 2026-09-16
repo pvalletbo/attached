@@ -336,7 +336,8 @@ where
     T: Serialize,
 {
     let mut encoded = message_buffer();
-    serde_json::to_writer(&mut *encoded, message).context("could not encode handoff IPC message")?;
+    serde_json::to_writer(&mut *encoded, message)
+        .context("could not encode handoff IPC message")?;
     ensure!(
         encoded.len() <= MAX_IPC_MESSAGE_BYTES,
         "handoff IPC message is too large"
