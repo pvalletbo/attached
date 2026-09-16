@@ -136,6 +136,8 @@ jobs:
           --exclude attached-browser-iroh
           --exclude attached-browser-sync
           --exclude herdr-tui-protocol
+      - name: Test Linux desktop notification actions on a private D-Bus
+        run: cargo test -p attached --locked private_dbus_notification_click_replacement_and_dismissal -- --ignored
       - name: Run Clippy on the core workspace
         run: >-
           cargo clippy --workspace --all-targets --locked

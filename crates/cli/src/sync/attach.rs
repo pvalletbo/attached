@@ -84,6 +84,7 @@ pub async fn attach(
     target: &str,
     herdr_bin: PathBuf,
     upgrade_remote: bool,
+    pane: Option<crate::pane_focus::PaneFocus>,
 ) -> Result<i32> {
     let (host, session) = parse_target(target)?;
     let account = state::load_account(state_dir, ApiKeyScope::Download)?;
@@ -160,6 +161,11 @@ pub async fn attach(
         local_version == remote_version,
         "remote Herdr version did not match after update"
     );
+    let _notification_activity = crate::notifications::activity::attach(
+        state_dir,
+        attachment.endpoint_identity,
+        &attachment.session,
+    )?;
     let connection = tunnel::connect(
         endpoint.endpoint_addr().clone(),
         &local_identity,
@@ -167,6 +173,7 @@ pub async fn attach(
         CapabilitySecret::from_bytes(attachment.attach_capability),
         herdr_bin,
         local_version,
+        pane,
     )
     .await;
     finish_remote_operation(state_dir, &account, target, &attachment, connection)
@@ -209,7 +216,7 @@ fn finish_remote_operation<T>(
     }
 }
 
-fn parse_target(target: &str) -> Result<(&str, &str)> {
+pub(crate) fn parse_target(target: &str) -> Result<(&str, &str)> {
     let (host, session) = target
         .split_once('/')
         .context("session target must be `HOST/SESSION`")?;
