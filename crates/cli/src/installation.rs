@@ -425,6 +425,8 @@ const OWNED_STATE_FILES: &[&str] = &[
     "sync-account.lock",
     "sync-catalog.json",
     "sync-catalog.lock",
+    "host-catalog.json",
+    "host-catalog.lock",
     "ssh-access.json",
     "ssh-access.lock",
     "ssh-host.key",

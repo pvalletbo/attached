@@ -50,7 +50,6 @@ jobs:
     outputs:
       core: ${{ steps.filter.outputs.core }}
       worker: ${{ steps.filter.outputs.worker }}
-      web: ${{ steps.filter.outputs.web }}
     steps:
       - name: Select affected CI jobs
         id: filter
@@ -80,17 +79,6 @@ jobs:
               - 'crates/session-sync-protocol/**'
               - 'crates/session-sync-worker/**'
               - 'crates/tunnel-protocol/**'
-            web:
-              - '.github/workflows/ci.yml'
-              - '.cargo/**'
-              - 'Cargo.lock'
-              - 'Cargo.toml'
-              - 'rust-toolchain.toml'
-              - '**/Cargo.toml'
-              - 'crates/session-sync-protocol/**'
-              - 'crates/tunnel-protocol/**'
-              - 'experimental/crates/**'
-              - 'experimental/web-client/**'
 
   rust:
     name: Core Rust quality gates
@@ -133,22 +121,13 @@ jobs:
       - name: Run core workspace tests
         run: >-
           cargo test --workspace --locked
-          --exclude attached-browser-iroh
-          --exclude attached-browser-sync
-          --exclude herdr-tui-protocol
       - name: Run Clippy on the core workspace
         run: >-
           cargo clippy --workspace --all-targets --locked
-          --exclude attached-browser-iroh
-          --exclude attached-browser-sync
-          --exclude herdr-tui-protocol
           -- -D warnings
       - name: Build the core workspace
         run: >-
           cargo build --workspace --locked
-          --exclude attached-browser-iroh
-          --exclude attached-browser-sync
-          --exclude herdr-tui-protocol
       - name: Check dependency, license, and source policy
         run: cargo deny check bans licenses sources
       - name: Check whitespace
@@ -192,73 +171,11 @@ jobs:
         run: corepack enable
       - name: Install Worker dependencies
         run: pnpm install --frozen-lockfile
+      - name: Build the Cloudflare Worker
+        # Keep cold compilation and tool downloads outside the local server's readiness deadline.
+        run: pnpm run build
       - name: Run Worker against local Durable Objects
         run: pnpm run test:integration
-
-  web:
-    name: Experimental web and browser quality gates
-    needs: changes
-    # The browser client remains available for explicit, temporary opt-in runs.
-    if: >-
-      always() && !cancelled() &&
-      vars.ENABLE_EXPERIMENTAL_WEB == 'true' &&
-      (github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' &&
-      github.event.pull_request.draft == false &&
-      needs.changes.outputs.web == 'true'))
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    env:
-      CC: clang-18
-      CXX: clang++-18
-      CC_wasm32_unknown_unknown: clang-18
-      CXX_wasm32_unknown_unknown: clang++-18
-      CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_LINKER: wasm-ld-18
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-        with:
-          toolchain: 1.97.1
-          targets: wasm32-unknown-unknown
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          key: browser-wasm
-          cache-bin: false
-          cache-on-failure: true
-      - name: Install Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 22
-      - name: Enable the pinned pnpm version
-        working-directory: experimental/web-client
-        run: corepack enable
-      - name: Install web dependencies
-        working-directory: experimental/web-client
-        run: pnpm install --frozen-lockfile
-      - name: Run web unit tests
-        working-directory: experimental/web-client
-        run: pnpm test
-      - name: Run ESLint
-        working-directory: experimental/web-client
-        run: pnpm run lint
-      - name: Install matching wasm-bindgen CLI
-        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
-        with:
-          tool: wasm-bindgen@0.2.126
-          fallback: none
-      - name: Assemble Attached browser client
-        working-directory: experimental/web-client
-        run: pnpm run build
-      - name: Install Playwright Chromium
-        working-directory: experimental/web-client
-        run: pnpm exec playwright install --with-deps chromium
-      - name: Smoke-test assembled browser client
-        working-directory: experimental/web-client
-        run: pnpm exec playwright test
 
   macos:
     name: Core macOS workspace
@@ -308,22 +225,13 @@ jobs:
       - name: Run core workspace tests on macOS
         run: >-
           cargo test --workspace --locked
-          --exclude attached-browser-iroh
-          --exclude attached-browser-sync
-          --exclude herdr-tui-protocol
       - name: Run Clippy on the core macOS workspace
         run: >-
           cargo clippy --workspace --all-targets --locked
-          --exclude attached-browser-iroh
-          --exclude attached-browser-sync
-          --exclude herdr-tui-protocol
           -- -D warnings
       - name: Build the core workspace on macOS
         run: >-
           cargo build --workspace --locked
-          --exclude attached-browser-iroh
-          --exclude attached-browser-sync
-          --exclude herdr-tui-protocol
       - name: Check dependency, license, and source policy on macOS
         run: cargo deny check bans licenses sources
       - name: Check whitespace on macOS

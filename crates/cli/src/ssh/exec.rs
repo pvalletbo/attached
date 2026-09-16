@@ -142,7 +142,7 @@ async fn run_channel(
         command.arg("-c").arg(OsStr::from_bytes(bytes));
     }
     // Do not inherit publish bundles, encryption credentials, agent sockets, or
-    // Herdr routing variables from the Attached service process.
+    // application routing variables from the Attached service process.
     command
         .env_clear()
         .env("HOME", &policy.home)

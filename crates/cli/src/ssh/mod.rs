@@ -1,4 +1,4 @@
-//! Account-authorized SSH over its own versioned Iroh ALPN, independent of Herdr.
+//! Account-authorized SSH over a versioned Iroh ALPN.
 //! russh implements SSH; Attached implements the deliberately limited exec/shell service.
 mod account;
 mod client;
@@ -21,6 +21,12 @@ pub(crate) use attached_tunnel_protocol::SSH_ALPN as ALPN;
 pub(crate) use client::{connect, local_proxy};
 pub(crate) use state::set_access;
 const SETUP_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Discovery advertises only explicit consent for the configured consumer and OS account.
+/// Invalid, missing, or inaccessible policy files fail closed, just as connection admission does.
+pub(crate) fn access_enabled(path: &Path, consumer: &[u8; 32]) -> bool {
+    state::policy(path, consumer).is_ok()
+}
 
 #[derive(Serialize, Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 #[serde(deny_unknown_fields)]

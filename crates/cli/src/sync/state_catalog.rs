@@ -3,11 +3,8 @@ use std::{collections::HashSet, path::Path, str::FromStr as _};
 use anyhow::{Context as _, Result, ensure};
 use attached_session_sync_protocol::{
     account::{AccountId, RecordId},
-    crypto::OpenedSessionAccessDescriptor,
-    limits::{
-        MAX_ENDPOINT_TICKET_BYTES, MAX_LIVE_RECORDS, MAX_SESSIONS, validate_host_label,
-        validate_session_name,
-    },
+    crypto::OpenedHostAccessDescriptor,
+    limits::{MAX_ENDPOINT_TICKET_BYTES, MAX_LIVE_RECORDS, validate_host_label},
 };
 use chrono::{DateTime, Utc};
 use iroh_tickets::endpoint::EndpointTicket;
@@ -24,37 +21,34 @@ use crate::{
 
 use super::state::AccountCredentials;
 
-const CATALOG_FILE: &str = "sync-catalog.json";
-const CATALOG_LOCK: &str = "sync-catalog.lock";
+const CATALOG_FILE: &str = "host-catalog.json";
+const CATALOG_LOCK: &str = "host-catalog.lock";
 const MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STORED_CATALOG_BYTES: usize = stored_limit(MAX_CATALOG_BYTES);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SyncedSession {
+pub struct SyncedHost {
     pub target: String,
     pub host: String,
-    pub session: String,
-    pub attached_version: Option<[u16; 3]>,
-    pub herdr_version: [u16; 3],
+    pub attached_version: [u16; 3],
     pub published_at: Option<DateTime<Utc>>,
 }
 
-pub(super) struct SessionListing {
-    pub(super) sessions: Vec<SyncedSession>,
+pub(super) struct HostListing {
+    pub(super) hosts: Vec<SyncedHost>,
     pub(super) registry_unavailable: bool,
 }
 
 #[derive(Clone, Eq, PartialEq)]
-pub struct SyncedAttachment {
+pub struct HostConnection {
     pub(crate) record_id: RecordId,
     pub(crate) service_revision: u64,
     pub endpoint_ticket: String,
     pub endpoint_identity: [u8; 32],
     pub attach_capability: [u8; 32],
-    pub attached_version: Option<[u16; 3]>,
-    pub herdr_version: [u16; 3],
+    pub attached_version: [u16; 3],
     pub expires_at: DateTime<Utc>,
-    pub session: String,
+    pub ssh_enabled: bool,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -67,15 +61,6 @@ pub(super) struct Catalog {
     #[serde(default, with = "chrono::serde::ts_seconds_option")]
     pub(super) refreshed_at: Option<DateTime<Utc>>,
     pub(super) records: Vec<CatalogRecord>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pruned_revisions: Vec<PrunedRevision>,
-}
-
-#[derive(Clone, Copy, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct PrunedRevision {
-    record_id: RecordId,
-    service_revision: u64,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -91,10 +76,8 @@ pub(super) struct CatalogRecord {
     endpoint_ticket: String,
     endpoint_identity: [u8; 32],
     attach_capability: [u8; 32],
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    attached_version: Option<[u16; 3]>,
-    herdr_version: [u16; 3],
-    sessions: Vec<String>,
+    attached_version: [u16; 3],
+    ssh_enabled: bool,
 }
 
 impl Catalog {
@@ -105,14 +88,7 @@ impl Catalog {
             generation: 0,
             refreshed_at: None,
             records: Vec::new(),
-            pruned_revisions: Vec::new(),
         }
-    }
-
-    pub(super) fn pruned_revision_pairs(&self) -> impl Iterator<Item = (RecordId, u64)> + '_ {
-        self.pruned_revisions
-            .iter()
-            .map(|pruned| (pruned.record_id, pruned.service_revision))
     }
 }
 
@@ -121,24 +97,23 @@ impl CatalogRecord {
         self.expires_at <= now
     }
 
-    pub(super) fn ssh_attachment(&self) -> SyncedAttachment {
-        SyncedAttachment {
+    pub(super) fn ssh_attachment(&self) -> HostConnection {
+        HostConnection {
             record_id: self.record_id,
             service_revision: self.service_revision,
             endpoint_ticket: self.endpoint_ticket.clone(),
             endpoint_identity: self.endpoint_identity,
             attach_capability: self.attach_capability,
             attached_version: self.attached_version,
-            herdr_version: self.herdr_version,
+            ssh_enabled: self.ssh_enabled,
             expires_at: self.expires_at,
-            session: String::new(),
         }
     }
 
     pub(super) fn from_opened(
         record_id: RecordId,
         service_revision: u64,
-        opened: &OpenedSessionAccessDescriptor,
+        opened: &OpenedHostAccessDescriptor,
     ) -> Self {
         let descriptor = opened.descriptor();
         Self {
@@ -150,27 +125,24 @@ impl CatalogRecord {
             endpoint_ticket: descriptor.endpoint_ticket().to_owned(),
             endpoint_identity: descriptor.endpoint_identity(),
             attach_capability: descriptor.attach_capability_bytes(),
-            attached_version: descriptor
-                .attached_version()
-                .map(|version| [version.major, version.minor, version.patch]),
-            herdr_version: [
-                descriptor.herdr_version().major,
-                descriptor.herdr_version().minor,
-                descriptor.herdr_version().patch,
+            attached_version: [
+                descriptor.attached_version().major,
+                descriptor.attached_version().minor,
+                descriptor.attached_version().patch,
             ],
-            sessions: descriptor.sessions().to_vec(),
+            ssh_enabled: descriptor.ssh_enabled(),
         }
     }
 }
 
-/// Resolve a publisher independent of its session list or Herdr version.
+/// Resolve a published machine by label or stable identity.
 /// Stable endpoint IDs are accepted; ambiguous human labels fail closed.
-pub(crate) fn ssh_host(
+pub(crate) fn host(
     state_dir: &Path,
     account: &AccountCredentials,
     target: &str,
     now: DateTime<Utc>,
-) -> Result<SyncedAttachment> {
+) -> Result<HostConnection> {
     let catalog = load(state_dir, account)?;
     // An explicit endpoint identity must never fall back to a mutable label.
     // Otherwise another publisher can name itself after an absent/expired host's
@@ -223,7 +195,6 @@ pub(super) fn save_refresh(
     state_dir: &Path,
     account: &AccountCredentials,
     baseline_revisions: &HashSet<(RecordId, u64)>,
-    baseline_pruned_revisions: &HashSet<(RecordId, u64)>,
     refreshed: &Catalog,
 ) -> Result<()> {
     validate(refreshed, account)?;
@@ -243,47 +214,22 @@ pub(super) fn save_refresh(
             .into_iter()
             .map(|record| (record.record_id, record))
             .collect::<std::collections::BTreeMap<_, _>>();
-        let mut current_tombstones = current
-            .pruned_revisions
-            .into_iter()
-            .map(|pruned| (pruned.record_id, pruned.service_revision))
-            .collect::<std::collections::BTreeMap<_, _>>();
         let mut reconciled = Catalog::empty(account);
-        reconciled.refreshed_at = refreshed.refreshed_at;
+        // A concurrent refresh may have removed hosts or invalidated freshness.
+        // Reconcile conservatively without caching a potentially partial result.
+        reconciled.refreshed_at = (current_generation == refreshed.generation)
+            .then_some(refreshed.refreshed_at)
+            .flatten();
         for candidate in &refreshed.records {
-            if (current_generation != refreshed.generation
-                && !baseline_revisions.contains(&(candidate.record_id, candidate.service_revision))
+            // A newer completed refresh may have removed this record. Do not
+            // resurrect it from an older in-flight index observation.
+            if current_generation != refreshed.generation
                 && !current_records.contains_key(&candidate.record_id)
-                && !current_tombstones
-                    .get(&candidate.record_id)
-                    .is_some_and(|revision| *revision < candidate.service_revision))
-                || baseline_pruned_revisions
-                    .iter()
-                    .any(|(record_id, revision)| {
-                        *record_id == candidate.record_id && *revision >= candidate.service_revision
-                    })
-                || current_tombstones
-                    .get(&candidate.record_id)
-                    .is_some_and(|revision| *revision >= candidate.service_revision)
             {
                 continue;
             }
-            current_tombstones.remove(&candidate.record_id);
-            let current = current_records.remove(&candidate.record_id);
-            let selected = match current {
+            let selected = match current_records.remove(&candidate.record_id) {
                 Some(current) if current.service_revision > candidate.service_revision => current,
-                Some(current)
-                    if baseline_revisions
-                        .contains(&(candidate.record_id, candidate.service_revision))
-                        && current.service_revision != candidate.service_revision =>
-                {
-                    continue;
-                }
-                None if baseline_revisions
-                    .contains(&(candidate.record_id, candidate.service_revision)) =>
-                {
-                    continue;
-                }
                 _ => candidate.clone(),
             };
             reconciled.records.push(selected);
@@ -293,75 +239,12 @@ pub(super) fn save_refresh(
             .extend(current_records.into_values().filter(|record| {
                 !baseline_revisions.contains(&(record.record_id, record.service_revision))
             }));
-        let refreshed_revisions = refreshed
-            .records
-            .iter()
-            .map(|record| (record.record_id, record.service_revision))
-            .collect::<std::collections::BTreeMap<_, _>>();
-        reconciled.pruned_revisions.extend(
-            current_tombstones
-                .into_iter()
-                .filter(|(record_id, revision)| {
-                    !baseline_pruned_revisions.contains(&(*record_id, *revision))
-                        || refreshed_revisions
-                            .get(record_id)
-                            .is_some_and(|refreshed_revision| refreshed_revision <= revision)
-                })
-                .map(|(record_id, service_revision)| PrunedRevision {
-                    record_id,
-                    service_revision,
-                }),
-        );
         reconciled.records.sort_by_key(|record| record.record_id);
-        reconciled
-            .pruned_revisions
-            .sort_by_key(|pruned| pruned.record_id);
         reconciled.generation = current_generation
             .checked_add(1)
             .context("sync catalog generation exhausted")?;
         validate(&reconciled, account)?;
         write_catalog(directory, &reconciled, existed)
-    })
-}
-
-pub(super) fn remove_if_revision(
-    state_dir: &Path,
-    account: &AccountCredentials,
-    record_id: RecordId,
-    service_revision: u64,
-) -> Result<bool> {
-    with_exclusive_lock(state_dir, CATALOG_LOCK, |directory| {
-        let Some(mut catalog) = read_catalog(directory, account, true)? else {
-            return Ok(false);
-        };
-        let previous_len = catalog.records.len();
-        catalog.records.retain(|record| {
-            record.record_id != record_id || record.service_revision != service_revision
-        });
-        if catalog.records.len() == previous_len {
-            return Ok(false);
-        }
-        match catalog
-            .pruned_revisions
-            .iter_mut()
-            .find(|pruned| pruned.record_id == record_id)
-        {
-            Some(pruned) => pruned.service_revision = pruned.service_revision.max(service_revision),
-            None => catalog.pruned_revisions.push(PrunedRevision {
-                record_id,
-                service_revision,
-            }),
-        }
-        catalog
-            .pruned_revisions
-            .sort_by_key(|pruned| pruned.record_id);
-        catalog.generation = catalog
-            .generation
-            .checked_add(1)
-            .context("sync catalog generation exhausted")?;
-        validate(&catalog, account)?;
-        write_catalog(directory, &catalog, true)?;
-        Ok(true)
     })
 }
 
@@ -443,41 +326,43 @@ fn encode_catalog(catalog: &Catalog) -> Result<Zeroizing<Vec<u8>>> {
     Ok(encoded)
 }
 
-fn sessions_with_filter(
+fn hosts_with_filter(
     state_dir: &Path,
     account: &AccountCredentials,
     now: DateTime<Utc>,
     mut suppress: impl FnMut(&CatalogRecord) -> bool,
-) -> Result<Vec<SyncedSession>> {
+) -> Result<Vec<SyncedHost>> {
     let catalog = load(state_dir, account)?;
-    let mut sessions = catalog
+    let mut hosts = catalog
         .records
         .iter()
-        .filter(|record| now < record.expires_at && !suppress(record))
-        .flat_map(|record| {
-            record.sessions.iter().map(move |session| SyncedSession {
-                target: format!("{}/{session}", record.host_label),
-                host: record.host_label.clone(),
-                session: session.clone(),
-                attached_version: record.attached_version,
-                herdr_version: record.herdr_version,
-                published_at: record.published_at,
-            })
+        .filter(|record| record.ssh_enabled && now < record.expires_at && !suppress(record))
+        .map(|record| SyncedHost {
+            target: iroh::EndpointId::from_bytes(&record.endpoint_identity)
+                .expect("catalog validates endpoint identities")
+                .to_string(),
+            host: record.host_label.clone(),
+            attached_version: record.attached_version,
+            published_at: record.published_at,
         })
         .collect::<Vec<_>>();
-    sessions.sort_by(|left, right| left.target.cmp(&right.target));
-    Ok(sessions)
+    hosts.sort_by(|left, right| {
+        left.host
+            .cmp(&right.host)
+            .then(left.target.cmp(&right.target))
+    });
+    Ok(hosts)
 }
 
-#[tracing::instrument(name = "list_sync_sessions", level = "debug", skip_all)]
-pub(super) fn sessions_excluding_local_endpoints(
+#[tracing::instrument(name = "list_sync_hosts", level = "debug", skip_all)]
+pub(super) fn hosts_excluding_local_endpoints(
     state_dir: &Path,
     account: &AccountCredentials,
     now: DateTime<Utc>,
     registry_dir: &Path,
-) -> Result<SessionListing> {
+) -> Result<HostListing> {
     let mut registry_unavailable = false;
-    let sessions = sessions_with_filter(state_dir, account, now, |record| {
+    let hosts = hosts_with_filter(state_dir, account, now, |record| {
         match crate::endpoint_registry::is_active(registry_dir, record.endpoint_identity) {
             Ok(active) => active,
             Err(_) => {
@@ -486,42 +371,10 @@ pub(super) fn sessions_excluding_local_endpoints(
             }
         }
     })?;
-    Ok(SessionListing {
-        sessions,
+    Ok(HostListing {
+        hosts,
         registry_unavailable,
     })
-}
-
-#[tracing::instrument(name = "load_sync_attachment", level = "debug", skip_all)]
-pub fn attachment(
-    state_dir: &Path,
-    account: &AccountCredentials,
-    host: &str,
-    session: &str,
-    now: DateTime<Utc>,
-) -> Result<Option<SyncedAttachment>> {
-    let catalog = load(state_dir, account)?;
-    let mut matches = catalog.records.iter().filter(|record| {
-        record.host_label == host
-            && now < record.expires_at
-            && record.sessions.iter().any(|candidate| candidate == session)
-    });
-    let selected = matches.next();
-    ensure!(
-        matches.next().is_none(),
-        "synchronized host label `{host}` is ambiguous"
-    );
-    Ok(selected.map(|record| SyncedAttachment {
-        record_id: record.record_id,
-        service_revision: record.service_revision,
-        endpoint_ticket: record.endpoint_ticket.clone(),
-        endpoint_identity: record.endpoint_identity,
-        attach_capability: record.attach_capability,
-        attached_version: record.attached_version,
-        herdr_version: record.herdr_version,
-        expires_at: record.expires_at,
-        session: session.to_owned(),
-    }))
 }
 
 fn validate(catalog: &Catalog, account: &AccountCredentials) -> Result<()> {
@@ -537,18 +390,6 @@ fn validate(catalog: &Catalog, account: &AccountCredentials) -> Result<()> {
         catalog.records.len() <= MAX_LIVE_RECORDS,
         "too many sync records"
     );
-    ensure!(
-        catalog.pruned_revisions.len() <= MAX_LIVE_RECORDS,
-        "too many pruned sync records"
-    );
-    let mut pruned_ids = HashSet::new();
-    for pruned in &catalog.pruned_revisions {
-        ensure!(pruned.service_revision > 0, "invalid pruned sync revision");
-        ensure!(
-            pruned_ids.insert(pruned.record_id),
-            "duplicate pruned sync record"
-        );
-    }
     let mut record_ids = HashSet::new();
     for record in &catalog.records {
         ensure!(record_ids.insert(record.record_id), "duplicate sync record");
@@ -559,7 +400,7 @@ fn validate(catalog: &Catalog, account: &AccountCredentials) -> Result<()> {
         );
         ensure!(
             record.expires_at.timestamp() >= 0 && record.expires_at.timestamp_subsec_nanos() == 0,
-            "invalid session access descriptor expiration"
+            "invalid host access descriptor expiration"
         );
         ensure!(
             record.published_at.is_none_or(|published_at| {
@@ -567,7 +408,7 @@ fn validate(catalog: &Catalog, account: &AccountCredentials) -> Result<()> {
                     && published_at.timestamp_subsec_nanos() == 0
                     && published_at <= record.expires_at
             }),
-            "invalid session access descriptor publication time"
+            "invalid host access descriptor publication time"
         );
         ensure!(
             !record.endpoint_ticket.is_empty()
@@ -581,15 +422,6 @@ fn validate(catalog: &Catalog, account: &AccountCredentials) -> Result<()> {
             endpoint.to_string() == record.endpoint_ticket
                 && endpoint.endpoint_addr().id.as_bytes() == &record.endpoint_identity,
             "invalid synchronized endpoint"
-        );
-        ensure!(record.sessions.len() <= MAX_SESSIONS, "too many sessions");
-        ensure!(
-            record
-                .sessions
-                .iter()
-                .all(|session| validate_session_name(session))
-                && record.sessions.windows(2).all(|pair| pair[0] < pair[1]),
-            "invalid synchronized sessions"
         );
     }
     Ok(())
@@ -620,7 +452,7 @@ mod tests {
         DateTime::from_timestamp(seconds, 0).expect("fixture timestamp")
     }
 
-    fn record(identity_byte: u8, host: &str, session: &str) -> CatalogRecord {
+    fn record(identity_byte: u8, host: &str) -> CatalogRecord {
         let secret = iroh::SecretKey::from_bytes(&[identity_byte; 32]);
         let mut address = ENDPOINT
             .parse::<EndpointTicket>()
@@ -638,41 +470,38 @@ mod tests {
             endpoint_ticket,
             endpoint_identity: *secret.public().as_bytes(),
             attach_capability: [7; 32],
-            attached_version: Some([0, 2, 0]),
-            herdr_version: [1, 2, 3],
-            sessions: vec![session.to_owned()],
+            attached_version: [0, 2, 0],
+            ssh_enabled: true,
         }
     }
 
     #[test]
-    fn ssh_resolves_publishers_without_sessions_and_rejects_ambiguous_or_expired_hosts() {
+    fn resolves_publishers_by_host_and_rejects_ambiguous_or_expired_hosts() {
         let root = crate::test_support::canonical_tempdir();
         let state_dir = root.path().join("state");
         super::super::state::test_support::create_account(&state_dir, "https://sync.example")
             .unwrap();
         let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
         let mut catalog = Catalog::empty(&account);
-        let mut host = record(0x51, "office", "work");
-        host.sessions.clear();
-        let id = iroh::EndpointId::from_bytes(&host.endpoint_identity)
+        let publisher = record(0x51, "office");
+        let id = iroh::EndpointId::from_bytes(&publisher.endpoint_identity)
             .unwrap()
             .to_string();
-        catalog.records.push(host);
+        catalog.records.push(publisher);
         save(&state_dir, &account, &catalog).unwrap();
         let now = timestamp(1_700_000_000);
         assert!(
-            ssh_host(&state_dir, &account, "office", now)
+            host(&state_dir, &account, "office", now)
                 .unwrap()
-                .session
-                .is_empty()
+                .ssh_enabled
         );
-        assert!(ssh_host(&state_dir, &account, &id, now).is_ok());
-        assert!(ssh_host(&state_dir, &account, "office/work", now).is_err());
-        catalog.records.push(record(0x52, "office", "another"));
+        assert!(host(&state_dir, &account, &id, now).is_ok());
+        assert!(host(&state_dir, &account, "office/work", now).is_err());
+        catalog.records.push(record(0x52, "office"));
         save(&state_dir, &account, &catalog).unwrap();
-        assert!(ssh_host(&state_dir, &account, "office", now).is_err());
-        assert!(ssh_host(&state_dir, &account, &id, now).is_ok());
-        assert!(ssh_host(&state_dir, &account, &id, timestamp(1_900_000_000)).is_err());
+        assert!(host(&state_dir, &account, "office", now).is_err());
+        assert!(host(&state_dir, &account, &id, now).is_ok());
+        assert!(host(&state_dir, &account, &id, timestamp(1_900_000_000)).is_err());
     }
 
     #[test]
@@ -683,16 +512,16 @@ mod tests {
             .unwrap();
         let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
         let mut catalog = Catalog::empty(&account);
-        let intended = record(0x61, "office", "work");
+        let intended = record(0x61, "office");
         let identity = iroh::EndpointId::from_bytes(&intended.endpoint_identity).unwrap();
         let target = identity.to_string();
-        let other = record(0x62, &target, "other");
+        let other = record(0x62, &target);
         let now = timestamp(1_700_000_000);
 
         // A label cannot impersonate an absent endpoint, even on first use.
         catalog.records = vec![other.clone()];
         save(&state_dir, &account, &catalog).unwrap();
-        assert!(ssh_host(&state_dir, &account, &target, now).is_err());
+        assert!(host(&state_dir, &account, &target, now).is_err());
 
         // Nor may an expired descriptor redirect a previously pinned identity.
         let mut expired = intended.clone();
@@ -700,7 +529,7 @@ mod tests {
         expired.expires_at = now;
         catalog.records = vec![expired, other.clone()];
         save(&state_dir, &account, &catalog).unwrap();
-        assert!(ssh_host(&state_dir, &account, &target, now).is_err());
+        assert!(host(&state_dir, &account, &target, now).is_err());
 
         // When the intended endpoint is present, its identity takes precedence
         // over a colliding label; normal human-label selection still works.
@@ -708,7 +537,7 @@ mod tests {
         save(&state_dir, &account, &catalog).unwrap();
         for target in [&*target, "office"] {
             assert_eq!(
-                ssh_host(&state_dir, &account, target, now)
+                host(&state_dir, &account, target, now)
                     .unwrap()
                     .endpoint_identity,
                 *identity.as_bytes(),
@@ -764,36 +593,6 @@ mod tests {
     }
 
     #[test]
-    fn failed_attachment_removes_only_the_selected_catalog_revision() {
-        let root = crate::test_support::canonical_tempdir();
-        let state_dir = root.path().join("state");
-        super::super::state::test_support::create_account(&state_dir, "https://sync.example")
-            .unwrap();
-        let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
-        let mut catalog = Catalog::empty(&account);
-        let selected = record(0x51, "office", "work");
-        let record_id = selected.record_id;
-        catalog.records.push(selected);
-        save(&state_dir, &account, &catalog).unwrap();
-        let stored = std::fs::read(state_dir.join(CATALOG_FILE)).unwrap();
-        assert!(crate::local_encryption::is_envelope(&stored));
-        assert!(!stored.windows(32).any(|bytes| bytes == [7; 32]));
-
-        assert!(remove_if_revision(&state_dir, &account, record_id, 1).unwrap());
-        assert!(
-            attachment(
-                &state_dir,
-                &account,
-                "office",
-                "work",
-                timestamp(1_700_000_000)
-            )
-            .unwrap()
-            .is_none()
-        );
-    }
-
-    #[test]
     fn legacy_plaintext_catalog_migrates_and_preserves_records_and_capabilities() {
         let root = crate::test_support::canonical_tempdir();
         let state_dir = root.path().join("state");
@@ -801,7 +600,7 @@ mod tests {
             .unwrap();
         let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
         let mut expected = Catalog::empty(&account);
-        expected.records.push(record(0x59, "office", "work"));
+        expected.records.push(record(0x59, "office"));
         let plaintext = serde_json::to_vec(&expected).unwrap();
         std::fs::write(state_dir.join(CATALOG_FILE), &plaintext).unwrap();
         std::fs::set_permissions(
@@ -818,63 +617,13 @@ mod tests {
             loaded.records[0].attach_capability,
             expected.records[0].attach_capability
         );
-        assert_eq!(loaded.records[0].sessions, expected.records[0].sessions);
+        assert_eq!(
+            loaded.records[0].ssh_enabled,
+            expected.records[0].ssh_enabled
+        );
         let migrated = std::fs::read(state_dir.join(CATALOG_FILE)).unwrap();
         assert!(crate::local_encryption::is_envelope(&migrated));
         assert_ne!(migrated, plaintext);
-    }
-
-    #[test]
-    fn republished_revision_survives_an_older_attachment_failure() {
-        let root = crate::test_support::canonical_tempdir();
-        let state_dir = root.path().join("state");
-        super::super::state::test_support::create_account(&state_dir, "https://sync.example")
-            .unwrap();
-        let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
-        let mut catalog = Catalog::empty(&account);
-        let mut republished = record(0x52, "office", "work");
-        let record_id = republished.record_id;
-        republished.service_revision = 2;
-        catalog.records.push(republished);
-        save(&state_dir, &account, &catalog).unwrap();
-
-        assert!(!remove_if_revision(&state_dir, &account, record_id, 1).unwrap());
-        assert!(
-            attachment(
-                &state_dir,
-                &account,
-                "office",
-                "work",
-                timestamp(1_700_000_000)
-            )
-            .unwrap()
-            .is_some(),
-            "a newer publisher revision was removed by an older failed attachment"
-        );
-    }
-
-    #[test]
-    fn remove_noop_migrates_a_valid_legacy_catalog() {
-        let root = crate::test_support::canonical_tempdir();
-        let state_dir = root.path().join("state");
-        super::super::state::test_support::create_account(&state_dir, "https://sync.example")
-            .unwrap();
-        let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
-        let catalog = Catalog::empty(&account);
-        let legacy = encode_catalog(&catalog).unwrap();
-        std::fs::write(state_dir.join(CATALOG_FILE), &legacy).unwrap();
-        std::fs::set_permissions(
-            state_dir.join(CATALOG_FILE),
-            std::fs::Permissions::from_mode(0o600),
-        )
-        .unwrap();
-
-        assert!(
-            !remove_if_revision(&state_dir, &account, RecordId::from_bytes([0xee; 16]), 1).unwrap()
-        );
-        assert!(is_envelope(
-            &std::fs::read(state_dir.join(CATALOG_FILE)).unwrap()
-        ));
     }
 
     #[test]
@@ -898,14 +647,7 @@ mod tests {
             std::fs::write(&path, &corrupted).unwrap();
 
             assert!(
-                save_refresh(
-                    &state_dir,
-                    &account,
-                    &HashSet::new(),
-                    &HashSet::new(),
-                    &catalog,
-                )
-                .is_err(),
+                save_refresh(&state_dir, &account, &HashSet::new(), &catalog,).is_err(),
                 "magic corruption at offset {offset} was accepted"
             );
             assert_eq!(std::fs::read(&path).unwrap(), corrupted);
@@ -928,56 +670,11 @@ mod tests {
         for (name, corrupted) in variants {
             std::fs::write(&path, &corrupted).unwrap();
             assert!(
-                save_refresh(
-                    &state_dir,
-                    &account,
-                    &HashSet::new(),
-                    &HashSet::new(),
-                    &catalog,
-                )
-                .is_err(),
+                save_refresh(&state_dir, &account, &HashSet::new(), &catalog,).is_err(),
                 "{name} was accepted"
             );
             assert_eq!(std::fs::read(&path).unwrap(), corrupted, "{name}");
         }
-    }
-
-    #[test]
-    fn refresh_save_does_not_resurrect_a_concurrently_pruned_revision() {
-        let root = crate::test_support::canonical_tempdir();
-        let state_dir = root.path().join("state");
-        super::super::state::test_support::create_account(&state_dir, "https://sync.example")
-            .unwrap();
-        let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
-        let mut baseline = Catalog::empty(&account);
-        let selected = record(0x53, "office", "work");
-        let record_id = selected.record_id;
-        baseline.records.push(selected);
-        save(&state_dir, &account, &baseline).unwrap();
-
-        assert!(remove_if_revision(&state_dir, &account, record_id, 1).unwrap());
-        let baseline_revisions = HashSet::from([(record_id, 1)]);
-        save_refresh(
-            &state_dir,
-            &account,
-            &baseline_revisions,
-            &HashSet::new(),
-            &baseline,
-        )
-        .unwrap();
-
-        assert!(
-            attachment(
-                &state_dir,
-                &account,
-                "office",
-                "work",
-                timestamp(1_700_000_000)
-            )
-            .unwrap()
-            .is_none(),
-            "a stale in-flight refresh resurrected a pruned revision"
-        );
     }
 
     #[test]
@@ -988,23 +685,16 @@ mod tests {
             .unwrap();
         let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
         let mut baseline = Catalog::empty(&account);
-        baseline.records.push(record(0x54, "office", "work"));
+        baseline.records.push(record(0x54, "office"));
         save(&state_dir, &account, &baseline).unwrap();
 
         let mut newer = Catalog::empty(&account);
-        let mut newer_record = record(0x54, "office", "work");
+        let mut newer_record = record(0x54, "office");
         newer_record.service_revision = 2;
         newer.records.push(newer_record);
         save(&state_dir, &account, &newer).unwrap();
         let baseline_revisions = HashSet::from([(baseline.records[0].record_id, 1)]);
-        save_refresh(
-            &state_dir,
-            &account,
-            &baseline_revisions,
-            &HashSet::new(),
-            &baseline,
-        )
-        .unwrap();
+        save_refresh(&state_dir, &account, &baseline_revisions, &baseline).unwrap();
 
         let stored = load(&state_dir, &account).unwrap();
         assert_eq!(stored.records[0].service_revision, 2);
@@ -1020,17 +710,10 @@ mod tests {
         let baseline = Catalog::empty(&account);
         save(&state_dir, &account, &baseline).unwrap();
         let mut concurrent = Catalog::empty(&account);
-        concurrent.records.push(record(0x56, "new-host", "work"));
+        concurrent.records.push(record(0x56, "new-host"));
         save(&state_dir, &account, &concurrent).unwrap();
 
-        save_refresh(
-            &state_dir,
-            &account,
-            &HashSet::new(),
-            &HashSet::new(),
-            &baseline,
-        )
-        .unwrap();
+        save_refresh(&state_dir, &account, &HashSet::new(), &baseline).unwrap();
 
         let stored = load(&state_dir, &account).unwrap();
         assert_eq!(stored.records.len(), 1);
@@ -1048,24 +731,17 @@ mod tests {
             .unwrap();
         let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
         let mut baseline = Catalog::empty(&account);
-        baseline.records.push(record(0x57, "office", "work"));
+        baseline.records.push(record(0x57, "office"));
         save(&state_dir, &account, &baseline).unwrap();
         let baseline_revisions = HashSet::from([(baseline.records[0].record_id, 1)]);
         let mut newer = Catalog::empty(&account);
-        let mut newer_record = record(0x57, "office", "work");
+        let mut newer_record = record(0x57, "office");
         newer_record.service_revision = 2;
         newer.records.push(newer_record);
         save(&state_dir, &account, &newer).unwrap();
         let empty_refresh = Catalog::empty(&account);
 
-        save_refresh(
-            &state_dir,
-            &account,
-            &baseline_revisions,
-            &HashSet::new(),
-            &empty_refresh,
-        )
-        .unwrap();
+        save_refresh(&state_dir, &account, &baseline_revisions, &empty_refresh).unwrap();
 
         let stored = load(&state_dir, &account).unwrap();
         assert_eq!(stored.records.len(), 1);
@@ -1073,282 +749,69 @@ mod tests {
     }
 
     #[test]
-    fn refresh_save_does_not_resurrect_a_new_record_pruned_after_fetch() {
+    fn stale_refresh_cannot_resurrect_a_host_or_cache_a_partial_listing() {
         let root = crate::test_support::canonical_tempdir();
         let state_dir = root.path().join("state");
         super::super::state::test_support::create_account(&state_dir, "https://sync.example")
             .unwrap();
         let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
-        let mut fetched = Catalog::empty(&account);
-        let fetched_record = record(0x58, "new-host", "work");
-        let record_id = fetched_record.record_id;
-        fetched.records.push(fetched_record);
-        save(&state_dir, &account, &fetched).unwrap();
-        assert!(remove_if_revision(&state_dir, &account, record_id, 1).unwrap());
-
-        save_refresh(
-            &state_dir,
-            &account,
-            &HashSet::new(),
-            &HashSet::new(),
-            &fetched,
-        )
-        .unwrap();
-
-        assert!(load(&state_dir, &account).unwrap().records.is_empty());
+        let mut initial = Catalog::empty(&account);
+        initial.records.push(record(0x51, "office"));
+        save(&state_dir, &account, &initial).unwrap();
+        let mut stale = load(&state_dir, &account).unwrap();
+        stale.refreshed_at = Some(timestamp(1_700_000_000));
+        let baseline = HashSet::from([(stale.records[0].record_id, 1)]);
+        // A newer completed refresh saw the publisher disappear.
+        save(&state_dir, &account, &Catalog::empty(&account)).unwrap();
+        save_refresh(&state_dir, &account, &baseline, &stale).unwrap();
+        let mut current = load(&state_dir, &account).unwrap();
+        assert!(current.records.is_empty());
+        assert!(current.refreshed_at.is_none());
+        // A fresh observation can discover the host again.
+        current.records.push(record(0x51, "office"));
+        current.refreshed_at = Some(timestamp(1_700_000_001));
+        save_refresh(&state_dir, &account, &HashSet::new(), &current).unwrap();
+        assert_eq!(load(&state_dir, &account).unwrap().records.len(), 1);
     }
 
     #[test]
-    fn refresh_save_does_not_resurrect_a_baseline_tombstone_after_concurrent_gc() {
+    fn stale_refresh_cannot_restore_revoked_ssh_permission() {
         let root = crate::test_support::canonical_tempdir();
         let state_dir = root.path().join("state");
         super::super::state::test_support::create_account(&state_dir, "https://sync.example")
             .unwrap();
         let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
-        let mut fetched = Catalog::empty(&account);
-        let fetched_record = record(0x5a, "office", "work");
-        let record_id = fetched_record.record_id;
-        fetched.records.push(fetched_record);
-        save(&state_dir, &account, &fetched).unwrap();
-        assert!(remove_if_revision(&state_dir, &account, record_id, 1).unwrap());
-        let baseline_pruned_revisions = HashSet::from([(record_id, 1)]);
-
-        let empty_refresh = Catalog::empty(&account);
-        save_refresh(
-            &state_dir,
-            &account,
-            &HashSet::new(),
-            &baseline_pruned_revisions,
-            &empty_refresh,
-        )
-        .unwrap();
+        let mut initial = Catalog::empty(&account);
+        initial.records.push(record(0x51, "office"));
+        save(&state_dir, &account, &initial).unwrap();
+        let stale = load(&state_dir, &account).unwrap();
+        let baseline = HashSet::from([(stale.records[0].record_id, 1)]);
+        let mut revoked = stale.clone();
+        revoked.records[0].service_revision = 2;
+        revoked.records[0].ssh_enabled = false;
+        save(&state_dir, &account, &revoked).unwrap();
+        save_refresh(&state_dir, &account, &baseline, &stale).unwrap();
+        let now = timestamp(1_700_000_000);
         assert!(
-            load(&state_dir, &account)
+            !host(&state_dir, &account, "office", now)
                 .unwrap()
-                .pruned_revisions
-                .is_empty(),
-            "the newer refresh did not garbage-collect the observed tombstone"
+                .ssh_enabled
         );
-
-        save_refresh(
-            &state_dir,
-            &account,
-            &HashSet::new(),
-            &baseline_pruned_revisions,
-            &fetched,
-        )
-        .unwrap();
-
         assert!(
-            load(&state_dir, &account).unwrap().records.is_empty(),
-            "an older refresh resurrected the exact revision from its baseline tombstone"
+            hosts_excluding_local_endpoints(
+                &state_dir,
+                &account,
+                now,
+                &root.path().join("registry")
+            )
+            .unwrap()
+            .hosts
+            .is_empty()
         );
     }
 
     #[test]
-    fn tombstone_lifecycle_retains_current_collects_absent_and_accepts_newer_revision() {
-        let root = crate::test_support::canonical_tempdir();
-        let state_dir = root.path().join("state");
-        super::super::state::test_support::create_account(&state_dir, "https://sync.example")
-            .unwrap();
-        let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
-        let mut revision_one = Catalog::empty(&account);
-        let initial = record(0x5b, "office", "work");
-        let record_id = initial.record_id;
-        revision_one.records.push(initial);
-        save(&state_dir, &account, &revision_one).unwrap();
-        assert!(remove_if_revision(&state_dir, &account, record_id, 1).unwrap());
-        let baseline_tombstones = HashSet::from([(record_id, 1)]);
-
-        save_refresh(
-            &state_dir,
-            &account,
-            &HashSet::new(),
-            &baseline_tombstones,
-            &revision_one,
-        )
-        .unwrap();
-        let retained = load(&state_dir, &account).unwrap();
-        assert!(retained.records.is_empty());
-        assert_eq!(
-            retained.pruned_revision_pairs().collect::<Vec<_>>(),
-            vec![(record_id, 1)]
-        );
-
-        save_refresh(
-            &state_dir,
-            &account,
-            &HashSet::new(),
-            &baseline_tombstones,
-            &Catalog::empty(&account),
-        )
-        .unwrap();
-        assert!(
-            load(&state_dir, &account)
-                .unwrap()
-                .pruned_revisions
-                .is_empty()
-        );
-
-        save(&state_dir, &account, &revision_one).unwrap();
-        assert!(remove_if_revision(&state_dir, &account, record_id, 1).unwrap());
-        let mut revision_two = load(&state_dir, &account).unwrap();
-        let mut newer = record(0x5b, "office", "work");
-        newer.service_revision = 2;
-        revision_two.records.push(newer);
-        save_refresh(
-            &state_dir,
-            &account,
-            &HashSet::new(),
-            &baseline_tombstones,
-            &revision_two,
-        )
-        .unwrap();
-        let superseded = load(&state_dir, &account).unwrap();
-        assert_eq!(superseded.records.len(), 1);
-        assert_eq!(superseded.records[0].service_revision, 2);
-        assert!(superseded.pruned_revisions.is_empty());
-    }
-
-    #[test]
-    fn legacy_catalog_without_pruned_revisions_loads_with_empty_tombstones() {
-        let root = crate::test_support::canonical_tempdir();
-        let state_dir = root.path().join("state");
-        super::super::state::test_support::create_account(&state_dir, "https://sync.example")
-            .unwrap();
-        let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
-        let mut catalog = Catalog::empty(&account);
-        catalog.records.push(record(0x5c, "legacy", "work"));
-        let mut legacy = serde_json::to_value(&catalog).unwrap();
-        legacy.as_object_mut().unwrap().remove("generation");
-        legacy.as_object_mut().unwrap().remove("pruned_revisions");
-
-        let encoded = serde_json::to_vec(&legacy).unwrap();
-        let decoded: Catalog = serde_json::from_slice(&encoded).unwrap();
-
-        validate(&decoded, &account).unwrap();
-        assert_eq!(decoded.records.len(), 1);
-        assert!(decoded.pruned_revisions.is_empty());
-    }
-
-    #[test]
-    fn in_flight_newer_revision_survives_concurrent_pruning_of_older_revision() {
-        let root = crate::test_support::canonical_tempdir();
-        let state_dir = root.path().join("state");
-        super::super::state::test_support::create_account(&state_dir, "https://sync.example")
-            .unwrap();
-        let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
-        let mut revision_one = Catalog::empty(&account);
-        let initial = record(0x5e, "office", "work");
-        let record_id = initial.record_id;
-        revision_one.records.push(initial);
-        save(&state_dir, &account, &revision_one).unwrap();
-
-        let mut fetched_revision_two = load(&state_dir, &account).unwrap();
-        fetched_revision_two.records[0].service_revision = 2;
-        let baseline_revisions = HashSet::from([(record_id, 1)]);
-        assert!(remove_if_revision(&state_dir, &account, record_id, 1).unwrap());
-
-        save_refresh(
-            &state_dir,
-            &account,
-            &baseline_revisions,
-            &HashSet::new(),
-            &fetched_revision_two,
-        )
-        .unwrap();
-
-        let stored = load(&state_dir, &account).unwrap();
-        assert_eq!(stored.records.len(), 1);
-        assert_eq!(stored.records[0].service_revision, 2);
-        assert!(stored.pruned_revisions.is_empty());
-    }
-
-    #[test]
-    fn stale_empty_baseline_refresh_cannot_resurrect_a_pruned_and_collected_revision() {
-        let root = crate::test_support::canonical_tempdir();
-        let state_dir = root.path().join("state");
-        super::super::state::test_support::create_account(&state_dir, "https://sync.example")
-            .unwrap();
-        let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
-        let mut fetched = Catalog::empty(&account);
-        let fetched_record = record(0x5d, "office", "work");
-        let record_id = fetched_record.record_id;
-        fetched.records.push(fetched_record);
-
-        save_refresh(
-            &state_dir,
-            &account,
-            &HashSet::new(),
-            &HashSet::new(),
-            &fetched,
-        )
-        .unwrap();
-        assert!(remove_if_revision(&state_dir, &account, record_id, 1).unwrap());
-        let observed_tombstones = HashSet::from([(record_id, 1)]);
-        save_refresh(
-            &state_dir,
-            &account,
-            &HashSet::new(),
-            &observed_tombstones,
-            &Catalog::empty(&account),
-        )
-        .unwrap();
-        assert!(
-            load(&state_dir, &account)
-                .unwrap()
-                .pruned_revisions
-                .is_empty()
-        );
-
-        save_refresh(
-            &state_dir,
-            &account,
-            &HashSet::new(),
-            &HashSet::new(),
-            &fetched,
-        )
-        .unwrap();
-
-        assert!(
-            load(&state_dir, &account).unwrap().records.is_empty(),
-            "a refresh with an empty stale baseline resurrected a pruned revision"
-        );
-    }
-
-    #[test]
-    fn refresh_save_does_not_resurrect_a_new_revision_pruned_after_fetch() {
-        let root = crate::test_support::canonical_tempdir();
-        let state_dir = root.path().join("state");
-        super::super::state::test_support::create_account(&state_dir, "https://sync.example")
-            .unwrap();
-        let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
-        let mut baseline = Catalog::empty(&account);
-        baseline.records.push(record(0x59, "office", "work"));
-        let baseline_revisions = HashSet::from([(baseline.records[0].record_id, 1)]);
-        save(&state_dir, &account, &baseline).unwrap();
-        let mut fetched = Catalog::empty(&account);
-        let mut fetched_record = record(0x59, "office", "work");
-        fetched_record.service_revision = 2;
-        let record_id = fetched_record.record_id;
-        fetched.records.push(fetched_record);
-        save(&state_dir, &account, &fetched).unwrap();
-        assert!(remove_if_revision(&state_dir, &account, record_id, 2).unwrap());
-
-        save_refresh(
-            &state_dir,
-            &account,
-            &baseline_revisions,
-            &HashSet::new(),
-            &fetched,
-        )
-        .unwrap();
-
-        assert!(load(&state_dir, &account).unwrap().records.is_empty());
-    }
-
-    #[test]
-    fn active_exact_endpoint_sessions_are_suppressed() {
+    fn active_exact_endpoint_hosts_are_suppressed() {
         let root = crate::test_support::canonical_tempdir();
         let state_dir = root.path().join("state");
         let registry_dir = root.path().join("registry-user/live-endpoints");
@@ -1356,13 +819,13 @@ mod tests {
             .unwrap();
         let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
         let mut catalog = Catalog::empty(&account);
-        let record = record(0x21, "office", "work");
+        let record = record(0x21, "office");
         let identity = record.endpoint_identity;
         catalog.records.push(record);
         save(&state_dir, &account, &catalog).unwrap();
         let _guard = crate::endpoint_registry::register(&registry_dir, identity).unwrap();
 
-        let listed = sessions_excluding_local_endpoints(
+        let listed = hosts_excluding_local_endpoints(
             &state_dir,
             &account,
             timestamp(1_700_000_000),
@@ -1371,7 +834,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            listed.sessions.is_empty(),
+            listed.hosts.is_empty(),
             "locally served session was listed twice"
         );
         assert!(!listed.registry_unavailable);
@@ -1385,7 +848,7 @@ mod tests {
             .unwrap();
         let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
         let mut catalog = Catalog::empty(&account);
-        catalog.records.push(record(0x25, "legacy", "work"));
+        catalog.records.push(record(0x25, "legacy"));
         let catalog_path = state_dir.join(CATALOG_FILE);
         let mut encoded: serde_json::Value =
             serde_json::to_value(&catalog).expect("catalog fixture serializes");
@@ -1401,48 +864,6 @@ mod tests {
     }
 
     #[test]
-    fn synchronized_session_listing_retains_remote_versions_and_reads_legacy_catalogs() {
-        let root = crate::test_support::canonical_tempdir();
-        let state_dir = root.path().join("state");
-        let registry_dir = root.path().join("registry-user/live-endpoints");
-        super::super::state::test_support::create_account(&state_dir, "https://sync.example")
-            .unwrap();
-        let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
-        let mut catalog = Catalog::empty(&account);
-        catalog.records.push(record(0x26, "versioned", "work"));
-        save(&state_dir, &account, &catalog).unwrap();
-
-        let listed = sessions_excluding_local_endpoints(
-            &state_dir,
-            &account,
-            timestamp(1_700_000_000),
-            &registry_dir,
-        )
-        .unwrap();
-        assert_eq!(listed.sessions[0].attached_version, Some([0, 2, 0]));
-        assert_eq!(listed.sessions[0].herdr_version, [1, 2, 3]);
-
-        let catalog_path = state_dir.join(CATALOG_FILE);
-        let mut legacy: serde_json::Value =
-            serde_json::to_value(&catalog).expect("catalog fixture serializes");
-        legacy["records"][0]
-            .as_object_mut()
-            .unwrap()
-            .remove("attached_version");
-        std::fs::write(&catalog_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
-
-        let legacy = sessions_excluding_local_endpoints(
-            &state_dir,
-            &account,
-            timestamp(1_700_000_000),
-            &registry_dir,
-        )
-        .unwrap();
-        assert_eq!(legacy.sessions[0].attached_version, None);
-        assert_eq!(legacy.sessions[0].herdr_version, [1, 2, 3]);
-    }
-
-    #[test]
     fn same_label_different_endpoint_is_retained() {
         let root = crate::test_support::canonical_tempdir();
         let state_dir = root.path().join("state");
@@ -1451,14 +872,14 @@ mod tests {
             .unwrap();
         let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
         let mut catalog = Catalog::empty(&account);
-        let local = record(0x31, "office", "work");
+        let local = record(0x31, "office");
         let local_identity = local.endpoint_identity;
         catalog.records.push(local);
-        catalog.records.push(record(0x32, "office", "work"));
+        catalog.records.push(record(0x32, "office"));
         save(&state_dir, &account, &catalog).unwrap();
         let _guard = crate::endpoint_registry::register(&registry_dir, local_identity).unwrap();
 
-        let listed = sessions_excluding_local_endpoints(
+        let listed = hosts_excluding_local_endpoints(
             &state_dir,
             &account,
             timestamp(1_700_000_000),
@@ -1466,8 +887,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(listed.sessions.len(), 1);
-        assert_eq!(listed.sessions[0].target, "office/work");
+        assert_eq!(listed.hosts.len(), 1);
+        assert_eq!(listed.hosts[0].host, "office");
         assert!(!listed.registry_unavailable);
     }
 
@@ -1485,12 +906,12 @@ mod tests {
             .unwrap();
         let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
         let mut catalog = Catalog::empty(&account);
-        catalog.records.push(record(0x41, "office", "work"));
+        catalog.records.push(record(0x41, "office"));
         save(&state_dir, &account, &catalog).unwrap();
         std::fs::create_dir(&registry_dir).unwrap();
         std::fs::set_permissions(&registry_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let listed = sessions_excluding_local_endpoints(
+        let listed = hosts_excluding_local_endpoints(
             &state_dir,
             &account,
             timestamp(1_700_000_000),
@@ -1498,11 +919,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            listed.sessions.len(),
-            1,
-            "registry error hid a remote session"
-        );
+        assert_eq!(listed.hosts.len(), 1, "registry error hid a remote session");
         assert!(listed.registry_unavailable);
     }
 }

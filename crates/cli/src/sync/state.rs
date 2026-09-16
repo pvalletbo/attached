@@ -239,7 +239,7 @@ pub fn load_account(state_dir: &Path, required_scope: ApiKeyScope) -> Result<Acc
         .context("no synchronization account is configured")
 }
 
-#[tracing::instrument(name = "inspect_sync_account", level = "debug", skip_all)]
+#[cfg(test)]
 pub fn has_download_account(state_dir: &Path) -> Result<bool> {
     Ok(match load_stored_account(state_dir)? {
         None => false,

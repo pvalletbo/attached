@@ -7,7 +7,6 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use attached_session_sync_protocol::account::ApiKeyScope;
-use attached_tunnel_protocol::HerdrVersion;
 use iroh::{Endpoint, endpoint::presets};
 use iroh_tickets::endpoint::EndpointTicket;
 use tokio::{
@@ -80,7 +79,7 @@ pub(crate) async fn local_proxy(socket: PathBuf) -> Result<i32> {
 
 async fn open(
     endpoint: &Endpoint,
-    attachment: &sync::state_catalog::SyncedAttachment,
+    attachment: &sync::state_catalog::HostConnection,
     public_key: &str,
 ) -> Result<(
     iroh::endpoint::Connection,
@@ -153,17 +152,21 @@ pub(crate) async fn connect(
     trust_new_host_key: bool,
 ) -> Result<i32> {
     let account = sync::state::load_account(path, ApiKeyScope::Download)?;
-    // No Herdr executable or exact-version compatibility check belongs on this carrier.
-    if no_cache
-        || sync::state_catalog::ssh_host(path, &account, target, sync::utc_now_seconds()).is_err()
-    {
-        let refreshed = sync::refresh::refresh_sessions(path, HerdrVersion::new(0, 0, 0)).await?;
-        for warning in refreshed.warnings {
+    let refreshed = sync::refresh::hosts_for_connect(path, no_cache).await?;
+    for warning in refreshed.warnings {
+        if !warning.is_verbose_only() {
             eprintln!("Warning: {warning}");
         }
     }
-    let attachment =
-        sync::state_catalog::ssh_host(path, &account, target, sync::utc_now_seconds())?;
+    // A newly added or renamed target may not be in an otherwise fresh catalog.
+    if sync::state_catalog::host(path, &account, target, sync::utc_now_seconds()).is_err() {
+        sync::refresh::refresh_hosts(path).await?;
+    }
+    let attachment = sync::state_catalog::host(path, &account, target, sync::utc_now_seconds())?;
+    ensure!(
+        attachment.ssh_enabled,
+        "SSH access is disabled on this publisher; run `attached ssh-access enable` there"
+    );
     let consumer = iroh::SecretKey::from_bytes(
         account
             .consumer_identity_secret()
@@ -196,7 +199,7 @@ pub(crate) async fn connect(
 async fn run(
     endpoint: &Endpoint,
     path: &Path,
-    attachment: sync::state_catalog::SyncedAttachment,
+    attachment: sync::state_catalog::HostConnection,
     account: sync::state::AccountCredentials,
     command: Vec<String>,
     expose_config: bool,

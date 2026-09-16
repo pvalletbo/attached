@@ -8,7 +8,7 @@ use tokio::{
     time::{Instant, timeout},
 };
 
-use crate::sync::{self, state::AccountCredentials, state_catalog::SyncedAttachment};
+use crate::sync::{self, state::AccountCredentials, state_catalog::HostConnection};
 
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
 const REFRESH_RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -18,12 +18,12 @@ pub(super) struct Descriptors {
 }
 
 struct State {
-    current: SyncedAttachment,
+    current: HostConnection,
     last_attempt: Option<Instant>,
 }
 
 impl Descriptors {
-    pub(super) fn new(current: SyncedAttachment) -> Self {
+    pub(super) fn new(current: HostConnection) -> Self {
         Self {
             state: Mutex::new(State {
                 current,
@@ -35,8 +35,8 @@ impl Descriptors {
     pub(super) async fn get(
         &self,
         account: &AccountCredentials,
-        failed: Option<&SyncedAttachment>,
-    ) -> Result<SyncedAttachment> {
+        failed: Option<&HostConnection>,
+    ) -> Result<HostConnection> {
         self.get_with(failed, |previous| async move {
             sync::refresh::refresh_ssh_attachment(account, &previous).await
         })
@@ -47,12 +47,12 @@ impl Descriptors {
     // setup waits for this lock: already-established byte streams never use it.
     async fn get_with<Fetch, F>(
         &self,
-        failed: Option<&SyncedAttachment>,
+        failed: Option<&HostConnection>,
         fetch: Fetch,
-    ) -> Result<SyncedAttachment>
+    ) -> Result<HostConnection>
     where
-        Fetch: FnOnce(SyncedAttachment) -> F,
-        F: Future<Output = Result<SyncedAttachment>>,
+        Fetch: FnOnce(HostConnection) -> F,
+        F: Future<Output = Result<HostConnection>>,
     {
         let mut state = self.state.lock().await;
         let live = sync::utc_now_seconds() < state.current.expires_at;
@@ -111,23 +111,22 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
-    fn descriptor(expired: bool) -> SyncedAttachment {
+    fn descriptor(expired: bool) -> HostConnection {
         let id = iroh::SecretKey::generate().public();
-        SyncedAttachment {
+        HostConnection {
             record_id: RecordId::from_bytes([1; 16]),
             service_revision: 1,
             endpoint_ticket: EndpointTicket::new(iroh::EndpointAddr::new(id)).to_string(),
             endpoint_identity: *id.as_bytes(),
             attach_capability: [2; 32],
-            attached_version: None,
-            herdr_version: [0, 0, 0],
-            session: String::new(),
+            attached_version: [0, 0, 0],
+            ssh_enabled: true,
             expires_at: sync::utc_now_seconds()
                 + chrono::Duration::seconds(if expired { -1 } else { 300 }),
         }
     }
 
-    fn renewed(mut previous: SyncedAttachment) -> SyncedAttachment {
+    fn renewed(mut previous: HostConnection) -> HostConnection {
         previous.service_revision += 1;
         previous.expires_at = sync::utc_now_seconds() + chrono::Duration::seconds(300);
         previous.attach_capability = [3; 32];
@@ -258,7 +257,7 @@ mod tests {
         let result = timeout(
             Duration::from_millis(20),
             cache.get_with(None, |_| async {
-                std::future::pending::<Result<SyncedAttachment>>().await
+                std::future::pending::<Result<HostConnection>>().await
             }),
         )
         .await;

@@ -28,7 +28,6 @@ const CANDIDATE_EXIT_GRACE: Duration = Duration::from_secs(5);
 #[serde(deny_unknown_fields)]
 pub(crate) struct ServeConfig {
     pub(crate) state_dir: PathBuf,
-    pub(crate) herdr_bin: PathBuf,
     pub(crate) host_label: String,
 }
 
@@ -37,7 +36,6 @@ pub(crate) struct ServeConfig {
 pub(crate) struct CandidateConfig {
     pub(crate) serve: ServeConfig,
     pub(crate) operation_id: UpdateOperationId,
-    pub(crate) session: String,
     pub(crate) expected_version: AttachedVersion,
     pub(crate) expected_endpoint_identity: [u8; 32],
     pub(crate) capability: [u8; 32],
@@ -398,11 +396,9 @@ mod tests {
         let config = CandidateConfig {
             serve: ServeConfig {
                 state_dir: root.path().join("state"),
-                herdr_bin: PathBuf::from("herdr"),
                 host_label: "office".to_owned(),
             },
             operation_id: UpdateOperationId::from_bytes([0x41; 16]),
-            session: "work".to_owned(),
             expected_version: AttachedVersion::new(9, 8, 7),
             expected_endpoint_identity: [0x51; 32],
             capability: [0x61; 32],
