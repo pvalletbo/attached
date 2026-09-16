@@ -3,16 +3,13 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, bail, ensure};
 use attached_session_sync_protocol::{
     account::{ApiKeyScope, RecordId, ServiceOrigin},
-    api::{
-        CACHE_CONTROL_VALUE, CreateAccountResponse, Envelope, ErrorDto, LiveRecordIndex,
-        parse_live_record_index,
-    },
+    api::{CreateAccountResponse, Envelope, ErrorDto, LiveRecordIndex, parse_live_record_index},
     limits::MAX_API_BODY_BYTES,
 };
 use futures_util::StreamExt as _;
 use reqwest::{
     Client, Response, StatusCode,
-    header::{self, HeaderValue},
+    header::{self, HeaderMap, HeaderValue},
     redirect::Policy,
 };
 
@@ -59,10 +56,7 @@ impl SyncHttpClient {
         }
         ensure_json(&response)?;
         ensure!(
-            response
-                .headers()
-                .get(header::CACHE_CONTROL)
-                .is_some_and(|value| value.as_bytes() == CACHE_CONTROL_VALUE.as_bytes()),
+            cache_control_has_no_store(response.headers()),
             "account-creation response is not marked no-store"
         );
         let body = bounded_response(response, MAX_API_BODY_BYTES).await?;
@@ -200,6 +194,53 @@ fn response_revision(response: &reqwest::Response) -> Result<u64> {
     Ok(revision)
 }
 
+fn cache_control_has_no_store(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::CACHE_CONTROL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(cache_control_value_has_no_store)
+}
+
+fn cache_control_value_has_no_store(value: &str) -> bool {
+    let mut directive_start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut found = false;
+
+    for (index, byte) in value.bytes().enumerate() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+            }
+            continue;
+        }
+
+        match byte {
+            b'"' => quoted = true,
+            b',' => {
+                found |= is_no_store_directive(&value[directive_start..index]);
+                directive_start = index + 1;
+            }
+            _ => {}
+        }
+    }
+
+    if quoted || escaped {
+        return false;
+    }
+    found || is_no_store_directive(&value[directive_start..])
+}
+
+fn is_no_store_directive(value: &str) -> bool {
+    let value = value.trim();
+    !value.contains('=') && value.eq_ignore_ascii_case("no-store")
+}
+
 fn is_json_content_type(value: &HeaderValue) -> bool {
     let Ok(value) = value.to_str() else {
         return false;
@@ -293,5 +334,35 @@ mod content_type_tests {
                 "accepted {content_type}"
             );
         }
+    }
+
+    #[test]
+    fn cache_control_accepts_no_store_directive_without_matching_lookalikes() {
+        for value in [
+            "no-store",
+            "No-Store",
+            "private, no-store",
+            "max-age=0, private=\"x,y\", NO-STORE",
+        ] {
+            assert!(cache_control_value_has_no_store(value), "rejected {value}");
+        }
+
+        for value in [
+            "private",
+            "no-store=1",
+            "not-no-store",
+            "private=\"x, no-store, y\"",
+            "private=\"unterminated, no-store",
+        ] {
+            assert!(!cache_control_value_has_no_store(value), "accepted {value}");
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.append(header::CACHE_CONTROL, HeaderValue::from_static("private"));
+        headers.append(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("max-age=0, No-Store"),
+        );
+        assert!(cache_control_has_no_store(&headers));
     }
 }
