@@ -21,6 +21,7 @@ mod secure_state;
 mod serve_handoff;
 mod server;
 mod session;
+mod session_catalog;
 mod session_picker;
 mod sync;
 mod tunnel;
