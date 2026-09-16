@@ -160,6 +160,11 @@ pub async fn attach(
         local_version == remote_version,
         "remote Herdr version did not match after update"
     );
+    let _notification_activity = crate::notifications::activity::attach(
+        state_dir,
+        attachment.endpoint_identity,
+        &attachment.session,
+    )?;
     let connection = tunnel::connect(
         endpoint.endpoint_addr().clone(),
         &local_identity,
@@ -209,7 +214,7 @@ fn finish_remote_operation<T>(
     }
 }
 
-fn parse_target(target: &str) -> Result<(&str, &str)> {
+pub(crate) fn parse_target(target: &str) -> Result<(&str, &str)> {
     let (host, session) = target
         .split_once('/')
         .context("session target must be `HOST/SESSION`")?;

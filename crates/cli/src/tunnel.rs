@@ -70,7 +70,7 @@ pub(crate) fn is_remote_unavailable(error: &anyhow::Error) -> bool {
     error.downcast_ref::<RemoteUnavailable>().is_some()
 }
 
-async fn bind_client_endpoint(local_identity: &iroh::SecretKey) -> Result<Endpoint> {
+pub(crate) async fn bind_client_endpoint(local_identity: &iroh::SecretKey) -> Result<Endpoint> {
     Endpoint::builder(presets::N0)
         .secret_key(local_identity.clone())
         .bind()

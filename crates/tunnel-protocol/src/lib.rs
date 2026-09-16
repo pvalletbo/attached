@@ -9,6 +9,14 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 pub const PROTOCOL_VERSION: u8 = 3;
 /// ALPN used by the interactive-only Herdr tunnel protocol.
 pub const TUNNEL_ALPN: &[u8] = b"herdr-tunnel/3";
+/// Passive, fixed-operation Herdr agent events. Before application admission,
+/// a bidirectional stream proves the authorized consumer key by signing the
+/// TLS exporter (`attached-events-consumer-v1`, empty context, 32 bytes) prefixed
+/// with `attached/events/consumer-proof/v1\0`. Client sends 64-byte Ed25519
+/// signature; server acknowledges with byte 0. A second bidirectional stream
+/// performs existing capability authentication, then one server-only
+/// unidirectional stream carries bounded JSON lines. No client API input.
+pub const EVENTS_ALPN: &[u8] = b"attached-events/1";
 /// Magic prefix for interactive stream headers.
 const STREAM_MAGIC: [u8; 4] = *b"HDRS";
 /// Magic prefix for authentication requests and responses.
