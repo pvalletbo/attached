@@ -301,6 +301,51 @@ async fn refresh_sessions_with_registry_at(
     Ok(finish_refresh(listing, warnings))
 }
 
+/// Refresh only an already-selected SSH publisher, using the broker's unlocked
+/// account and stable record/endpoint identities. Labels are never re-resolved.
+/// This does not change the discovery cache or any active SSH connection.
+pub(crate) async fn refresh_ssh_attachment(
+    account: &state::AccountCredentials,
+    previous: &state_catalog::SyncedAttachment,
+) -> Result<state_catalog::SyncedAttachment> {
+    let client = SyncHttpClient::new()?;
+    let indexed = client
+        .list_records(account)
+        .await?
+        .records
+        .into_iter()
+        .find(|entry| entry.record_id == previous.record_id)
+        .context("SSH publisher is no longer advertised; check that Attached serve is running")?;
+    ensure!(
+        indexed.revision >= previous.service_revision,
+        "SSH publisher record revision moved backwards"
+    );
+    let fetched = fetch_consistent_record(&client, account, indexed)
+        .await?
+        .context("SSH publisher disappeared during discovery refresh")?;
+    let envelope = CryptoEnvelope::new(fetched.envelope.nonce, fetched.envelope.ciphertext)?;
+    // Validate against completion time, not the time before the HTTP requests.
+    let context = VerificationContext {
+        account_id: *account.account_id().as_bytes(),
+        record_id: *previous.record_id.as_bytes(),
+        now: super::utc_now_seconds(),
+        local_version: descriptor_version(HerdrVersion::new(0, 0, 0))?,
+    };
+    let opened = open_session_access_descriptor_cursorless_for_native_upgrade(
+        &envelope,
+        account.account_root_key(),
+        &context,
+    )
+    .context("could not verify refreshed SSH publisher descriptor")?;
+    let attachment =
+        CatalogRecord::from_opened(previous.record_id, fetched.revision, &opened).ssh_attachment();
+    ensure!(
+        attachment.endpoint_identity == previous.endpoint_identity,
+        "SSH publisher identity changed during discovery refresh"
+    );
+    Ok(attachment)
+}
+
 const MAX_RECORD_FETCH_ATTEMPTS: usize = 3;
 
 // The index is not a snapshot. A newer GET may be used only after a second
@@ -519,6 +564,105 @@ mod tests {
             stream.write_all(&body).await.unwrap();
             stream.shutdown().await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn ssh_renewal_verifies_the_original_account_record_and_publisher() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            for scenario in 0..6 {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let root = crate::test_support::canonical_tempdir();
+                let state_dir = root.path().join("state");
+                state::test_support::create_account(
+                    &state_dir,
+                    &format!("http://{}", listener.local_addr().unwrap()),
+                )
+                .unwrap();
+                let account = state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
+                // Renewal must use the unlocked account already retained by the
+                // broker, not re-read credentials or ask for another password.
+                std::fs::remove_file(state_dir.join("sync-account.bundle")).unwrap();
+                let record_id = RecordId::from_bytes([71; 16]);
+                let now = super::super::utc_now_seconds();
+                let previous = state_catalog::SyncedAttachment {
+                    record_id,
+                    service_revision: if scenario == 5 { 2 } else { 1 },
+                    endpoint_ticket: ENDPOINT.into(),
+                    endpoint_identity: ENDPOINT_ID,
+                    attach_capability: [1; 32],
+                    attached_version: None,
+                    herdr_version: [0, 0, 0],
+                    expires_at: now - chrono::Duration::seconds(1),
+                    session: String::new(),
+                };
+                let ticket = if scenario == 1 {
+                    EndpointTicket::new(iroh::EndpointAddr::new(
+                        iroh::SecretKey::generate().public(),
+                    ))
+                    .to_string()
+                } else {
+                    ENDPOINT.to_owned()
+                };
+                let expired = scenario == 2;
+                let descriptor = SessionAccessDescriptor::new(
+                    "renamed-publisher".into(),
+                    now - chrono::Duration::seconds(90),
+                    now + chrono::Duration::seconds(if expired { -1 } else { 90 }),
+                    ticket,
+                    CapabilitySecret::from_bytes([2; 32]),
+                    SessionAccessAttachedVersion::new(0, 2, 12),
+                    SessionAccessVersion::new(99, 0, 0),
+                    Vec::new(),
+                )
+                .unwrap();
+                let (nonce, mut ciphertext) = seal_session_access_descriptor(
+                    &descriptor,
+                    account.account_root_key(),
+                    account.account_id().as_bytes(),
+                    record_id.as_bytes(),
+                )
+                .unwrap()
+                .into_parts();
+                if scenario == 3 {
+                    ciphertext[0] ^= 1;
+                }
+                let body = serde_json::to_vec(&Envelope::new(nonce, ciphertext).unwrap()).unwrap();
+                let revision = if scenario == 5 { 1 } else { 2 };
+                let entries = if scenario == 4 {
+                    vec![]
+                } else {
+                    vec![LiveRecordIndexEntry {
+                        record_id,
+                        revision,
+                    }]
+                };
+                let index = serde_json::to_vec(&LiveRecordIndex::new(entries).unwrap()).unwrap();
+                let index_path = format!("/v1/accounts/{}/records", account.account_id());
+                let mut responses = vec![(index_path.clone(), 200, None, index)];
+                if scenario < 4 {
+                    responses.push((format!("{index_path}/{record_id}"), 200, Some(2), body));
+                }
+                let server = tokio::spawn(serve_sequence(listener, responses));
+                let result = refresh_ssh_attachment(&account, &previous).await;
+                if scenario == 0 {
+                    let next = result.unwrap();
+                    assert_eq!(next.endpoint_identity, previous.endpoint_identity);
+                    assert_eq!(next.record_id, previous.record_id);
+                    assert_eq!(next.service_revision, 2);
+                    assert_eq!(next.attach_capability, [2; 32]);
+                    assert!(next.expires_at > now);
+                } else {
+                    assert!(
+                        result.is_err(),
+                        "accepted invalid renewal scenario {scenario}"
+                    );
+                }
+                server.await.unwrap();
+                assert!(!state_dir.join("sync-catalog.json").exists());
+            }
+        })
+        .await
+        .expect("SSH renewal fixture timed out");
     }
 
     #[tokio::test]

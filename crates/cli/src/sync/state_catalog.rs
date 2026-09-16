@@ -46,8 +46,8 @@ pub(super) struct SessionListing {
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct SyncedAttachment {
-    pub(super) record_id: RecordId,
-    pub(super) service_revision: u64,
+    pub(crate) record_id: RecordId,
+    pub(crate) service_revision: u64,
     pub endpoint_ticket: String,
     pub endpoint_identity: [u8; 32],
     pub attach_capability: [u8; 32],
@@ -121,6 +121,20 @@ impl CatalogRecord {
         self.expires_at <= now
     }
 
+    pub(super) fn ssh_attachment(&self) -> SyncedAttachment {
+        SyncedAttachment {
+            record_id: self.record_id,
+            service_revision: self.service_revision,
+            endpoint_ticket: self.endpoint_ticket.clone(),
+            endpoint_identity: self.endpoint_identity,
+            attach_capability: self.attach_capability,
+            attached_version: self.attached_version,
+            herdr_version: self.herdr_version,
+            expires_at: self.expires_at,
+            session: String::new(),
+        }
+    }
+
     pub(super) fn from_opened(
         record_id: RecordId,
         service_revision: u64,
@@ -147,6 +161,36 @@ impl CatalogRecord {
             sessions: descriptor.sessions().to_vec(),
         }
     }
+}
+
+/// Resolve a publisher independent of its session list or Herdr version.
+/// Stable endpoint IDs are accepted; ambiguous human labels fail closed.
+pub(crate) fn ssh_host(
+    state_dir: &Path,
+    account: &AccountCredentials,
+    target: &str,
+    now: DateTime<Utc>,
+) -> Result<SyncedAttachment> {
+    let catalog = load(state_dir, account)?;
+    // An explicit endpoint identity must never fall back to a mutable label.
+    // Otherwise another publisher can name itself after an absent/expired host's
+    // ID and bypass the caller's identity selection (and its existing host pin).
+    let target_identity = target.parse::<iroh::EndpointId>().ok();
+    let mut matches = catalog.records.iter().filter(|record| {
+        !record.is_expired_at(now)
+            && match target_identity {
+                Some(identity) => &record.endpoint_identity == identity.as_bytes(),
+                None => record.host_label == target,
+            }
+    });
+    let record = matches
+        .next()
+        .context("SSH publisher not found; use its host label or stable endpoint ID")?;
+    ensure!(
+        matches.next().is_none(),
+        "ambiguous publisher label; use its stable endpoint ID"
+    );
+    Ok(record.ssh_attachment())
 }
 
 #[tracing::instrument(name = "load_sync_catalog", level = "debug", skip_all)]
@@ -597,6 +641,78 @@ mod tests {
             attached_version: Some([0, 2, 0]),
             herdr_version: [1, 2, 3],
             sessions: vec![session.to_owned()],
+        }
+    }
+
+    #[test]
+    fn ssh_resolves_publishers_without_sessions_and_rejects_ambiguous_or_expired_hosts() {
+        let root = crate::test_support::canonical_tempdir();
+        let state_dir = root.path().join("state");
+        super::super::state::test_support::create_account(&state_dir, "https://sync.example")
+            .unwrap();
+        let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
+        let mut catalog = Catalog::empty(&account);
+        let mut host = record(0x51, "office", "work");
+        host.sessions.clear();
+        let id = iroh::EndpointId::from_bytes(&host.endpoint_identity)
+            .unwrap()
+            .to_string();
+        catalog.records.push(host);
+        save(&state_dir, &account, &catalog).unwrap();
+        let now = timestamp(1_700_000_000);
+        assert!(
+            ssh_host(&state_dir, &account, "office", now)
+                .unwrap()
+                .session
+                .is_empty()
+        );
+        assert!(ssh_host(&state_dir, &account, &id, now).is_ok());
+        assert!(ssh_host(&state_dir, &account, "office/work", now).is_err());
+        catalog.records.push(record(0x52, "office", "another"));
+        save(&state_dir, &account, &catalog).unwrap();
+        assert!(ssh_host(&state_dir, &account, "office", now).is_err());
+        assert!(ssh_host(&state_dir, &account, &id, now).is_ok());
+        assert!(ssh_host(&state_dir, &account, &id, timestamp(1_900_000_000)).is_err());
+    }
+
+    #[test]
+    fn explicit_ssh_endpoint_identity_never_matches_another_publishers_label() {
+        let root = crate::test_support::canonical_tempdir();
+        let state_dir = root.path().join("state");
+        super::super::state::test_support::create_account(&state_dir, "https://sync.example")
+            .unwrap();
+        let account = super::super::state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
+        let mut catalog = Catalog::empty(&account);
+        let intended = record(0x61, "office", "work");
+        let identity = iroh::EndpointId::from_bytes(&intended.endpoint_identity).unwrap();
+        let target = identity.to_string();
+        let other = record(0x62, &target, "other");
+        let now = timestamp(1_700_000_000);
+
+        // A label cannot impersonate an absent endpoint, even on first use.
+        catalog.records = vec![other.clone()];
+        save(&state_dir, &account, &catalog).unwrap();
+        assert!(ssh_host(&state_dir, &account, &target, now).is_err());
+
+        // Nor may an expired descriptor redirect a previously pinned identity.
+        let mut expired = intended.clone();
+        expired.published_at = Some(now - chrono::Duration::seconds(90));
+        expired.expires_at = now;
+        catalog.records = vec![expired, other.clone()];
+        save(&state_dir, &account, &catalog).unwrap();
+        assert!(ssh_host(&state_dir, &account, &target, now).is_err());
+
+        // When the intended endpoint is present, its identity takes precedence
+        // over a colliding label; normal human-label selection still works.
+        catalog.records = vec![intended, other];
+        save(&state_dir, &account, &catalog).unwrap();
+        for target in [&*target, "office"] {
+            assert_eq!(
+                ssh_host(&state_dir, &account, target, now)
+                    .unwrap()
+                    .endpoint_identity,
+                *identity.as_bytes(),
+            );
         }
     }
 

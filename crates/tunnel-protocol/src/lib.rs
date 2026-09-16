@@ -9,6 +9,8 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 pub const PROTOCOL_VERSION: u8 = 3;
 /// ALPN used by the interactive-only Herdr tunnel protocol.
 pub const TUNNEL_ALPN: &[u8] = b"herdr-tunnel/3";
+/// Account-authorized SSH service, separately negotiated from Herdr attachment.
+pub const SSH_ALPN: &[u8] = b"attached-ssh/1";
 /// Magic prefix for interactive stream headers.
 const STREAM_MAGIC: [u8; 4] = *b"HDRS";
 /// Magic prefix for authentication requests and responses.
