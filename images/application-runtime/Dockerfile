@@ -18,6 +18,8 @@ RUN apt-get update \
         less \
         libgcc-s1 \
         procps \
+        python3 \
+        tini \
         xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
@@ -27,7 +29,10 @@ RUN TARGETARCH="${TARGETARCH}" /tmp/install-runtime.sh \
     && attached --version \
     && herdr --version
 
+COPY start-service.py /usr/local/libexec/attached/start-service.py
+
 ENV SHELL=/bin/bash \
     TERM=xterm-256color
 
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/bin/python3", "/usr/local/libexec/attached/start-service.py"]
 CMD ["/bin/bash"]
