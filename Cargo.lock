@@ -245,7 +245,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "attached"
-version = "0.2.14"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -280,7 +280,7 @@ dependencies = [
 
 [[package]]
 name = "attached-session-sync-protocol"
-version = "0.2.14"
+version = "0.3.0"
 dependencies = [
  "attached-tunnel-protocol",
  "base64",
@@ -300,7 +300,7 @@ dependencies = [
 
 [[package]]
 name = "attached-session-sync-worker"
-version = "0.2.14"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "attached-session-sync-protocol",
@@ -319,7 +319,7 @@ dependencies = [
 
 [[package]]
 name = "attached-tunnel-protocol"
-version = "0.2.14"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "iroh",
