@@ -7,7 +7,6 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use attached_session_sync_protocol::account::ApiKeyScope;
-use attached_tunnel_protocol::HerdrVersion;
 use iroh::{Endpoint, endpoint::presets};
 use iroh_tickets::endpoint::EndpointTicket;
 use tokio::{
@@ -80,7 +79,7 @@ pub(crate) async fn local_proxy(socket: PathBuf) -> Result<i32> {
 
 async fn open(
     endpoint: &Endpoint,
-    attachment: &sync::state_catalog::SyncedAttachment,
+    attachment: &sync::state_catalog::HostConnection,
     public_key: &str,
 ) -> Result<(
     iroh::endpoint::Connection,
@@ -153,17 +152,7 @@ pub(crate) async fn connect(
     trust_new_host_key: bool,
 ) -> Result<i32> {
     let account = sync::state::load_account(path, ApiKeyScope::Download)?;
-    // No Herdr executable or exact-version compatibility check belongs on this carrier.
-    if no_cache
-        || sync::state_catalog::ssh_host(path, &account, target, sync::utc_now_seconds()).is_err()
-    {
-        let refreshed = sync::refresh::refresh_sessions(path, HerdrVersion::new(0, 0, 0)).await?;
-        for warning in refreshed.warnings {
-            eprintln!("Warning: {warning}");
-        }
-    }
-    let attachment =
-        sync::state_catalog::ssh_host(path, &account, target, sync::utc_now_seconds())?;
+    let attachment = sync::refresh::ssh_host(path, &account, target, no_cache).await?;
     let consumer = iroh::SecretKey::from_bytes(
         account
             .consumer_identity_secret()
@@ -193,76 +182,127 @@ pub(crate) async fn connect(
     result
 }
 
-async fn run(
-    endpoint: &Endpoint,
-    path: &Path,
-    attachment: sync::state_catalog::SyncedAttachment,
-    account: sync::state::AccountCredentials,
-    command: Vec<String>,
-    expose_config: bool,
-    trust_new_host_key: bool,
-) -> Result<i32> {
-    // A new key per invocation. It is registered only inside each authorized Iroh
-    // connection, never persisted on the publisher, and dies with that connection.
-    let key = state::ephemeral_key()?;
-    let public_key = key.public_key().to_openssh()?;
-    let descriptors = Arc::new(Descriptors::new(attachment));
-    let account = Arc::new(account);
-    let (first_connection, _, _, response) =
-        open_current(endpoint, &descriptors, &account, &public_key).await?;
-    let peer = first_connection.remote_id();
-    first_connection.close(0u32.into(), b"SSH metadata verified");
-    let host_key = canonical_host_key(&response.host_key)?;
-    state::pin_host(
-        path,
-        &peer,
-        &response.username,
-        &host_key,
-        trust_new_host_key,
-    )?;
+pub(super) struct Broker {
+    descriptors: Arc<Descriptors>,
+    endpoint: Endpoint,
+    account: Arc<sync::state::AccountCredentials>,
+    _temporary: tempfile::TempDir,
+    runtime: PathBuf,
+    listener: UnixListener,
+    public_key: String,
+    response: Response,
+    host_key: String,
+    alias: String,
+}
 
-    // Short paths avoid Unix socket pathname limits. No persistent plaintext keys.
-    let temporary = tempfile::Builder::new().prefix("attached-ssh-").tempdir()?;
-    let runtime = temporary.path().canonicalize()?;
-    secure_state::prepare_private_dir(&runtime)?;
-    let directory = StateDir::open(&runtime)?;
-    let encoded = key.to_openssh(russh::keys::ssh_key::LineEnding::LF)?;
-    directory.atomic_replace("identity", encoded.as_bytes())?;
-    let alias = format!("attached-{peer}");
-    directory.atomic_replace("known_hosts", format!("{alias} {host_key}\n").as_bytes())?;
-    let socket = runtime.join("proxy");
-    let listener = UnixListener::bind(&socket)?;
-    let config = configuration(
-        &alias,
-        &response.username,
-        &runtime,
-        &std::env::current_exe()?,
-    )?;
-    directory.atomic_replace("config", config.as_bytes())?;
-    let config_path = runtime.join("config");
-    let cancellation = tokio_util::sync::CancellationToken::new();
-    let _cancel = cancellation.clone().drop_guard();
-    let broker = async {
+impl Broker {
+    pub(super) async fn prepare(
+        endpoint: &Endpoint,
+        path: &Path,
+        attachment: sync::state_catalog::HostConnection,
+        account: Arc<sync::state::AccountCredentials>,
+        trust_new_host_key: bool,
+    ) -> Result<Self> {
+        // A new key per invocation. It is registered only inside each authorized Iroh
+        // connection, never persisted on the publisher, and dies with that connection.
+        let key = state::ephemeral_key()?;
+        let public_key = key.public_key().to_openssh()?;
+        let descriptors = Arc::new(Descriptors::new(attachment));
+        let (first_connection, _, _, response) =
+            open_current(endpoint, &descriptors, &account, &public_key).await?;
+        let peer = first_connection.remote_id();
+        first_connection.close(0u32.into(), b"SSH metadata verified");
+        let host_key = canonical_host_key(&response.host_key)?;
+        state::pin_host(
+            path,
+            &peer,
+            &response.username,
+            &host_key,
+            trust_new_host_key,
+        )?;
+
+        // Short paths avoid Unix socket pathname limits. No persistent plaintext keys.
+        let temporary = tempfile::Builder::new().prefix("attached-ssh-").tempdir()?;
+        let runtime = temporary.path().canonicalize()?;
+        secure_state::prepare_private_dir(&runtime)?;
+        let directory = StateDir::open(&runtime)?;
+        let encoded = key.to_openssh(russh::keys::ssh_key::LineEnding::LF)?;
+        directory.atomic_replace("identity", encoded.as_bytes())?;
+        let alias = format!("attached-{peer}");
+        directory.atomic_replace("known_hosts", format!("{alias} {host_key}\n").as_bytes())?;
+        let socket = runtime.join("proxy");
+        let listener = UnixListener::bind(&socket)?;
+        let config = configuration(
+            &alias,
+            &response.username,
+            &runtime,
+            &std::env::current_exe()?,
+        )?;
+        directory.atomic_replace("config", config.as_bytes())?;
+        Ok(Self {
+            descriptors,
+            endpoint: endpoint.clone(),
+            account,
+            _temporary: temporary,
+            runtime,
+            listener,
+            public_key,
+            response,
+            host_key,
+            alias,
+        })
+    }
+
+    pub(super) fn observe(&self, connection: &sync::state_catalog::HostConnection) {
+        self.descriptors.observe(connection);
+    }
+
+    pub(super) fn configuration(&self, aliases: &str) -> Result<String> {
+        let config = configuration(
+            &self.alias,
+            &self.response.username,
+            &self.runtime,
+            &std::env::current_exe()?,
+        )?;
+        Ok(config.replacen(
+            &format!("Host {}\n", self.alias),
+            &format!("Host {aliases}\n"),
+            1,
+        ))
+    }
+
+    /// Retirement stops admission, but does not interrupt established SSH streams.
+    /// Global cancellation tears down both pending setup and active connections.
+    pub(super) async fn serve(
+        &self,
+        cancellation: tokio_util::sync::CancellationToken,
+        retired: tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
         let limit = Arc::new(Semaphore::new(8));
         let mut tasks = JoinSet::new();
         loop {
             tokio::select! {
+                biased;
                 _ = cancellation.cancelled() => break,
-                accepted = listener.accept() => {
+                _ = retired.cancelled() => break,
+                accepted = self.listener.accept() => {
                     let (stream, _) = accepted?;
                     let Ok(permit) = limit.clone().try_acquire_owned() else { continue; };
-                    let endpoint = endpoint.clone();
-                    let descriptors = descriptors.clone();
-                    let account = account.clone();
-                    let public_key = public_key.clone();
-                    let expected_username = response.username.clone();
-                    let expected_host_key = host_key.clone();
+                    let endpoint = self.endpoint.clone();
+                    let descriptors = self.descriptors.clone();
+                    let account = self.account.clone();
+                    let public_key = self.public_key.clone();
+                    let expected_username = self.response.username.clone();
+                    let expected_host_key = self.host_key.clone();
                     let token = cancellation.child_token();
+                    let retired = retired.clone();
                     tasks.spawn(async move {
                         let _permit = permit;
                         let (connection, send, receive, metadata) = tokio::select! {
-                            result = open_current(&endpoint, &descriptors, &account, &public_key) => result?,
+                            biased;
                             _ = token.cancelled() => return Ok::<_, anyhow::Error>(()),
+                            _ = retired.cancelled() => return Ok(()),
+                            result = open_current(&endpoint, &descriptors, &account, &public_key) => result?,
                         };
                         let result = async {
                             ensure!(metadata.username == expected_username && canonical_host_key(&metadata.host_key)? == expected_host_key, "publisher SSH identity changed");
@@ -284,9 +324,40 @@ async fn run(
                 }
             }
         }
+        // Existing streams may keep this broker alive after its aliases retire.
+        // Unlink the listening address now so stale OpenSSH configurations fail
+        // promptly rather than queuing behind a listener no longer being polled.
+        let _ = std::fs::remove_file(self.runtime.join("proxy"));
         while tasks.join_next().await.is_some() {}
-        Ok::<_, anyhow::Error>(())
-    };
+        Ok(())
+    }
+}
+
+async fn run(
+    endpoint: &Endpoint,
+    path: &Path,
+    attachment: sync::state_catalog::HostConnection,
+    account: sync::state::AccountCredentials,
+    command: Vec<String>,
+    expose_config: bool,
+    trust_new_host_key: bool,
+) -> Result<i32> {
+    let prepared = Broker::prepare(
+        endpoint,
+        path,
+        attachment,
+        Arc::new(account),
+        trust_new_host_key,
+    )
+    .await?;
+    let config_path = prepared.runtime.join("config");
+    let alias = &prepared.alias;
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let _cancel = cancellation.clone().drop_guard();
+    let broker = prepared.serve(
+        cancellation.clone(),
+        tokio_util::sync::CancellationToken::new(),
+    );
     tokio::pin!(broker);
     if expose_config {
         // Foreground export keeps the ephemeral key unlocked. Users can point ordinary
@@ -302,12 +373,7 @@ async fn run(
         }
         return Ok(0);
     }
-    let mut child = tokio::process::Command::new("ssh")
-        .arg("-F")
-        .arg(&config_path)
-        .arg("-T")
-        .arg(&alias)
-        .args(command)
+    let mut child = openssh_command(&config_path, alias, &command)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -321,6 +387,23 @@ async fn run(
     cancellation.cancel();
     broker.await?;
     Ok(status.code().unwrap_or(255))
+}
+
+fn openssh_command(
+    config: &Path,
+    alias: &str,
+    remote_command: &[String],
+) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("ssh");
+    // OpenSSH also parses options after the destination. End option parsing
+    // before it so remote command arguments cannot override local SSH policy
+    // or select a different local ProxyCommand.
+    command
+        .args(["-F"])
+        .arg(config)
+        .args(["-T", "--", alias])
+        .args(remote_command);
+    command
 }
 
 fn loopback_only(address: &iroh::EndpointAddr) -> bool {
@@ -340,12 +423,12 @@ fn canonical_host_key(encoded: &str) -> Result<String> {
     Ok(russh::keys::PublicKey::new(parsed.key_data().clone(), "").to_openssh()?)
 }
 
-fn config_path(path: &Path) -> Result<String> {
+pub(super) fn config_path(path: &Path) -> Result<String> {
     let value = path.to_str().context("OpenSSH paths must be UTF-8")?;
     ensure!(
         !value
             .chars()
-            .any(|c| c.is_control() || matches!(c, '"' | '%' | '$' | '`' | '\\')),
+            .any(|c| c.is_control() || matches!(c, '"' | '%' | '$' | '`' | '\\' | '*' | '?' | '[')),
         "path cannot be represented safely in OpenSSH configuration"
     );
     Ok(format!("\"{value}\""))
@@ -360,7 +443,7 @@ fn shell_word(path: &Path) -> Result<String> {
 }
 fn configuration(alias: &str, username: &str, runtime: &Path, executable: &Path) -> Result<String> {
     Ok(format!(
-        "Host {alias}\n    HostName {alias}\n    User {username}\n    HostKeyAlias {alias}\n    ProxyCommand {} __ssh-local-proxy {}\n    IdentityFile {}\n    UserKnownHostsFile {}\n    GlobalKnownHostsFile /dev/null\n    StrictHostKeyChecking yes\n    CheckHostIP no\n    BatchMode yes\n    IdentitiesOnly yes\n    IdentityAgent none\n    PasswordAuthentication no\n    KbdInteractiveAuthentication no\n    PreferredAuthentications publickey\n    ForwardAgent no\n    ClearAllForwardings yes\n    RequestTTY no\n    ControlMaster no\n    ControlPath none\n    ConnectTimeout 20\n    ServerAliveInterval 30\n    ServerAliveCountMax 3\n",
+        "Host {alias}\n    HostName {alias}\n    CanonicalizeHostname no\n    User {username}\n    HostKeyAlias {alias}\n    ProxyCommand {} __ssh-local-proxy {}\n    IdentityFile {}\n    UserKnownHostsFile {}\n    GlobalKnownHostsFile /dev/null\n    StrictHostKeyChecking yes\n    CheckHostIP no\n    BatchMode yes\n    IdentitiesOnly yes\n    IdentityAgent none\n    PasswordAuthentication no\n    KbdInteractiveAuthentication no\n    PreferredAuthentications publickey\n    ForwardAgent no\n    ClearAllForwardings yes\n    RequestTTY no\n    ControlMaster no\n    ControlPath none\n    ConnectTimeout 20\n    ServerAliveInterval 30\n    ServerAliveCountMax 3\n",
         shell_word(executable)?,
         shell_word(&runtime.join("proxy"))?,
         config_path(&runtime.join("identity"))?,
@@ -408,6 +491,58 @@ mod tests {
             );
         }
         assert!(config.contains("Attached'\\''s binary"));
+    }
+
+    #[test]
+    fn remote_command_arguments_cannot_override_local_openssh_options() {
+        let root = crate::test_support::canonical_tempdir();
+        let config = root.path().join("config");
+        std::fs::write(
+            &config,
+            configuration(
+                "attached-stable-id",
+                "account",
+                root.path(),
+                Path::new("/bin/attached"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let remote = vec![
+            "-oIdentityAgent=/tmp/unwanted-agent".to_owned(),
+            "-oStrictHostKeyChecking=no".to_owned(),
+            "-oProxyCommand=unwanted-local-command".to_owned(),
+            "argument with spaces".to_owned(),
+        ];
+        let command = openssh_command(&config, "attached-stable-id", &remote);
+        let args = command.as_std().get_args().collect::<Vec<_>>();
+        assert_eq!(args[3], "--");
+        assert_eq!(args[4], "attached-stable-id");
+        assert_eq!(
+            args[5..],
+            remote.iter().map(std::ffi::OsStr::new).collect::<Vec<_>>()
+        );
+        // Ask real OpenSSH to parse the production argv without connecting or
+        // executing anything. These remote arguments must remain remote data.
+        let output = std::process::Command::new(command.as_std().get_program())
+            .arg("-G")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let effective = String::from_utf8(output.stdout).unwrap();
+        assert!(effective.lines().any(|line| line == "identityagent none"));
+        assert!(
+            effective
+                .lines()
+                .any(|line| line == "stricthostkeychecking true")
+        );
+        assert!(!effective.contains("unwanted-local-command"));
+        assert!(effective.contains("__ssh-local-proxy"));
     }
 
     #[test]

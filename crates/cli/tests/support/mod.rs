@@ -39,15 +39,6 @@ case "$*" in
   *) echo 'unexpected op invocation' >&2; exit 90;;
 esac
 "#);
-        fixture.script(
-            "herdr",
-            r#"
-case "$*" in
-  --version) printf 'herdr 3.2.1\n';;
-  *) echo 'unexpected herdr invocation' >&2; exit 91;;
-esac
-"#,
-        );
         fixture
     }
 
@@ -62,7 +53,11 @@ esac
     }
 
     pub fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_attached"));
+        self.command_at(Path::new(env!("CARGO_BIN_EXE_attached")), args)
+    }
+
+    pub fn command_at(&self, executable: &Path, args: &[&str]) -> Command {
+        let mut command = Command::new(executable);
         command
             .env_clear()
             .env("HOME", self.path("home"))
@@ -128,7 +123,7 @@ impl RunningCli {
 
 impl Drop for RunningCli {
     fn drop(&mut self) {
-        // Include Herdr/op descendants on assertion failure or timeout.
+        // Include SSH/op descendants on assertion failure or timeout.
         let _ = rustix::process::kill_process_group(self.pid, rustix::process::Signal::KILL);
     }
 }

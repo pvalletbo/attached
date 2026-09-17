@@ -200,12 +200,23 @@ fn response_revision(response: &reqwest::Response) -> Result<u64> {
     Ok(revision)
 }
 
+fn is_json_content_type(value: &HeaderValue) -> bool {
+    let Ok(value) = value.to_str() else {
+        return false;
+    };
+    value
+        .split_once(';')
+        .map_or(value, |(media_type, _)| media_type)
+        .trim()
+        .eq_ignore_ascii_case("application/json")
+}
+
 fn ensure_json(response: &Response) -> Result<()> {
     ensure!(
         response
             .headers()
             .get(header::CONTENT_TYPE)
-            .is_some_and(|value| value.as_bytes() == b"application/json"),
+            .is_some_and(is_json_content_type),
         "synchronization service returned an unexpected content type"
     );
     Ok(())
@@ -241,7 +252,7 @@ async fn service_error(response: Response) -> anyhow::Error {
     let code = if response
         .headers()
         .get(header::CONTENT_TYPE)
-        .is_some_and(|value| value.as_bytes() == b"application/json")
+        .is_some_and(is_json_content_type)
     {
         bounded_response(response, MAX_ERROR_BODY_BYTES)
             .await
@@ -253,4 +264,34 @@ async fn service_error(response: Response) -> anyhow::Error {
         String::new()
     };
     anyhow::anyhow!("synchronization service returned HTTP {status}{code}")
+}
+
+#[cfg(test)]
+mod content_type_tests {
+    use super::*;
+
+    #[test]
+    fn json_content_type_accepts_parameters_and_case_but_rejects_other_media_types() {
+        for content_type in [
+            "application/json",
+            "application/json; charset=utf-8",
+            "Application/JSON; Charset=UTF-8",
+        ] {
+            assert!(
+                is_json_content_type(&HeaderValue::from_static(content_type)),
+                "rejected {content_type}"
+            );
+        }
+
+        for content_type in [
+            "text/json",
+            "application/problem+json",
+            "text/plain; application/json",
+        ] {
+            assert!(
+                !is_json_content_type(&HeaderValue::from_static(content_type)),
+                "accepted {content_type}"
+            );
+        }
+    }
 }

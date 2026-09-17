@@ -10,26 +10,25 @@ use sha2::Sha256;
 use zeroize::Zeroizing;
 
 use crate::canonical::{
-    HerdrVersion, SessionAccessDescriptor, SessionAccessError, decode_session_access_descriptor,
-    encode_session_access_descriptor,
+    HostAccessDescriptor, HostAccessError, decode_host_access_descriptor,
+    encode_host_access_descriptor,
 };
 
 pub const ENVELOPE_VERSION: u16 = 1;
 pub const NONCE_LEN: usize = 24;
 pub const MAX_CIPHERTEXT_LEN: usize = crate::limits::MAX_CIPHERTEXT_BYTES;
 const MAX_FUTURE_CLOCK_SKEW: Duration = Duration::from_secs(60);
-// This established domain label is retained so a terminology-only rename does not change keys.
-const KEY_INFO: &[u8] = b"herdr/session-sync/manifest-aead-key/v1\0";
-const AAD_DOMAIN: &[u8] = b"herdr/session-sync/envelope-aad/v1\0";
+const KEY_INFO: &[u8] = b"attached/host-sync/descriptor-aead-key/v1\0";
+const AAD_DOMAIN: &[u8] = b"attached/host-sync/envelope-aad/v1\0";
 
 pub struct Envelope {
     nonce: [u8; NONCE_LEN],
     ciphertext: Vec<u8>,
 }
 impl Envelope {
-    pub fn new(nonce: [u8; NONCE_LEN], ciphertext: Vec<u8>) -> Result<Self, SessionAccessError> {
+    pub fn new(nonce: [u8; NONCE_LEN], ciphertext: Vec<u8>) -> Result<Self, HostAccessError> {
         if ciphertext.len() > MAX_CIPHERTEXT_LEN {
-            return Err(SessionAccessError::Limit);
+            return Err(HostAccessError::Limit);
         }
         Ok(Self { nonce, ciphertext })
     }
@@ -58,40 +57,33 @@ pub struct VerificationContext {
     pub account_id: [u8; 16],
     pub record_id: [u8; 16],
     pub now: DateTime<Utc>,
-    pub local_version: HerdrVersion,
 }
 
-#[derive(Clone, Copy)]
-enum VersionPolicy {
-    Compatible,
-    AnyStructured,
+pub struct OpenedHostAccessDescriptor {
+    descriptor: HostAccessDescriptor,
 }
-
-pub struct OpenedSessionAccessDescriptor {
-    descriptor: SessionAccessDescriptor,
-}
-impl OpenedSessionAccessDescriptor {
-    pub const fn descriptor(&self) -> &SessionAccessDescriptor {
+impl OpenedHostAccessDescriptor {
+    pub const fn descriptor(&self) -> &HostAccessDescriptor {
         &self.descriptor
     }
 }
-impl fmt::Debug for OpenedSessionAccessDescriptor {
+impl fmt::Debug for OpenedHostAccessDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("OpenedSessionAccessDescriptor")
+            .debug_struct("OpenedHostAccessDescriptor")
             .field("descriptor", &self.descriptor)
             .finish()
     }
 }
 
-pub fn derive_session_access_descriptor_key(
+pub fn derive_host_access_descriptor_key(
     account_root_key: &[u8; 32],
     account_id: &[u8; 16],
-) -> Result<[u8; 32], SessionAccessError> {
+) -> Result<[u8; 32], HostAccessError> {
     let hkdf = Hkdf::<Sha256>::new(Some(account_id), account_root_key);
     let mut key = [0_u8; 32];
     hkdf.expand(KEY_INFO, &mut key)
-        .map_err(|_| SessionAccessError::InvalidField)?;
+        .map_err(|_| HostAccessError::InvalidField)?;
     Ok(key)
 }
 
@@ -104,16 +96,16 @@ pub fn envelope_aad(account_id: &[u8; 16], record_id: &[u8; 16]) -> Vec<u8> {
     aad
 }
 
-pub fn seal_session_access_descriptor(
-    descriptor: &SessionAccessDescriptor,
+pub fn seal_host_access_descriptor(
+    descriptor: &HostAccessDescriptor,
     account_root_key: &[u8; 32],
     account_id: &[u8; 16],
     record_id: &[u8; 16],
-) -> Result<Envelope, SessionAccessError> {
+) -> Result<Envelope, HostAccessError> {
     let nonce = chacha20poly1305::XNonce::try_generate()
-        .map_err(|_| SessionAccessError::NonceReuse)?
+        .map_err(|_| HostAccessError::NonceReuse)?
         .into();
-    seal_session_access_descriptor_with_nonce(
+    seal_host_access_descriptor_with_nonce(
         descriptor,
         account_root_key,
         account_id,
@@ -122,15 +114,15 @@ pub fn seal_session_access_descriptor(
     )
 }
 
-fn seal_session_access_descriptor_with_nonce(
-    descriptor: &SessionAccessDescriptor,
+fn seal_host_access_descriptor_with_nonce(
+    descriptor: &HostAccessDescriptor,
     account_root_key: &[u8; 32],
     account_id: &[u8; 16],
     record_id: &[u8; 16],
     nonce: [u8; NONCE_LEN],
-) -> Result<Envelope, SessionAccessError> {
-    let mut ciphertext = Zeroizing::new(encode_session_access_descriptor(descriptor)?);
-    let key = Zeroizing::new(derive_session_access_descriptor_key(
+) -> Result<Envelope, HostAccessError> {
+    let mut ciphertext = Zeroizing::new(encode_host_access_descriptor(descriptor)?);
+    let key = Zeroizing::new(derive_host_access_descriptor_key(
         account_root_key,
         account_id,
     )?);
@@ -142,47 +134,19 @@ fn seal_session_access_descriptor_with_nonce(
             &envelope_aad(account_id, record_id),
             &mut *ciphertext,
         )
-        .map_err(|_| SessionAccessError::Decryption)?;
+        .map_err(|_| HostAccessError::Decryption)?;
     Envelope::new(nonce, std::mem::take(&mut *ciphertext))
 }
 
-pub fn open_session_access_descriptor_cursorless(
+pub fn open_host_access_descriptor(
     envelope: &Envelope,
     account_root_key: &[u8; 32],
     context: &VerificationContext,
-) -> Result<OpenedSessionAccessDescriptor, SessionAccessError> {
-    open_session_access_descriptor_with_policy(
-        envelope,
-        account_root_key,
-        context,
-        VersionPolicy::Compatible,
-    )
-}
-
-/// Opens an unexpired session access descriptor for the native client's exact-version upgrade flow.
-pub fn open_session_access_descriptor_cursorless_for_native_upgrade(
-    envelope: &Envelope,
-    account_root_key: &[u8; 32],
-    context: &VerificationContext,
-) -> Result<OpenedSessionAccessDescriptor, SessionAccessError> {
-    open_session_access_descriptor_with_policy(
-        envelope,
-        account_root_key,
-        context,
-        VersionPolicy::AnyStructured,
-    )
-}
-
-fn open_session_access_descriptor_with_policy(
-    envelope: &Envelope,
-    account_root_key: &[u8; 32],
-    context: &VerificationContext,
-    version_policy: VersionPolicy,
-) -> Result<OpenedSessionAccessDescriptor, SessionAccessError> {
+) -> Result<OpenedHostAccessDescriptor, HostAccessError> {
     if envelope.ciphertext.len() > MAX_CIPHERTEXT_LEN {
-        return Err(SessionAccessError::Limit);
+        return Err(HostAccessError::Limit);
     }
-    let key = Zeroizing::new(derive_session_access_descriptor_key(
+    let key = Zeroizing::new(derive_host_access_descriptor_key(
         account_root_key,
         &context.account_id,
     )?);
@@ -195,163 +159,17 @@ fn open_session_access_descriptor_with_policy(
             &envelope_aad(&context.account_id, &context.record_id),
             &mut *plaintext,
         )
-        .map_err(|_| SessionAccessError::Decryption)?;
-    let descriptor = decode_session_access_descriptor(&plaintext)?;
+        .map_err(|_| HostAccessError::Decryption)?;
+    let descriptor = decode_host_access_descriptor(&plaintext)?;
     let maximum_issued_at = context
         .now
         .checked_add_signed(
             chrono::Duration::from_std(MAX_FUTURE_CLOCK_SKEW)
-                .map_err(|_| SessionAccessError::InvalidField)?,
+                .map_err(|_| HostAccessError::InvalidField)?,
         )
-        .ok_or(SessionAccessError::InvalidField)?;
+        .ok_or(HostAccessError::InvalidField)?;
     if descriptor.issued_at() > maximum_issued_at || context.now >= descriptor.expires_at() {
-        return Err(SessionAccessError::Expired);
+        return Err(HostAccessError::Expired);
     }
-    let remote_version = descriptor.herdr_version();
-    if matches!(version_policy, VersionPolicy::Compatible)
-        && (remote_version.major, remote_version.minor)
-            != (context.local_version.major, context.local_version.minor)
-    {
-        return Err(SessionAccessError::IncompatibleVersion);
-    }
-    Ok(OpenedSessionAccessDescriptor { descriptor })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::canonical::AttachedVersion;
-    use attached_tunnel_protocol::CapabilitySecret;
-
-    const ENDPOINT: &str = "endpointacxfr74igmsbvsbnn73wcecg5vt3kbzncqwfrdiampuufwnhkublmaqacbuhi5dqhixs6zdfojyc43lffyxqcad7aaaadaai";
-
-    fn timestamp(seconds: i64) -> DateTime<Utc> {
-        DateTime::from_timestamp(seconds, 0).expect("fixture timestamp")
-    }
-
-    fn fixture_descriptor(version: HerdrVersion) -> SessionAccessDescriptor {
-        SessionAccessDescriptor::new(
-            "office".into(),
-            timestamp(1_700_000_000),
-            timestamp(1_700_000_300),
-            ENDPOINT.into(),
-            CapabilitySecret::from_bytes([6; 32]),
-            AttachedVersion::new(0, 2, 0),
-            version,
-            vec!["alpha".into(), "build".into()],
-        )
-        .expect("unit fixture")
-    }
-
-    fn context(local_version: HerdrVersion) -> VerificationContext {
-        VerificationContext {
-            account_id: [1; 16],
-            record_id: [2; 16],
-            now: timestamp(1_700_000_100),
-            local_version,
-        }
-    }
-
-    #[test]
-    fn native_upgrade_opening_retains_all_structured_version_mismatches() {
-        let account_root_key = [8; 32];
-        for remote in [
-            HerdrVersion::new(2, 0, 1),
-            HerdrVersion::new(2, 1, 0),
-            HerdrVersion::new(3, 0, 0),
-        ] {
-            let descriptor = fixture_descriptor(remote);
-            let envelope =
-                seal_session_access_descriptor(&descriptor, &account_root_key, &[1; 16], &[2; 16])
-                    .unwrap();
-            let opened = open_session_access_descriptor_cursorless_for_native_upgrade(
-                &envelope,
-                &account_root_key,
-                &context(HerdrVersion::new(2, 0, 0)),
-            )
-            .unwrap_or_else(|error| panic!("rejected {remote:?}: {error}"));
-            assert_eq!(opened.descriptor().herdr_version(), remote);
-        }
-    }
-
-    #[test]
-    fn context_expiration_version_and_ciphertext_tampering_fail_closed() {
-        let account_root_key = [8; 32];
-        let descriptor = fixture_descriptor(HerdrVersion::new(1, 2, 3));
-        let envelope =
-            seal_session_access_descriptor(&descriptor, &account_root_key, &[1; 16], &[2; 16])
-                .unwrap();
-
-        let wrong_context = VerificationContext {
-            record_id: [3; 16],
-            ..context(HerdrVersion::new(1, 2, 9))
-        };
-        assert_eq!(
-            open_session_access_descriptor_cursorless(&envelope, &account_root_key, &wrong_context)
-                .err(),
-            Some(SessionAccessError::Decryption)
-        );
-        let expired = VerificationContext {
-            now: timestamp(1_700_000_300),
-            ..context(HerdrVersion::new(1, 2, 9))
-        };
-        assert_eq!(
-            open_session_access_descriptor_cursorless(&envelope, &account_root_key, &expired).err(),
-            Some(SessionAccessError::Expired)
-        );
-        assert_eq!(
-            open_session_access_descriptor_cursorless(
-                &envelope,
-                &account_root_key,
-                &context(HerdrVersion::new(1, 3, 0)),
-            )
-            .err(),
-            Some(SessionAccessError::IncompatibleVersion)
-        );
-        assert!(
-            open_session_access_descriptor_cursorless(
-                &envelope,
-                &account_root_key,
-                &context(HerdrVersion::new(1, 2, 9)),
-            )
-            .is_ok(),
-            "browser compatibility still permits patch differences"
-        );
-
-        let mut tampered = envelope.ciphertext().to_vec();
-        tampered[0] ^= 1;
-        let tampered = Envelope::new(*envelope.nonce(), tampered).unwrap();
-        assert_eq!(
-            open_session_access_descriptor_cursorless(
-                &tampered,
-                &account_root_key,
-                &context(HerdrVersion::new(1, 2, 9)),
-            )
-            .err(),
-            Some(SessionAccessError::Decryption)
-        );
-    }
-
-    #[test]
-    fn private_deterministic_seal_seam_is_repeatable() {
-        let descriptor = fixture_descriptor(HerdrVersion::new(1, 2, 3));
-        let first = seal_session_access_descriptor_with_nonce(
-            &descriptor,
-            &[8; 32],
-            &[1; 16],
-            &[2; 16],
-            [9; NONCE_LEN],
-        )
-        .expect("first deterministic seal");
-        let second = seal_session_access_descriptor_with_nonce(
-            &descriptor,
-            &[8; 32],
-            &[1; 16],
-            &[2; 16],
-            [9; NONCE_LEN],
-        )
-        .expect("second deterministic seal");
-        assert_eq!(first.nonce(), &[9; NONCE_LEN]);
-        assert_eq!(first.ciphertext(), second.ciphertext());
-    }
+    Ok(OpenedHostAccessDescriptor { descriptor })
 }

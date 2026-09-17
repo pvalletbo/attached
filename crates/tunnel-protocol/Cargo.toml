@@ -15,7 +15,6 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 iroh.workspace = true
-postcard.workspace = true
 serde.workspace = true
 tokio = { version = "1", features = ["io-util"] }
 zeroize.workspace = true

@@ -1,8 +1,0 @@
-node_modules/
-dist/
-test-results/
-playwright-report/
-*.tsbuildinfo
-src/protocol-bindings/
-src/sync-bindings/
-src/iroh-bindings/

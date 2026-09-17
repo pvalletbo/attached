@@ -1,160 +1,216 @@
 # Attached
 
-Attach to remote Herdr sessions no matter where they run.
+Discover remote machines and connect over SSH through encrypted [Iroh](https://www.iroh.computer/)
+tunnels, without configuring inbound ports, a VPN, or a system SSH daemon.
 
-Attached uses secure peer-to-peer connections, together with a passive synchronization service,
-to provide a safe way to attach to remote Herdr sessions without having to deal with any networking.
-A good use case is attaching to ephemeral Herdr sessions spawned by AI agents running anywhere.
+Attached provides host discovery, credentials, and the SSH connection. Applications such as Herdr
+use that connection to discover and manage their own sessions; Attached does not inspect, launch,
+upgrade, or proxy Herdr sessions.
 
-Watch the video below to see how to publish a session from a Docker container and connect to it from
-the outside.
-
-![Attached terminal demo showing a consumer connected to a Herdr session running in Docker](demo/attached-demo.gif)
+> Alpha software: host discovery and remote-update protocols may change between releases.
+> Use matching current Attached versions on the client and publishers.
 
 ## Install
-
-### Curl
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://install.attached.sh | sh
 ```
 
-### Cargo
+Or build from source:
 
 ```bash
 cargo install --git https://github.com/pvalletbo/attached.git --locked attached
 ```
 
-You can verify that Attached is correctly installed by running `attached --version`. Although not mandatory,
-it is highly recommended to have [fzf](https://junegunn.github.io/fzf/)
-installed as well for a better experience when attaching to remote sessions.
+Run `attached --version` to verify the installation. The client needs OpenSSH (`ssh` and
+`ssh-keygen`). [fzf](https://junegunn.github.io/fzf/) is optional, for choosing a host during remote
+Attached updates. Linux and macOS are supported.
 
-## Attaching to your first remote session
+## Connect to your first machine
 
-You must have two available hosts:
-
-* **Client**: the local host from which you will control the remote session
-* **Publisher**: the remote host serving a Herdr session to the client. This may be any kind of machine,
-  as long as it can run Herdr (a Docker container works as well)
-
-Both hosts must have Herdr installed. You can find the installation instructions
-[here](https://herdr.dev/docs/install/).
+On the **client**:
 
 ```bash
-# Client host
-# Create an Attached account. No PII data is required.
-# You will need to create a password to protect the files written locally.
+# Create an account and protect local credentials with an encryption password.
 attached account create
-# Export the publisher-only credentials. They will be copied to your clipboard.
+
+# Copy a publish-only bundle to the clipboard temporarily.
 attached account export --type publish
-
-# Publisher host
-# On the publisher, start publishing its Herdr sessions.
-# You will need to paste the publish-only bundle previously copied to the clipboard.
-attached serve --host-label your-remote-session
-
-# Back on the client, select and attach to the remote session.
-attached attach
 ```
 
-You should see something like the image below. Select the desired session, and you will be attached
-to the remote Herdr session.
+On the **publisher**:
 
-![Attached session selection](./docs/img/attached_attach.png)
+```bash
+# Paste the publish bundle when prompted. Keep this process running.
+attached serve --host-label office
+```
 
-## How it works
+After the bundle has been saved, run this in a second terminal on the publisher:
 
-To attach to remote Herdr sessions, a secure peer-to-peer (P2P) channel must be established. Instead of
-implementing a custom solution to create this channel, Attached uses [Iroh](https://www.iroh.computer/)
-under the hood to create P2P QUIC connections in which all transmitted bytes are end-to-end encrypted.
-This means that no one except the two ends of the tunnel can read the commands sent between the Herdr
-client and server.
+```bash
+# Explicitly authorize remote command execution as the current OS user.
+attached ssh-access enable
+```
 
-To establish the tunnel, the client, which initiates the communication, must have enough information
-to tell the server that it intends to start a tunnel. This is equivalent to knowing an IP address in a
-regular HTTP message exchange. However, Iroh uses public keys instead of IP addresses because IP
-addresses may change. Both the server and client have a public-private key pair used to secure the
-tunnel. The server's public key is also used to perform an address lookup and determine how the server
-can be reached over the Internet. Once this information is known, a NAT traversal ceremony attempts to
-establish direct communication between the peers, using the cryptographic keys to secure the channel.
-More information is available in the [Iroh documentation](https://docs.iroh.computer/concepts/endpoints).
+Back on the client:
 
-Apart from sharing the Iroh connection details, the publisher and client need to share information
-about the active Herdr sessions, such as the hostname and active session names. To share this information
-securely, we rely on a backend service that stores the information in an encrypted form so that it can
-never read or write the data. The publisher encrypts the information and pushes it to the server. The
-client can then retrieve and decrypt it and start an attachment if active sessions are available. Among
-other technical details, the following information is shared:
+```bash
+# Lists SSH-enabled machines, not application sessions.
+attached sessions list
 
-* **Host label**: a descriptive name for the host
-* **Iroh endpoint ticket**: used by the consumer to establish the P2P tunnel
-* **Attach capability**: a shared secret that the consumer must present to authorize the tunnel
-* **Attached version**: the running version of the Attached binary
-* **Herdr version**: the running version of Herdr
-* **Sessions**: a list of the Herdr session names running on the remote machine
+# Execute a command. Its exit status is returned by Attached.
+attached ssh office uname -a
 
-### Security model and limitations
+# Or open a non-PTY shell.
+attached ssh office
+```
 
-If you want to know what things could go wrong and how Attached protects against different threats,
-do not skip this section.
+SSH access is disabled until explicitly enabled. Permission persists across server restarts.
+Discovery is republished every 30 seconds, so enabling or disabling access may take up to that long
+to appear in a freshly fetched list. The server enforces the current permission independently of
+discovery. To revoke access:
 
-#### Guarantees
+```bash
+attached ssh-access disable
+```
 
-The following properties are guaranteed by Attached's design if private keys and encryption
-keys are not leaked:
+New connections are rejected and active SSH connections are cancelled within one second.
+Deliberately detached remote processes cannot be recalled.
 
-##### Communication between the Herdr client and server cannot be read by a third party
+For headless provisioning, export a bundle with `attached account export --type publish --output
+publish.bundle`, transfer it securely, and pass `--bundle-file publish.bundle` to `attached serve`.
+The `ATTACHED_PUBLISH_BUNDLE` environment variable is also supported. Bundle files are secrets;
+export creates a new owner-only file and refuses to overwrite an existing file.
 
-This is protected by the end-to-end encryption provided by the Iroh QUIC tunnels.
+## Discovery and application integration
 
-##### A malicious synchronization service cannot connect to remote Herdr sessions
+`attached sessions list` always refreshes discovery and displays:
 
-Even though the synchronization service is used to share the connection details, the information
-is sent to the server encrypted using a symmetric key known only to the client and the publisher hosts.
-The symmetric key is shared using an out-of-band channel from the client to the publisher using
-the `attached export` command.
+- **HOST**: the publisher's human-readable label;
+- **ENDPOINT ID**: its stable Iroh identity, also usable as an SSH or update target;
+- **ATTACHED**: the running Attached version;
+- **LAST PUBLISH**: the age of the latest authenticated advertisement.
 
-##### A malicious synchronization service cannot lead the client to connect to remote sessions controlled by it
+Only unexpired, SSH-enabled publishers are listed. Advertisements expire after 90 seconds;
+a listed machine is not a guarantee that a live connection will succeed. Locally running Attached
+endpoints are omitted from the remote listing. Labels can collide: use the full endpoint ID to
+select a particular machine. Ambiguous labels are rejected rather than selected arbitrarily.
 
-Because the connection details are encrypted and authenticated using a symmetric encryption algorithm (XChaCha20-Poly1305)
-and the service does not know the symmetric key, the client would not be able to decrypt the
-malicious connection details added by the rogue service.
+`attached ssh` reuses its selected publisher's unexpired descriptor, even during a discovery outage
+or when another host is unavailable. It never extends the lease; use `--no-cache` to force a refresh.
+Long-lived brokers renew their selected publisher by stable identity when a
+new SSH connection needs fresh connection details; existing byte streams do not depend on renewal.
 
-##### A publisher host cannot connect to remote sessions
+For clients that already know how to invoke OpenSSH, expose a temporary configuration:
 
-Even though a publisher host knows the symmetric key used to encrypt the connection details,
-it is not able to fetch that information from the sync service because its API key only allows it
-to upload information. The sync service must be trusted to verify the API key's scope to prevent
-malicious retrievals of connection details.
+```bash
+# Prints a configuration path, then stays in the foreground until Ctrl-C.
+attached ssh --expose-config office
 
-##### Local sensitive data is never stored in plain text
+# In another terminal, using the printed path and the host's endpoint ID:
+ssh -F /printed/path/config attached-ENDPOINT-ID 'your-remote-command'
+```
 
-Both the client and publisher hosts need to store sensitive data, such as private keys and encryption keys.
-This information is never stored in plain text. Instead, the tool prompts the user to provide a password
-that will be used to derive a local encryption key, or it will use [1Password](https://1password.com/)
-to automatically generate a strong password.
+The broker creates connection-scoped client keys, pins the publisher's SSH identity, and transports
+SSH over Iroh through a private local proxy socket. It does not modify `~/.ssh/config` or
+`authorized_keys`. Keep the broker running while its configuration is in use. Its temporary files
+are removed when it exits normally.
 
-#### Limitations
+Use one broker for concurrent connections to a publisher: separate Attached processes share the
+consumer Iroh identity and can displace each other on relays. The current SSH service supports
+command execution and non-PTY shells, not PTYs, SFTP, agent forwarding, or TCP forwarding.
+Applications own any session discovery, installation checks, and lifecycle operations they run over
+SSH. Attached's old `attach`, `--herdr-bin`, and `--upgrade-remote` interfaces are removed.
 
-There are some limitations that must be understood before using the Attached CLI.
+## Accounts and local configuration
 
-##### The sync service may cause denial of service
+Credentials and the persistent endpoint identity are stored under `$HOME/.config/attached` by
+default. Private keys, account bundles, the host catalog, and the publisher's SSH host key are
+encrypted at rest. Host pins and SSH consent policy are owner-only metadata files.
 
-Nothing prevents the synchronization service from stopping its responses to the client or hiding valid
-session details shared by the publisher. If this happens, the client will not be able to connect
-to remote Herdr sessions. The sync service source code can be found in this repo, so you are free to
-self-host it if you feel like it.
+To add another client:
 
-##### Leaking client secrets may lead to RCE on hosts publishing Herdr sessions
+```bash
+attached account export --type download --output download.bundle
+# Transfer the file securely, then on the new client:
+attached account import --bundle-file download.bundle
+```
 
-If an attacker gains access to the secrets stored on the client machine, they will be able to
-connect to remote Herdr sessions, meaning that they will get access to those hosts. Currently,
-there is no way to revoke or shut down sessions, so this is something to really take into account.
+`attached account import --bundle-stdin` is available for automation. Publish bundles cannot be
+used as download bundles and do not contain the consumer's private Iroh identity.
 
-## TODO
+Attached reads `$HOME/.config/attached/config.toml`:
 
-* Implement token revocation and session shutdown in case of a credential leak
-* Raycast support
-* Multi account support
-* Remote notifications center
+```toml
+password_source = "password" # or "1password"
+# config_directory = "/absolute/path/to/attached-state"
+```
 
+`--use-1password` overrides the password source for an invocation. Noninteractive SSH calls fail
+rather than prompting for a password on the application's data stream; configure 1Password for
+unattended use. Run `attached --help` for global diagnostics and completion options.
+
+## Updates and removal
+
+```bash
+attached update                   # Update locally (alias: upgrade).
+attached update --remote office   # Update a publisher by label or endpoint ID.
+attached update --remote          # Choose a remote host with fzf.
+attached uninstall               # Remove Attached and managed local state.
+```
+
+Remote updates retain the authenticated, fixed-operation update service: stage the latest release,
+prepare a replacement server, hand off the endpoint identity and credentials over private IPC,
+and commit only after client reconnection. Failed handoffs restore the previous server and binary.
+Remote updates now address machines, not `HOST/SESSION`. They do not require arbitrary-shell consent;
+an explicitly named publisher can still be updated when SSH access is disabled. Active SSH
+connections are interrupted by an update and must be re-established.
+
+This host-only release changes encrypted discovery descriptors and the remote-update protocol;
+old Attached peers are not supported. Existing account credentials and endpoint identities are
+retained. The rebuildable discovery cache is now `host-catalog.json`; the old `sync-catalog.json`
+is no longer read. Upgrade both ends locally when crossing this protocol change.
+
+## How it works and security
+
+Iroh uses public-key endpoint identities, address lookup, NAT traversal, and relay fallback to
+establish end-to-end encrypted QUIC connections. See the [Iroh endpoint documentation](https://docs.iroh.computer/concepts/endpoints).
+
+The passive synchronization backend stores authenticated, encrypted host descriptors containing
+the host label, endpoint ticket, tunnel capability, Attached version, SSH permission advertisement,
+and publication/expiration times. It cannot decrypt those descriptors. The existing hosted service
+URL remains `https://herdr.attached.sh`; that domain name does not imply a Herdr dependency.
+Use `attached account create --service https://your-service.example` to choose a self-hosted service.
+The Cloudflare Worker and its credential/storage machinery remain in `crates/session-sync-worker`.
+
+Connection admission checks the account's authorized consumer Iroh identity before application
+traffic. SSH additionally checks the tunnel capability, explicit publisher consent, a connection-scoped
+client key, and the publisher's pinned SSH host key. A changed host key or OS account fails closed;
+use `--trust-new-host-key` only after independently verifying the change.
+
+Important limitations:
+
+- An authorized consumer can execute arbitrary commands as the publisher's OS account. Treat
+  download/owner bundles and their decryption credentials as remote-shell-equivalent secrets.
+- A compromised synchronization service can hide records, deny service, or replay valid
+  advertisements until expiration. Authenticated encryption is not an availability guarantee.
+- Account publishers share the descriptor encryption key. That key alone does not grant consumer
+  Iroh identity or SSH permission; do not treat a publish-only bundle as harmless.
+- SSH revocation is local to each publisher. General account-token revocation and per-client
+  identities are not yet implemented.
+
+## Development
+
+```bash
+cargo fmt --all -- --check
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo build --workspace --locked
+cargo deny check bans licenses sources
+```
+
+The workspace contains the CLI, encrypted discovery protocol, synchronization Worker, and SSH/update
+tunnel protocol. The former experimental browser client, Herdr TUI protocol, and combined
+Attached/Herdr runtime image have been removed.
+
+This document was updated with AI assistance.

@@ -1,9 +1,6 @@
 [workspace]
 members = [
     "crates/cli",
-    "experimental/crates/browser-iroh",
-    "experimental/crates/browser-sync",
-    "experimental/crates/herdr-tui-protocol",
     "crates/session-sync-protocol",
     "crates/session-sync-worker",
     "crates/tunnel-protocol",
@@ -12,13 +9,13 @@ default-members = ["crates/cli"]
 resolver = "3"
 
 [workspace.package]
-version = "0.2.12"
+version = "0.3.1"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT"
 repository = "https://github.com/pvalletbo/attached"
 homepage = "https://github.com/pvalletbo/attached"
-description = "Discover and securely attach to synchronized Herdr sessions over Iroh"
+description = "Discover machines and connect over SSH through secure Iroh tunnels"
 publish = false
 
 [workspace.lints.rust]
@@ -29,7 +26,6 @@ anyhow = "1.0"
 arboard = { version = "=3.6.1", default-features = false, features = ["wayland-data-control"] }
 argon2 = { version = "=0.6.0", default-features = false, features = ["alloc", "zeroize"] }
 base64 = "=0.22.1"
-bincode = { version = "2", features = ["serde"] }
 chacha20poly1305 = { version = "=0.11.0", default-features = false, features = ["alloc", "getrandom", "zeroize"] }
 chrono = { version = "=0.4.45", default-features = false, features = ["serde", "std"] }
 ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["zeroize"] }
@@ -43,8 +39,6 @@ attached-tunnel-protocol = { path = "crates/tunnel-protocol" }
 hkdf = "=0.13.0"
 iroh = "1.0.3"
 iroh-tickets = "1.0.0"
-n0-future = "0.3"
-postcard = { version = "1", features = ["use-std"] }
 rand_core = "=0.10.1"
 reqwest = { version = "=0.13.4", default-features = false, features = ["json", "rustls"] }
 rpassword = "=7.5.4"
@@ -63,7 +57,6 @@ url = "=2.5.8"
 uuid = "=1.24.0"
 zeroize = { version = "=1.9.0", features = ["derive"] }
 wasm-bindgen = "=0.2.126"
-wasm-bindgen-futures = "=0.4.76"
 worker = "=0.8.5"
 
 # The profile that 'dist' will build with

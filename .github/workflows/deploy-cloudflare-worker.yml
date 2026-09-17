@@ -61,6 +61,8 @@ jobs:
         run: corepack enable
       - name: Install Worker dependencies
         run: pnpm install --frozen-lockfile
+      - name: Build the Cloudflare Worker
+        run: pnpm run build
       - name: Run local Worker integration tests
         run: pnpm run test:integration
       - name: Deploy development Worker

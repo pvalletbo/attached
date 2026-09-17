@@ -1,7 +1,11 @@
 //! Black-box tests: only the public protocol crates are linked here. All CLI
 //! behavior (including production encryption/KDF) runs in CARGO_BIN_EXE_attached.
+#[path = "discovery/mod.rs"]
+mod discovery;
 #[path = "encryption/environment.rs"]
 mod encryption_environment;
+#[path = "ssh/export.rs"]
+mod ssh_export;
 #[path = "ssh/renewal.rs"]
 mod ssh_renewal;
 mod support;
@@ -14,12 +18,10 @@ use attached_session_sync_protocol::{
         ScopedAccountBundle, ServiceOrigin,
     },
     api::{Envelope, LiveRecordIndex, LiveRecordIndexEntry},
-    canonical::{AttachedVersion, HerdrVersion, SessionAccessDescriptor},
-    crypto::seal_session_access_descriptor,
+    canonical::{AttachedVersion, HostAccessDescriptor},
+    crypto::seal_host_access_descriptor,
 };
-use attached_tunnel_protocol::{
-    CapabilitySecret, TUNNEL_ALPN, authenticate_server, read_stream_header,
-};
+use attached_tunnel_protocol::{ATTACHED_UPDATE_ALPN, CapabilitySecret, SSH_ALPN};
 use iroh::{
     Endpoint, RelayMode,
     endpoint::{BindOpts, presets},
@@ -71,19 +73,22 @@ async fn import_with_identity(fixture: &CliFixture, origin: &str, identity: [u8;
 }
 
 fn catalog(endpoint: &str, revision: u64) -> (Vec<u8>, Vec<u8>) {
+    catalog_with_access(endpoint, revision, true)
+}
+
+fn catalog_with_access(endpoint: &str, revision: u64, ssh_enabled: bool) -> (Vec<u8>, Vec<u8>) {
     let now = chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp(), 0).unwrap();
-    let descriptor = SessionAccessDescriptor::new(
+    let descriptor = HostAccessDescriptor::new(
         "remote".into(),
         now - Duration::from_secs(1),
         now + Duration::from_secs(300),
         endpoint.into(),
         CapabilitySecret::from_bytes([46; 32]),
         AttachedVersion::new(0, 2, 9),
-        HerdrVersion::new(3, 2, 1),
-        vec!["work".into()],
+        ssh_enabled,
     )
     .unwrap();
-    let (nonce, ciphertext) = seal_session_access_descriptor(
+    let (nonce, ciphertext) = seal_host_access_descriptor(
         &descriptor,
         &ROOT_KEY,
         AccountId::parse(ACCOUNT).unwrap().as_bytes(),
@@ -369,8 +374,19 @@ async fn help_version_completions_and_usage_errors_are_real_process_contracts() 
     let help = fixture.run(&["--help"]).await;
     help.assert_code(0);
     assert!(help.stdout.contains("sessions"));
+    assert!(help.stdout.contains("export-ssh-config"));
     assert!(!help.stdout.contains("__handoff-serve"));
     assert!(help.stderr.is_empty());
+    let export_help = fixture.run(&["export-ssh-config", "--help"]).await;
+    export_help.assert_code(0);
+    assert!(
+        export_help
+            .stdout
+            .contains("Usage: attached export-ssh-config")
+    );
+    assert!(export_help.stdout.contains("--refresh-interval"));
+    assert!(export_help.stderr.is_empty());
+    assert!(!fixture.path("home/.ssh").exists());
     let version = fixture.run(&["--version"]).await;
     version.assert_code(0);
     assert_eq!(
@@ -381,11 +397,17 @@ async fn help_version_completions_and_usage_errors_are_real_process_contracts() 
         let output = fixture.run(&["completions", shell]).await;
         output.assert_code(0);
         assert!(output.stdout.contains("attached"), "{shell}: {output:?}");
+        assert!(
+            output.stdout.contains("export-ssh-config"),
+            "{shell}: {output:?}"
+        );
         assert!(output.stderr.is_empty(), "{shell}: {output:?}");
     }
     for args in [
         vec!["unknown"],
         vec!["attach", "host/work", "--", "sh"],
+        vec!["export-ssh-config", "office"],
+        vec!["export-ssh-config", "--refresh-interval", "0"],
         vec!["account", "import", "--bundle-file", "x", "--bundle-stdin"],
     ] {
         let output = fixture.run(&args).await;
@@ -495,8 +517,8 @@ fn assert_remote_listing(output: &support::CliOutput) {
     let lines = output.stdout.lines().collect::<Vec<_>>();
     assert_eq!(lines.len(), 2, "{output:?}");
     assert_eq!(
-        lines[1].split_whitespace().take(4).collect::<Vec<_>>(),
-        ["remote", "work", "0.2.9", "3.2.1"]
+        lines[1].split_whitespace().take(1).collect::<Vec<_>>(),
+        ["remote"]
     );
 }
 
@@ -528,7 +550,7 @@ async fn catalog_cache_avoids_redundant_downloads_and_outage_never_prints_stale_
             let failed = fixture.run(&args).await;
             failed.assert_code(1);
             assert!(failed.stdout.is_empty(), "outage printed stale sessions: {failed:?}");
-            assert!(failed.stderr.contains("could not refresh synchronized sessions"), "{failed:?}");
+            assert!(failed.stderr.contains("could not refresh synchronized hosts"), "{failed:?}");
             let recovered = fixture.run(&args).await;
             assert_remote_listing(&recovered);
         };
@@ -546,161 +568,8 @@ async fn endpoint() -> Endpoint {
         .unwrap()
         .relay_mode(RelayMode::Disabled)
         .clear_address_lookup()
-        .alpns(vec![TUNNEL_ALPN.to_vec()])
+        .alpns(vec![SSH_ALPN.to_vec(), ATTACHED_UPDATE_ALPN.to_vec()])
         .bind()
         .await
         .unwrap()
-}
-
-#[tokio::test]
-async fn remote_attach_forwards_bytes_propagates_exit_and_cleans_up_after_connection_loss() {
-    timeout(DEADLINE * 4, async {
-        let fixture = CliFixture::new();
-        fs::write(
-            fixture.path("herdr_client.py"),
-            include_str!("fixtures/remote_client.py"),
-        )
-        .unwrap();
-        fixture.script(
-            "herdr",
-            r#"
-case "$*" in
-  --version) printf 'herdr 3.2.1\n';;
-  client) exec /usr/bin/python3 "$FIXTURE_ROOT/herdr_client.py";;
-  *) exit 91;;
-esac
-"#,
-        );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        import(
-            &fixture,
-            &format!("http://{}", listener.local_addr().unwrap()),
-        )
-        .await;
-        let endpoint = endpoint().await;
-        assert!(endpoint.addr().relay_urls().next().is_none());
-        assert!(
-            endpoint
-                .addr()
-                .ip_addrs()
-                .all(|addr| addr.ip().is_loopback())
-        );
-        let ticket = EndpointTicket::new(endpoint.addr()).to_string();
-        // Populate discovery, reuse it for the connection-loss attempt, then
-        // explicitly refresh after pruning. Ordinary attachment does not auto-reconnect.
-        for (attempt, mode) in ["exit", "drop", "exit"].into_iter().enumerate() {
-            for marker in ["received", "proxy-socket", "herdr-pid"] {
-                let _ = fs::remove_file(fixture.path(marker));
-            }
-            let revision = if attempt == 2 { 2 } else { 1 };
-            let (index, record) = catalog(&ticket, revision);
-            let http = async {
-                respond(&mut checked_request(&listener, false).await, &index, "").await;
-                respond(
-                    &mut checked_request(&listener, true).await,
-                    &record,
-                    &format!("ETag: \"{revision}\"\r\n"),
-                )
-                .await;
-            };
-            let peer = async {
-                let connection = endpoint.accept().await.unwrap().await.unwrap();
-                assert_eq!(
-                    connection.remote_id(),
-                    iroh::SecretKey::from_bytes(&IDENTITY).public()
-                );
-                let (mut send, mut receive) = connection.accept_bi().await.unwrap();
-                authenticate_server(
-                    &mut receive,
-                    &mut send,
-                    &CapabilitySecret::from_bytes([46; 32]),
-                    attached_tunnel_protocol::HerdrVersion::new(3, 2, 1),
-                    |session| async move {
-                        anyhow::ensure!(session == "work", "wrong session");
-                        Ok(())
-                    },
-                    || Ok(()),
-                )
-                .await
-                .unwrap();
-                let (mut send, mut receive) = connection.accept_bi().await.unwrap();
-                read_stream_header(&mut receive).await.unwrap();
-                // Larger than the proxy copy buffer; deterministic bytes, both directions.
-                let payload = receive.read_to_end(1024 * 1024).await.unwrap();
-                assert_eq!(payload, (0..=255_u8).collect::<Vec<_>>().repeat(2048));
-                send.write_all(&payload).await.unwrap();
-                send.finish().unwrap();
-                send.stopped().await.unwrap();
-                if mode == "drop" {
-                    let (_send, mut receive) = connection.accept_bi().await.unwrap();
-                    read_stream_header(&mut receive).await.unwrap();
-                    assert_eq!(receive.read_to_end(5).await.unwrap(), b"ready");
-                    connection.close(17_u32.into(), b"injected connection loss");
-                }
-                connection.closed().await;
-            };
-            let client = async {
-                let mut command = fixture.command(&["--use-1password", "attach", "remote/work"]);
-                if attempt == 2 {
-                    // The failed connection prunes this revision, but discovery is
-                    // still cached. Explicitly request the replacement publication.
-                    command.arg("--no-cache");
-                }
-                command.env("FIXTURE_MODE", mode);
-                let output = fixture.spawn(command).wait().await;
-                if mode == "exit" {
-                    output.assert_code(23);
-                } else {
-                    output.assert_code(1);
-                    assert!(output.stderr.contains("connection was lost"), "{output:?}");
-                    assert!(output.stderr.contains("run `attach` again"), "{output:?}");
-                }
-                assert_eq!(
-                    fs::read_to_string(fixture.path("received")).unwrap(),
-                    "524288"
-                );
-                let socket = fs::read_to_string(fixture.path("proxy-socket")).unwrap();
-                assert!(
-                    !std::path::Path::new(&socket).exists(),
-                    "proxy socket leaked"
-                );
-                let pid: i32 = fs::read_to_string(fixture.path("herdr-pid"))
-                    .unwrap()
-                    .parse()
-                    .unwrap();
-                let error = rustix::process::test_kill_process(
-                    rustix::process::Pid::from_raw(pid).unwrap(),
-                )
-                .unwrap_err();
-                assert_eq!(
-                    error,
-                    rustix::io::Errno::SRCH,
-                    "Herdr child survived CLI exit"
-                );
-            };
-            let exchange = async {
-                tokio::join!(peer, client);
-            };
-            timeout(DEADLINE, async {
-                if attempt == 1 {
-                    // Keep the service listening so any unintended refresh fails
-                    // immediately rather than leaving an HTTP fixture waiting forever.
-                    tokio::select! {
-                        biased;
-                        unexpected = listener.accept() => {
-                            panic!("cached attachment contacted the sync service: {unexpected:?}");
-                        }
-                        () = exchange => {}
-                    }
-                } else {
-                    tokio::join!(http, exchange);
-                }
-            })
-            .await
-            .unwrap_or_else(|_| panic!("remote attachment attempt {attempt} ({mode}) timed out"));
-        }
-        endpoint.close().await;
-    })
-    .await
-    .expect("binary remote attachment scenario timed out");
 }

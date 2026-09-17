@@ -187,14 +187,49 @@ async fn absent_environment_password_keeps_noninteractive_credentials_locked() {
     let fixture = CliFixture::new();
     import(&fixture, "http://127.0.0.1:1").await;
     forbid_one_password(&fixture);
-    let output = fixture.run(&["-vv", "ssh", "remote", "true"]).await;
+    for args in [
+        &["-vv", "ssh", "remote", "true"][..],
+        &["-vv", "export-ssh-config"][..],
+    ] {
+        let output = fixture.run(args).await;
+        output.assert_code(1);
+        assert!(
+            output.stderr.contains("Attached credentials are locked"),
+            "{output:?}"
+        );
+        assert!(output.stderr.contains(PASSWORD_ENV), "{output:?}");
+        assert!(
+            output.stderr.contains("attached export-ssh-config"),
+            "{output:?}"
+        );
+        assert!(!output.stderr.contains("--expose-config"), "{output:?}");
+        assert!(output.stdout.is_empty());
+    }
+    assert!(!fixture.path("home/.ssh").exists());
+    assert!(!fixture.path("op-called").exists());
+}
+
+#[tokio::test]
+async fn environment_password_unlocks_noninteractive_ssh_export() {
+    let fixture = CliFixture::new();
+    let encoded = import(&fixture, "http://127.0.0.1:1").await;
+    forbid_one_password(&fixture);
+    // Fail configuration setup after unlocking, before any Iroh endpoint is bound.
+    let blocker = fixture.path("home/.ssh");
+    fs::write(&blocker, "not a directory").unwrap();
+    let password = "fixture-only-encryption-password";
+    let mut command = fixture.command(&["-vv", "export-ssh-config"]);
+    command.env(PASSWORD_ENV, password);
+    let output = fixture.spawn(command).wait().await;
     output.assert_code(1);
     assert!(
-        output.stderr.contains("Attached credentials are locked"),
+        output.stderr.contains("~/.ssh is not a directory"),
         "{output:?}"
     );
-    assert!(output.stderr.contains(PASSWORD_ENV), "{output:?}");
+    assert!(!output.stderr.contains("Attached credentials are locked"));
+    assert_no_secret(&output, password, &encoded);
     assert!(output.stdout.is_empty());
+    assert_eq!(fs::read_to_string(blocker).unwrap(), "not a directory");
     assert!(!fixture.path("op-called").exists());
 }
 
@@ -218,8 +253,10 @@ async fn publisher_bootstraps_and_reopens_encrypted_state_from_environment_secre
     use attached_session_sync_protocol::account::ApiKeyScope;
     let fixture = CliFixture::new();
     forbid_one_password(&fixture);
-    // Stop after credential/identity setup, before binding Iroh or publishing to a service.
-    fixture.script("herdr", "exit 91");
+    // A renamed executable fails startup validation after credential/identity setup,
+    // before binding Iroh or publishing to a service. No Herdr dependency is needed.
+    let executable = fixture.path("bin/attached-publisher-test");
+    fs::copy(env!("CARGO_BIN_EXE_attached"), &executable).unwrap();
     let encoded = AccountBundle::Scoped(
         ScopedAccountBundle::from_parts(
             ServiceOrigin::parse("http://127.0.0.1:1").unwrap(),
@@ -233,8 +270,15 @@ async fn publisher_bootstraps_and_reopens_encrypted_state_from_environment_secre
     )
     .encode();
     let password = "ephemeral-publisher-encryption-secret";
+    let state_paths = [
+        "sync-account.bundle",
+        "admin-identity.key",
+        "encryption-salt.argon2id-v1",
+    ]
+    .map(|name| fixture.path(&format!("{STATE}/{name}")));
+    let mut initial_state = None;
     for first_run in [true, false] {
-        let mut command = fixture.command(&["-vv", "serve"]);
+        let mut command = fixture.command_at(&executable, &["-vv", "serve"]);
         command.env(PASSWORD_ENV, password);
         if first_run {
             command.env("ATTACHED_PUBLISH_BUNDLE", &encoded);
@@ -244,11 +288,22 @@ async fn publisher_bootstraps_and_reopens_encrypted_state_from_environment_secre
         assert!(
             output
                 .stderr
-                .contains("could not determine the local Herdr version"),
+                .contains("cannot safely manage an Attached executable renamed to"),
             "{output:?}"
         );
         assert_no_secret(&output, password, &encoded);
         assert!(!output.stderr.contains("Enter the publish bundle"));
+        let stored = state_paths.each_ref().map(|path| {
+            assert_private(path);
+            fs::read(path).unwrap()
+        });
+        assert!(stored[0].starts_with(b"ATSECR01"));
+        assert!(stored[1].starts_with(b"ATSECR01"));
+        if let Some(initial) = initial_state.as_ref() {
+            assert_eq!(&stored, initial, "restart must preserve encrypted state");
+        } else {
+            initial_state = Some(stored);
+        }
     }
     let mut command = fixture.command(&[
         "-vv",
