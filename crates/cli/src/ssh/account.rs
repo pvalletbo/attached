@@ -184,7 +184,9 @@ mod tests {
     fn account_lookup_subprocess_is_bounded() {
         let mut oversized = Command::new("/bin/sh");
         oversized.args(["-c", "printf 12345678901234567; exec /bin/sleep 30"]);
-        let error = run_lookup_with_limits(oversized, Duration::from_secs(2), 16).unwrap_err();
+        let error = run_lookup_with_limits(oversized, Duration::from_secs(2), 16)
+            .err()
+            .expect("oversized lookup output should fail");
         assert!(
             error.to_string().contains("produced more than 16 bytes"),
             "{error:#}"
@@ -192,7 +194,9 @@ mod tests {
 
         let mut stalled = Command::new("/bin/sh");
         stalled.args(["-c", "exec /bin/sleep 30"]);
-        let error = run_lookup_with_limits(stalled, Duration::from_millis(50), 16).unwrap_err();
+        let error = run_lookup_with_limits(stalled, Duration::from_millis(50), 16)
+            .err()
+            .expect("stalled lookup should fail");
         assert!(error.to_string().contains("timed out"), "{error:#}");
     }
 
