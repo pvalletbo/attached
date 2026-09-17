@@ -279,6 +279,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "attached-herdr-plugin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fs4",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "attached-session-sync-protocol"
 version = "0.3.1"
 dependencies = [

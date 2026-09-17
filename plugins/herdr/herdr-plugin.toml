@@ -1,0 +1,42 @@
+id = "attached.discovery"
+name = "Attached machines"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Automatically discover Attached SSH publishers, add Herdr machines, and show a toast"
+platforms = ["linux", "macos"]
+
+# Install: herdr plugin install pvalletbo/attached/plugins/herdr --yes
+# Requires Rust/Cargo (see rust-toolchain.toml) to build, Attached with
+# `sessions list --json`, OpenSSH, an
+# imported download account with unattended credential access (e.g. unlocked
+# 1Password CLI), and compatible Herdr already installed on SSH-enabled publishers.
+# No password prompts, automatic remote upgrades, or host-key approval bypasses.
+# Checks immediately, then every 30s. It starts/reuses export-ssh-config; no
+# separate terminal, cron job, or system service is needed.
+# Logs and deduplication state live in HERDR_PLUGIN_STATE_DIR. Removed/disabled
+# machines are left alone; deleting discovery-state.json allows rediscovery.
+# Disabling pauses discovery and stops only the exporter this plugin owns.
+# Uninstalling stops the worker; saved Herdr machines are never removed.
+
+# Herdr 0.9 startup hooks do NOT run on install. This bounded bootstrap waits
+# for successful registration, then invokes ensure in an already-running session.
+# With no running session, the normal startup hook below handles the next launch.
+[[build]]
+command = ["cargo", "build", "--manifest-path", "../../Cargo.toml", "--release", "--locked", "--package", "attached-herdr-plugin", "--target-dir", "../../target"]
+
+[[build]]
+command = ["../../target/release/attached-herdr-plugin", "install"]
+
+[[startup]]
+command = ["../../target/release/attached-herdr-plugin", "ensure"]
+
+[[actions]]
+id = "ensure"
+title = "Attached: ensure automatic machine discovery"
+command = ["../../target/release/attached-herdr-plugin", "ensure"]
+
+# Also recover a stopped worker after a local link or enable, without requiring
+# the user to invoke a plugin action. A shared flock makes repeated hooks cheap.
+[[events]]
+on = "workspace.focused"
+command = ["../../target/release/attached-herdr-plugin", "ensure"]

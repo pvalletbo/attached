@@ -57,6 +57,62 @@ async fn machine_discovery_reports_identity_and_filters_disabled_publishers() {
 }
 
 #[tokio::test]
+async fn json_discovery_refreshes_and_only_reports_ssh_enabled_public_metadata() {
+    timeout(DEADLINE * 3, async {
+        let fixture = CliFixture::new();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        import(
+            &fixture,
+            &format!("http://{}", listener.local_addr().unwrap()),
+        )
+        .await;
+        let identity = iroh::SecretKey::from_bytes(&[47; 32]).public();
+        let ticket = EndpointTicket::new(iroh::EndpointAddr::new(identity)).to_string();
+        let server = async {
+            for (revision, enabled) in [(1, false), (2, true), (3, false)] {
+                let (index, record) = catalog_with_access(&ticket, revision, enabled);
+                respond(&mut checked_request(&listener, false).await, &index, "").await;
+                respond(
+                    &mut checked_request(&listener, true).await,
+                    &record,
+                    &format!("ETag: \"{revision}\"\r\n"),
+                )
+                .await;
+            }
+        };
+        let client = async {
+            for enabled in [false, true, false] {
+                let output = fixture
+                    .run(&["--use-1password", "sessions", "list", "--json"])
+                    .await;
+                output.assert_code(0);
+                let rows: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                assert_eq!(rows.as_array().unwrap().len(), usize::from(enabled));
+                if enabled {
+                    assert_eq!(rows[0].as_object().unwrap().len(), 5);
+                    assert_eq!(rows[0]["host"], "remote");
+                    assert_eq!(rows[0]["endpoint_id"], identity.to_string());
+                    assert_eq!(rows[0]["ssh_target"], format!("attached-{identity}"));
+                    assert_eq!(rows[0]["attached_version"], "0.2.9");
+                    assert!(rows[0]["published_at"].as_str().is_some());
+                }
+            }
+        };
+        tokio::join!(server, client);
+        // A background plugin must never prompt on /dev/tty or emit partial JSON.
+        let locked = fixture.run(&["-v", "sessions", "list", "--json"]).await;
+        locked.assert_code(1);
+        assert!(locked.stdout.is_empty());
+        assert!(
+            locked.stderr.contains("credentials are locked"),
+            "{locked:?}"
+        );
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn remote_attached_update_targets_a_machine_even_when_ssh_is_disabled() {
     use attached_tunnel_protocol::{
         AttachedUpdateRequest, AttachedUpdateResponse, read_attached_update_request,
