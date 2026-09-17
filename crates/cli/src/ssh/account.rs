@@ -188,10 +188,7 @@ mod tests {
             .err()
             .expect("oversized lookup output should fail");
         let message = format!("{error:#}");
-        assert!(
-            message.contains("produced more than 16 bytes"),
-            "{message}"
-        );
+        assert!(message.contains("produced more than 16 bytes"), "{message}");
 
         let mut stalled = Command::new("/bin/sh");
         stalled.args(["-c", "exec /bin/sleep 30"]);
