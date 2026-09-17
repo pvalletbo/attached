@@ -1,12 +1,7 @@
 //! Resolve the effective account through the OS directory service, not environment
 //! variables or /etc/passwd alone. Absolute tool paths avoid PATH substitution and
 //! keep this lookup compatible with the workspace's prohibition on unsafe code.
-use std::{
-    os::unix::ffi::OsStrExt,
-    path::PathBuf,
-    process::Command,
-    time::Duration,
-};
+use std::{os::unix::ffi::OsStrExt, path::PathBuf, process::Command, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 
@@ -188,10 +183,7 @@ mod tests {
     #[test]
     fn account_lookup_subprocess_is_bounded() {
         let mut oversized = Command::new("/bin/sh");
-        oversized.args([
-            "-c",
-            "printf 12345678901234567; exec /bin/sleep 30",
-        ]);
+        oversized.args(["-c", "printf 12345678901234567; exec /bin/sleep 30"]);
         let error = run_lookup_with_limits(oversized, Duration::from_secs(2), 16).unwrap_err();
         assert!(
             error.to_string().contains("produced more than 16 bytes"),
@@ -200,8 +192,7 @@ mod tests {
 
         let mut stalled = Command::new("/bin/sh");
         stalled.args(["-c", "exec /bin/sleep 30"]);
-        let error =
-            run_lookup_with_limits(stalled, Duration::from_millis(50), 16).unwrap_err();
+        let error = run_lookup_with_limits(stalled, Duration::from_millis(50), 16).unwrap_err();
         assert!(error.to_string().contains("timed out"), "{error:#}");
     }
 
