@@ -1,9 +1,17 @@
 //! Resolve the effective account through the OS directory service, not environment
 //! variables or /etc/passwd alone. Absolute tool paths avoid PATH substitution and
 //! keep this lookup compatible with the workspace's prohibition on unsafe code.
-use std::{os::unix::ffi::OsStrExt, path::PathBuf, process::Command};
+use std::{
+    os::unix::ffi::OsStrExt,
+    path::PathBuf,
+    process::Command,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, ensure};
+
+const LOOKUP_RUNTIME_LIMIT: Duration = Duration::from_secs(15);
+const LOOKUP_CAPTURE_LIMIT: u64 = 64 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Account {
@@ -26,18 +34,30 @@ pub(super) fn lookup(uid: u32) -> Result<Account> {
         command.args(["-q", "user", "-a", "uid", &uid.to_string()]);
         command
     };
-    let output = command
+    command
         .env_clear()
         .env("LC_ALL", "C")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .context("could not run OS account lookup tool")?;
+        .stdin(std::process::Stdio::null());
+    let output = run_lookup(command)?;
     ensure!(output.status.success(), "OS account lookup failed");
     #[cfg(target_os = "linux")]
     let account = parse_passwd(&output.stdout, uid);
     #[cfg(target_os = "macos")]
     let account = parse_directory(&output.stdout, uid);
     account.context("could not resolve publisher OS account")
+}
+
+fn run_lookup(command: Command) -> Result<crate::bounded_process::BoundedOutput> {
+    run_lookup_with_limits(command, LOOKUP_RUNTIME_LIMIT, LOOKUP_CAPTURE_LIMIT)
+}
+
+fn run_lookup_with_limits(
+    command: Command,
+    runtime_limit: Duration,
+    capture_limit: u64,
+) -> Result<crate::bounded_process::BoundedOutput> {
+    crate::bounded_process::run_command(command, runtime_limit, capture_limit)
+        .context("could not run OS account lookup tool")
 }
 
 fn account(
@@ -163,6 +183,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.home.as_os_str().as_bytes(), b"/home/\xff");
+    }
+
+    #[test]
+    fn account_lookup_subprocess_is_bounded() {
+        let mut oversized = Command::new("/bin/sh");
+        oversized.args([
+            "-c",
+            "printf 12345678901234567; exec /bin/sleep 30",
+        ]);
+        let error = run_lookup_with_limits(oversized, Duration::from_secs(2), 16).unwrap_err();
+        assert!(
+            error.to_string().contains("produced more than 16 bytes"),
+            "{error:#}"
+        );
+
+        let mut stalled = Command::new("/bin/sh");
+        stalled.args(["-c", "exec /bin/sleep 30"]);
+        let error =
+            run_lookup_with_limits(stalled, Duration::from_millis(50), 16).unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error:#}");
     }
 
     #[test]
