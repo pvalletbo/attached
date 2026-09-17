@@ -3,7 +3,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     path::Path,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{Context, Result};
@@ -21,6 +21,32 @@ use crate::sync::{
 
 const PREPARE_CONCURRENCY: usize = 8;
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
+const RESUME_GAP: Duration = Duration::from_secs(30);
+
+#[derive(Debug, PartialEq, Eq)]
+enum RunExit {
+    Shutdown,
+    Resumed,
+}
+
+struct ResumeDetector {
+    last_tick: SystemTime,
+}
+
+impl ResumeDetector {
+    fn new(now: SystemTime) -> Self {
+        Self { last_tick: now }
+    }
+
+    fn observe(&mut self, now: SystemTime) -> bool {
+        // Instant may stop during suspend (notably on macOS). Compare wall time
+        // instead: an unchanged interface/IP does not imply a usable relay/NAT
+        // session after waking. Backward clock corrections simply rebase us.
+        let elapsed = now.duration_since(self.last_tick).unwrap_or_default();
+        self.last_tick = now;
+        elapsed >= RESUME_GAP
+    }
+}
 
 type Snapshot = BTreeMap<String, Advertisement>;
 
@@ -56,22 +82,48 @@ pub(crate) async fn export(path: &Path, refresh_interval: Duration) -> Result<i3
             .consumer_identity_secret()
             .context("download bundle has no consumer identity")?,
     );
-    // Never one endpoint per host: relays would displace the same consumer identity.
-    // Keep relay support even when the initial catalog is empty or entirely local.
-    let endpoint = Endpoint::builder(presets::N0)
-        .secret_key(consumer)
-        .bind()
-        .await?;
     let cancellation = CancellationToken::new();
     let _cancel = cancellation.clone().drop_guard();
-    let run = run(
-        &endpoint,
-        path,
-        account,
-        &managed,
-        refresh_interval,
-        cancellation.clone(),
-    );
+    let run = async {
+        loop {
+            // Never one endpoint per host: relays would displace the same
+            // consumer identity. Fully close the old endpoint before rebinding.
+            // Keep relay support even when the catalog is empty or local-only.
+            let endpoint = Endpoint::builder(presets::N0)
+                .secret_key(consumer.clone())
+                .bind()
+                .await?;
+            let result = run(
+                &endpoint,
+                path,
+                account.clone(),
+                &managed,
+                refresh_interval,
+                cancellation.child_token(),
+            )
+            .await;
+            // All brokers and keys are gone. Do not leave stale proxy paths
+            // published while the next endpoint is binding/discovering hosts.
+            let unpublished = managed.publish("");
+            // QUIC draining can otherwise outlive shutdown/resume when a peer
+            // is unreachable. Drop the last endpoint handle even if draining
+            // times out, so the old relay registration cannot outlive this loop.
+            if tokio::time::timeout(Duration::from_secs(3), endpoint.close())
+                .await
+                .is_err()
+            {
+                tracing::debug!("SSH exporter stopped waiting for QUIC close acknowledgements");
+            }
+            drop(endpoint);
+            unpublished?;
+            if result? == RunExit::Shutdown || cancellation.is_cancelled() {
+                return Ok::<_, anyhow::Error>(());
+            }
+            eprintln!(
+                "SSH forwarding resumed after suspension; rebuilding network connections. Reconnect any interrupted SSH sessions."
+            );
+        }
+    };
     tokio::pin!(run);
     eprintln!(
         "SSH forwarding enabled. Use ssh attached-HOST [command] or ssh attached-ENDPOINT-ID [command]. Discovering hosts every {} seconds; keep this terminal running. Ctrl-C removes the managed Include and temporary keys.",
@@ -84,15 +136,6 @@ pub(crate) async fn export(path: &Path, refresh_interval: Duration) -> Result<i3
             run.await
         }
     };
-    // QUIC draining depends on peer acknowledgements/RTT and can otherwise
-    // outlive cancellation when a discovered publisher never answers setup.
-    // All SSH tasks/temporary keys are already gone; bound this best-effort wait.
-    if tokio::time::timeout(Duration::from_secs(3), endpoint.close())
-        .await
-        .is_err()
-    {
-        tracing::debug!("SSH exporter stopped waiting for QUIC close acknowledgements");
-    }
     result?;
     Ok(0)
 }
@@ -132,7 +175,7 @@ async fn run(
     managed: &ManagedConfig,
     refresh_interval: Duration,
     cancellation: CancellationToken,
-) -> Result<()> {
+) -> Result<RunExit> {
     let (sender, mut discoveries) = mpsc::channel(1);
     let discovery = {
         let path = path.to_owned();
@@ -167,13 +210,21 @@ async fn run(
     let mut retry_after = BTreeMap::new();
     let mut generation = 0_u64;
     let mut published = String::new();
+    let mut resume = ResumeDetector::new(SystemTime::now());
     let mut expiry = tokio::time::interval(Duration::from_secs(1));
     expiry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let result = async {
         loop {
             tokio::select! {
                 biased;
-                _ = cancellation.cancelled() => break,
+                _ = cancellation.cancelled() => return Ok(RunExit::Shutdown),
+                // Check before queued discovery/setup completions after wake.
+                // Otherwise stale work could be republished first.
+                _ = expiry.tick() => {
+                    if resume.observe(SystemTime::now()) {
+                        return Ok(RunExit::Resumed);
+                    }
+                }
                 snapshot = discoveries.recv() => {
                     match snapshot.context("SSH discovery task ended unexpectedly")? {
                         Ok(snapshot) => { known = snapshot; }
@@ -206,7 +257,6 @@ async fn run(
                     }
                     if let Err(error) = result { eprintln!("Warning: SSH host attached-{target} stopped: {error:#}"); }
                 }
-                _ = expiry.tick() => {},
             }
             // Also expire aliases during a hanging/failed HTTP refresh. Established
             // streams drain independently; no expired lease can admit a new setup.
@@ -249,7 +299,6 @@ async fn run(
                 published = configuration;
             }
         }
-        Ok(())
     }.await;
     cancellation.cancel();
     running.clear();
@@ -337,6 +386,31 @@ mod tests {
             );
         }
         (identities, hosts)
+    }
+
+    #[test]
+    fn resume_detection_uses_wall_time_even_when_the_monotonic_clock_does_not_advance() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let mut detector = ResumeDetector::new(now);
+        assert!(!detector.observe(now + Duration::from_secs(1)));
+        // No actual wait/advance of Instant: model the clock used on macOS sleep.
+        let wake = now + Duration::from_secs(3600);
+        assert!(detector.observe(wake));
+        assert!(!detector.observe(wake));
+        assert!(!detector.observe(wake + Duration::from_secs(1)));
+        assert!(detector.observe(wake + Duration::from_secs(1) + RESUME_GAP));
+    }
+
+    #[test]
+    fn ordinary_ticks_and_backward_clock_corrections_do_not_restart_transport() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let mut detector = ResumeDetector::new(now);
+        for seconds in 1..120 {
+            assert!(!detector.observe(now + Duration::from_secs(seconds)));
+        }
+        assert!(!detector.observe(now));
+        assert!(!detector.observe(now + Duration::from_secs(1)));
+        assert!(detector.observe(now + Duration::from_secs(1) + RESUME_GAP));
     }
 
     #[test]
