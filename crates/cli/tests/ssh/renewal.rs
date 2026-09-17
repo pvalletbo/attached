@@ -28,7 +28,7 @@ fn snapshot(
     expires: chrono::DateTime<chrono::Utc>,
 ) -> Snapshot {
     let now = chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp(), 0).unwrap();
-    let descriptor = SessionAccessDescriptor::new(
+    let descriptor = HostAccessDescriptor::new(
         if revision == 1 {
             "remote"
         } else {
@@ -42,11 +42,10 @@ fn snapshot(
         ticket.into(),
         CapabilitySecret::from_bytes([capability; 32]),
         AttachedVersion::new(0, 2, 12),
-        HerdrVersion::new(99, 0, 0),
-        Vec::new(),
+        true,
     )
     .unwrap();
-    let (nonce, ciphertext) = seal_session_access_descriptor(
+    let (nonce, ciphertext) = seal_host_access_descriptor(
         &descriptor,
         &ROOT_KEY,
         AccountId::parse(ACCOUNT).unwrap().as_bytes(),
@@ -310,7 +309,7 @@ async fn broker_case(expire: bool) {
     let config_before = fs::read(&config).unwrap();
     let identity_path = config.parent().unwrap().join("identity");
     let identity_before = fs::read(&identity_path).unwrap();
-    let catalog_before = fs::read(fixture.path("home/.config/attached/sync-catalog.json")).unwrap();
+    let catalog_before = fs::read(fixture.path("home/.config/attached/host-catalog.json")).unwrap();
     // The running broker must not consult newly locked/removed account state.
     fs::remove_file(fixture.path("home/.config/attached/sync-account.bundle")).unwrap();
     fs::remove_file(fixture.path("bin/op")).unwrap();
@@ -394,7 +393,7 @@ async fn broker_case(expire: bool) {
     assert!(fs::read(&config).unwrap() == config_before);
     assert!(fs::read(&identity_path).unwrap() == identity_before);
     assert!(
-        fs::read(fixture.path("home/.config/attached/sync-catalog.json")).unwrap()
+        fs::read(fixture.path("home/.config/attached/host-catalog.json")).unwrap()
             == catalog_before
     );
     drop(active_stdin);

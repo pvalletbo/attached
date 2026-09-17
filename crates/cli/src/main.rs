@@ -10,21 +10,18 @@ mod config;
 mod diagnostics;
 mod download_account;
 mod endpoint_registry;
-mod herdr_version;
+mod host_picker;
 mod identity;
 mod installation;
 mod local_encryption;
-mod local_sockets;
 mod proxy;
 mod publish_account;
+mod remote_update;
 mod secure_state;
 mod serve_handoff;
 mod server;
-mod session;
-mod session_picker;
 mod ssh;
 mod sync;
-mod tunnel;
 
 #[cfg(test)]
 mod test_support;

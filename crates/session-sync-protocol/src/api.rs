@@ -24,7 +24,7 @@ pub const ALLOW_RECORD_INDEX: &str = "GET";
 pub const ALLOW_RECORDS: &str = "GET, PUT";
 pub const ALLOW_CURSORLESS_RECORDS: &str = ALLOW_RECORDS;
 pub const CACHE_CONTROL_VALUE: &str = "no-store";
-pub const AUTHENTICATE_VALUE: &str = "Bearer realm=\"herdr-sync-v1\"";
+pub const AUTHENTICATE_VALUE: &str = "Bearer realm=\"attached-sync-v1\"";
 pub const CONTENT_TYPE_JSON: &str = "application/json";
 pub const HEADER_ETAG: &str = "ETag";
 pub const HEADER_RETRY_AFTER: &str = "Retry-After";

@@ -15,6 +15,8 @@ use crate::limits::{
     IDENTIFIER_TEXT_LEN, MAX_BUNDLE_BYTES, MAX_BUNDLE_ENCODED_BYTES, SECRET_TEXT_LEN,
 };
 
+// Historical namespace labels are credential derivation inputs, not application
+// integration. Keep them stable so deployed account tokens and identities remain valid.
 const API_TOKEN_HASH_DOMAIN: &[u8] = b"herdr/session-sync/api-token/v1\0";
 const LEGACY_CONSUMER_IDENTITY_DOMAIN: &[u8] = b"herdr/session-sync/legacy-consumer-identity/v1\0";
 

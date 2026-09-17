@@ -1,27 +1,28 @@
-use std::time::{Duration, Instant};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context as _, Result, ensure};
 use attached_session_sync_protocol::{
     account::{ApiKeyScope, RecordId},
     api::Envelope as ApiEnvelope,
-    canonical::{
-        AttachedVersion as SessionAccessAttachedVersion, HerdrVersion as SessionAccessHerdrVersion,
-        SessionAccessDescriptor,
-    },
-    crypto::seal_session_access_descriptor,
+    canonical::{AttachedVersion, HostAccessDescriptor},
+    crypto::seal_host_access_descriptor,
     limits::validate_host_label,
 };
-use attached_tunnel_protocol::{CapabilitySecret, HerdrVersion};
+use attached_tunnel_protocol::CapabilitySecret;
 use iroh::EndpointAddr;
 use iroh_tickets::endpoint::EndpointTicket;
 use sha2::{Digest as _, Sha256};
 
 use super::{http::SyncHttpClient, state, state::AccountCredentials};
 
+// Keep the established record namespace: publishing host-only data must replace
+// this endpoint's old record rather than consume a second slot on the backend.
 const RECORD_ID_DOMAIN: &[u8] = b"herdr/session-record/v1";
-// Keep dead hosts visible for at most 90 seconds while giving a healthy publisher
-// two complete retry windows before each descriptor expires.
-const SESSION_ACCESS_DESCRIPTOR_LIFETIME: Duration = Duration::from_secs(90);
+// Two retry opportunities before a stopped publisher disappears from discovery.
+const DESCRIPTOR_LIFETIME: Duration = Duration::from_secs(90);
 const REPUBLISH_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,6 +33,7 @@ pub enum PublishOutcome {
 
 pub struct Publisher {
     account: AccountCredentials,
+    state_dir: PathBuf,
     record_id: RecordId,
     last_input_digest: Option<[u8; 32]>,
     next_refresh_at: Option<Instant>,
@@ -43,6 +45,7 @@ impl Publisher {
         let record_id = derive_record_id(account.account_id().as_bytes(), &endpoint_identity);
         Ok(Self {
             account,
+            state_dir: state_dir.to_owned(),
             record_id,
             last_input_digest: None,
             next_refresh_at: None,
@@ -53,26 +56,26 @@ impl Publisher {
         &mut self,
         host_label: &str,
         endpoint: EndpointAddr,
-        attach_capability: &CapabilitySecret,
-        herdr_version: HerdrVersion,
-        mut sessions: Vec<String>,
+        capability: &CapabilitySecret,
     ) -> Result<PublishOutcome> {
         ensure!(
             validate_host_label(host_label),
             "sync host label is invalid"
         );
-        sessions.sort();
-        sessions.dedup();
+        let consumer = self
+            .account
+            .authorized_consumer_identity()
+            .context("publish account has no authorized consumer")?;
+        let ssh_enabled = crate::ssh::access_enabled(&self.state_dir, consumer.as_bytes());
         let now = super::utc_now_seconds();
         let endpoint_ticket = EndpointTicket::from(endpoint).to_string();
-        let attached_version = current_attached_version()?;
+        let version = current_attached_version()?;
         let input_digest = snapshot_digest(
             host_label,
             &endpoint_ticket,
-            attach_capability,
-            attached_version,
-            herdr_version,
-            &sessions,
+            capability,
+            version,
+            ssh_enabled,
         );
         if self.last_input_digest == Some(input_digest)
             && self
@@ -81,39 +84,29 @@ impl Publisher {
         {
             return Ok(PublishOutcome::Unchanged);
         }
-
-        let expires_at = now + SESSION_ACCESS_DESCRIPTOR_LIFETIME;
+        // Measure from the start of publication, not after the HTTP response:
+        // otherwise the next periodic tick could skip renewal by a few milliseconds.
         let next_refresh_at = Instant::now() + REPUBLISH_INTERVAL;
-        let descriptor_version = SessionAccessHerdrVersion::new(
-            u16::try_from(herdr_version.major())
-                .context("Herdr major version exceeds session access descriptor")?,
-            u16::try_from(herdr_version.minor())
-                .context("Herdr minor version exceeds session access descriptor")?,
-            u16::try_from(herdr_version.patch())
-                .context("Herdr patch version exceeds session access descriptor")?,
-        );
-        let descriptor = SessionAccessDescriptor::new(
+        let descriptor = HostAccessDescriptor::new(
             host_label.to_owned(),
             now,
-            expires_at,
+            now + DESCRIPTOR_LIFETIME,
             endpoint_ticket,
-            attach_capability.clone(),
-            attached_version,
-            descriptor_version,
-            sessions,
+            capability.clone(),
+            version,
+            ssh_enabled,
         )
-        .context("could not build session access descriptor")?;
-        let envelope = seal_session_access_descriptor(
+        .context("could not build host access descriptor")?;
+        let envelope = seal_host_access_descriptor(
             &descriptor,
             self.account.account_root_key(),
             self.account.account_id().as_bytes(),
             self.record_id.as_bytes(),
         )
-        .context("could not encrypt session access descriptor")?;
+        .context("could not encrypt host access descriptor")?;
         let (nonce, ciphertext) = envelope.into_parts();
-        let envelope = ApiEnvelope::new(nonce, ciphertext).map_err(|_| {
-            anyhow::anyhow!("encrypted session access descriptor exceeds record limit")
-        })?;
+        let envelope = ApiEnvelope::new(nonce, ciphertext)
+            .map_err(|_| anyhow::anyhow!("encrypted host descriptor exceeds record limit"))?;
         let revision = SyncHttpClient::new()?
             .put_record(&self.account, self.record_id, &envelope)
             .await?;
@@ -123,13 +116,13 @@ impl Publisher {
     }
 }
 
-fn current_attached_version() -> Result<SessionAccessAttachedVersion> {
+fn current_attached_version() -> Result<AttachedVersion> {
     let version = crate::attached_version::current();
     let component = |value, name| {
         u16::try_from(value)
             .with_context(|| format!("Attached {name} version exceeds sync protocol"))
     };
-    Ok(SessionAccessAttachedVersion::new(
+    Ok(AttachedVersion::new(
         component(version.major(), "major")?,
         component(version.minor(), "minor")?,
         component(version.patch(), "patch")?,
@@ -142,156 +135,93 @@ pub fn default_host_label(endpoint: &EndpointAddr) -> String {
 }
 
 pub fn derive_record_id(account_id: &[u8; 16], endpoint_identity: &[u8; 32]) -> RecordId {
-    let digest: [u8; 32] = Sha256::new()
+    let digest = Sha256::new()
         .chain_update(RECORD_ID_DOMAIN)
         .chain_update(account_id)
         .chain_update(endpoint_identity)
-        .finalize()
-        .into();
-    let mut record_id = [0_u8; 16];
+        .finalize();
+    let mut record_id = [0; 16];
     record_id.copy_from_slice(&digest[..16]);
     RecordId::from_bytes(record_id)
 }
 
 fn snapshot_digest(
-    host_label: &str,
-    endpoint_ticket: &str,
-    attach_capability: &CapabilitySecret,
-    attached_version: SessionAccessAttachedVersion,
-    herdr_version: HerdrVersion,
-    sessions: &[String],
+    host: &str,
+    ticket: &str,
+    capability: &CapabilitySecret,
+    version: AttachedVersion,
+    ssh_enabled: bool,
 ) -> [u8; 32] {
     let mut digest = Sha256::new();
-    digest.update(b"herdr/session-sync/publisher-input/v3\0");
-    digest.update((host_label.len() as u32).to_be_bytes());
-    digest.update(host_label.as_bytes());
-    digest.update((endpoint_ticket.len() as u32).to_be_bytes());
-    digest.update(endpoint_ticket.as_bytes());
-    digest.update(attach_capability.to_bytes().as_ref());
-    digest.update(attached_version.major.to_be_bytes());
-    digest.update(attached_version.minor.to_be_bytes());
-    digest.update(attached_version.patch.to_be_bytes());
-    digest.update(herdr_version.major().to_be_bytes());
-    digest.update(herdr_version.minor().to_be_bytes());
-    digest.update(herdr_version.patch().to_be_bytes());
-    for session in sessions {
-        digest.update((session.len() as u32).to_be_bytes());
-        digest.update(session.as_bytes());
+    digest.update(b"attached/host-sync/publisher-input/v1\0");
+    for field in [host, ticket] {
+        digest.update((field.len() as u32).to_be_bytes());
+        digest.update(field.as_bytes());
     }
+    digest.update(capability.to_bytes());
+    digest.update(version.major.to_be_bytes());
+    digest.update(version.minor.to_be_bytes());
+    digest.update(version.patch.to_be_bytes());
+    digest.update([u8::from(ssh_enabled)]);
     digest.finalize().into()
 }
+
+#[cfg(test)]
+#[path = "publisher_tests.rs"]
+mod integration_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn dead_publisher_disappears_within_ninety_seconds() {
-        assert!(
-            SESSION_ACCESS_DESCRIPTOR_LIFETIME <= Duration::from_secs(90),
-            "dead publishers remained discoverable for {:?}",
-            SESSION_ACCESS_DESCRIPTOR_LIFETIME
-        );
-        assert!(
-            REPUBLISH_INTERVAL * 3 <= SESSION_ACCESS_DESCRIPTOR_LIFETIME,
-            "healthy publishers lack two complete refresh opportunities before expiration"
-        );
-    }
-
-    #[test]
-    fn record_id_is_deterministic_and_bound_to_account_and_endpoint() {
-        let first = derive_record_id(&[1; 16], &[2; 32]);
-        assert_eq!(first.encode(), "bj-IPD__4nSbRhdl8nKC-w");
-        assert_eq!(first, derive_record_id(&[1; 16], &[2; 32]));
-        assert_ne!(first, derive_record_id(&[3; 16], &[2; 32]));
-        assert_ne!(first, derive_record_id(&[1; 16], &[4; 32]));
-    }
-
-    #[test]
-    fn host_label_changes_affect_publication_memoization() {
-        let endpoint = "endpoint-ticket";
-        let capability = CapabilitySecret::from_bytes([7; 32]);
-        let attached_version = SessionAccessAttachedVersion::new(0, 2, 0);
-        let herdr_version = HerdrVersion::new(1, 2, 3);
-        let sessions = vec!["work".to_owned()];
-        assert_ne!(
-            snapshot_digest(
-                "office",
-                endpoint,
-                &capability,
-                attached_version,
-                herdr_version,
-                &sessions,
-            ),
-            snapshot_digest(
-                "renamed",
-                endpoint,
-                &capability,
-                attached_version,
-                herdr_version,
-                &sessions,
-            )
-        );
-    }
-
-    #[test]
-    fn attached_version_changes_affect_publication_memoization() {
-        let endpoint = "endpoint-ticket";
-        let capability = CapabilitySecret::from_bytes([7; 32]);
-        let herdr_version = HerdrVersion::new(1, 2, 3);
-        let sessions = vec!["work".to_owned()];
-        assert_ne!(
-            snapshot_digest(
-                "office",
-                endpoint,
-                &capability,
-                SessionAccessAttachedVersion::new(0, 2, 0),
-                herdr_version,
-                &sessions,
-            ),
-            snapshot_digest(
-                "office",
-                endpoint,
-                &capability,
-                SessionAccessAttachedVersion::new(0, 3, 0),
-                herdr_version,
-                &sessions,
-            )
-        );
-    }
-
-    #[test]
-    fn package_version_is_publishable() {
-        let version = current_attached_version().unwrap();
-        assert_eq!(version.major.to_string(), env!("CARGO_PKG_VERSION_MAJOR"));
-        assert_eq!(version.minor.to_string(), env!("CARGO_PKG_VERSION_MINOR"));
-        assert_eq!(version.patch.to_string(), env!("CARGO_PKG_VERSION_PATCH"));
-    }
-
-    #[test]
-    fn obsolete_signing_and_publisher_files_are_ignored_and_retained() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let root = crate::test_support::canonical_tempdir();
-        let owner_dir = root.path().join("owner");
-        let host_dir = root.path().join("host");
-        state::test_support::create_account(&owner_dir, "https://sync.example").unwrap();
-        let bundle = state::export_account(&owner_dir, ApiKeyScope::Publish).unwrap();
-        state::import_account(&host_dir, bundle.as_bytes()).unwrap();
-        for name in ["sync-host-signing.key", "sync-publisher.json"] {
-            let path = host_dir.join(name);
-            std::fs::write(&path, b"obsolete synthetic fixture").unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        }
-
-        let publisher = Publisher::load(&host_dir, [2; 32]).expect("publisher ignores old files");
+    fn stopped_hosts_expire_and_record_ids_are_account_and_endpoint_bound() {
+        assert!(DESCRIPTOR_LIFETIME <= Duration::from_secs(90));
         assert_eq!(
-            publisher.record_id,
-            derive_record_id(publisher.account.account_id().as_bytes(), &[2; 32])
+            derive_record_id(&[1; 16], &[2; 32]).encode(),
+            "bj-IPD__4nSbRhdl8nKC-w"
         );
-        assert!(host_dir.join("sync-host-signing.key").exists());
-        assert!(host_dir.join("sync-publisher.json").exists());
-        assert!(!host_dir.join("sync-host-signing.lock").exists());
-        assert!(!host_dir.join("sync-publisher.lock").exists());
+        assert!(REPUBLISH_INTERVAL * 3 <= DESCRIPTOR_LIFETIME);
+        assert_eq!(
+            derive_record_id(&[1; 16], &[2; 32]),
+            derive_record_id(&[1; 16], &[2; 32])
+        );
+        assert_ne!(
+            derive_record_id(&[1; 16], &[2; 32]),
+            derive_record_id(&[3; 16], &[2; 32])
+        );
+        assert_ne!(
+            derive_record_id(&[1; 16], &[2; 32]),
+            derive_record_id(&[1; 16], &[3; 32])
+        );
+    }
+
+    #[test]
+    fn all_connection_metadata_and_consent_invalidate_publication_memoization() {
+        let key = CapabilitySecret::from_bytes([7; 32]);
+        let version = AttachedVersion::new(1, 2, 3);
+        let original = snapshot_digest("office", "ticket", &key, version, true);
+        for digest in [
+            snapshot_digest("renamed", "ticket", &key, version, true),
+            snapshot_digest("office", "new-ticket", &key, version, true),
+            snapshot_digest(
+                "office",
+                "ticket",
+                &CapabilitySecret::from_bytes([8; 32]),
+                version,
+                true,
+            ),
+            snapshot_digest(
+                "office",
+                "ticket",
+                &key,
+                AttachedVersion::new(1, 2, 4),
+                true,
+            ),
+            snapshot_digest("office", "ticket", &key, version, false),
+        ] {
+            assert_ne!(original, digest);
+        }
+        assert!(current_attached_version().is_ok());
     }
 }

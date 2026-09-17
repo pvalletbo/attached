@@ -8,74 +8,51 @@ use anyhow::{Context as _, Result, ensure};
 use attached_session_sync_protocol::{
     account::{ApiKeyScope, RecordId},
     api::LiveRecordIndexEntry,
-    canonical::{HerdrVersion as SessionAccessHerdrVersion, SessionAccessError},
-    crypto::{
-        Envelope as CryptoEnvelope, VerificationContext,
-        open_session_access_descriptor_cursorless_for_native_upgrade,
-    },
+    crypto::{Envelope as CryptoEnvelope, VerificationContext, open_host_access_descriptor},
 };
-use attached_tunnel_protocol::HerdrVersion;
 use futures_util::{StreamExt as _, stream};
 
 use super::{
     http::{FetchedRecord, SyncHttpClient},
     state,
-    state_catalog::{self, CatalogRecord, SyncedSession},
+    state_catalog::{self, CatalogRecord, SyncedHost},
 };
 
 const RECORD_FETCH_CONCURRENCY: usize = 8;
-const ATTACH_CACHE_TTL: chrono::Duration = chrono::Duration::minutes(5);
 
-/// Reuse recent, account-bound discovery without extending descriptor validity.
-pub async fn sessions_for_attach(
+/// Reuse only the selected publisher's unexpired descriptor. An outage or
+/// another host's expired record must not prevent an otherwise valid SSH setup.
+pub(crate) async fn ssh_host(
     state_dir: &Path,
-    local_version: HerdrVersion,
+    account: &state::AccountCredentials,
+    target: &str,
     no_cache: bool,
-) -> Result<RefreshResult> {
-    let now = super::utc_now_seconds();
-    if !no_cache {
-        let registry = crate::endpoint_registry::default_dir();
-        if let Ok(Some(mut cached)) =
-            cached_sessions(state_dir, registry.as_deref().unwrap_or(Path::new("")), now)
-        {
-            if registry.is_err() {
-                push_registry_warning(&mut cached.warnings);
-            }
-            return Ok(cached);
-        }
+) -> Result<state_catalog::HostConnection> {
+    if !no_cache
+        && let Ok(host) = state_catalog::host(state_dir, account, target, super::utc_now_seconds())
+        && host.ssh_enabled
+    {
+        return Ok(host);
     }
-    refresh_sessions(state_dir, local_version).await
-}
-
-fn cached_sessions(
-    state_dir: &Path,
-    registry_dir: &Path,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<Option<RefreshResult>> {
-    let Some(account) = state::load_account_optional(state_dir, ApiKeyScope::Download)? else {
-        return Ok(None);
-    };
-    let catalog = state_catalog::load(state_dir, &account)?;
-    let fresh = catalog.refreshed_at.is_some_and(|refreshed_at| {
-        let age = now.signed_duration_since(refreshed_at);
-        (chrono::Duration::zero()..ATTACH_CACHE_TTL).contains(&age)
-    });
-    if !fresh {
-        return Ok(None);
+    let refreshed = refresh_hosts(state_dir).await?;
+    for warning in refreshed
+        .warnings
+        .iter()
+        .filter(|warning| !warning.is_verbose_only())
+    {
+        eprintln!("Warning: {warning}");
     }
-    let listing =
-        state_catalog::sessions_excluding_local_endpoints(state_dir, &account, now, registry_dir)?;
-    // Empty discovery may be transient, or all cached sessions may have expired.
-    // Retry the service instead of hiding sessions for the rest of the cache TTL.
-    if listing.sessions.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(finish_refresh(listing, Vec::new())))
+    let host = state_catalog::host(state_dir, account, target, super::utc_now_seconds())?;
+    ensure!(
+        host.ssh_enabled,
+        "SSH access is disabled on this publisher; run `attached ssh-access enable` there"
+    );
+    Ok(host)
 }
 
 #[derive(Debug)]
 pub struct RefreshResult {
-    pub sessions: Vec<SyncedSession>,
+    pub hosts: Vec<SyncedHost>,
     pub warnings: Vec<RefreshWarning>,
 }
 
@@ -104,7 +81,7 @@ impl fmt::Display for RefreshWarning {
         match self {
             Self::CatalogRebuilt(error) => write!(
                 formatter,
-                "could not load synchronized session catalog; rebuilt it after a successful refresh: {error}"
+                "could not load synchronized host catalog; rebuilt it after a successful refresh: {error}"
             ),
             Self::RecordDiscarded { record_id, error } => write!(
                 formatter,
@@ -115,48 +92,34 @@ impl fmt::Display for RefreshWarning {
                 "synchronized record {record_id} is temporarily unavailable: {error:#}; retry discovery"
             ),
             Self::EndpointRegistryUnavailable => formatter.write_str(
-                "could not inspect the local endpoint registry; remote sessions were retained",
+                "could not inspect the local endpoint registry; remote hosts were retained",
             ),
         }
     }
 }
 
-#[tracing::instrument(name = "refresh_sessions", level = "debug", skip_all)]
-pub async fn refresh_sessions(
-    state_dir: &Path,
-    local_version: HerdrVersion,
-) -> Result<RefreshResult> {
+#[tracing::instrument(name = "refresh_hosts", level = "debug", skip_all)]
+pub async fn refresh_hosts(state_dir: &Path) -> Result<RefreshResult> {
     match crate::endpoint_registry::default_dir() {
-        Ok(registry_dir) => {
-            refresh_sessions_with_registry(state_dir, local_version, &registry_dir).await
-        }
+        Ok(registry_dir) => refresh_hosts_with_registry(state_dir, &registry_dir).await,
         Err(_) => {
-            let mut result =
-                refresh_sessions_with_registry(state_dir, local_version, Path::new("")).await?;
+            let mut result = refresh_hosts_with_registry(state_dir, Path::new("")).await?;
             push_registry_warning(&mut result.warnings);
             Ok(result)
         }
     }
 }
 
-async fn refresh_sessions_with_registry(
+async fn refresh_hosts_with_registry(
     state_dir: &Path,
-    local_version: HerdrVersion,
     registry_dir: &Path,
 ) -> Result<RefreshResult> {
-    refresh_sessions_with_registry_at(
-        state_dir,
-        local_version,
-        registry_dir,
-        super::utc_now_seconds(),
-    )
-    .await
+    refresh_hosts_with_registry_at(state_dir, registry_dir, super::utc_now_seconds()).await
 }
 
 #[tracing::instrument(name = "refresh_catalog", level = "debug", skip_all)]
-async fn refresh_sessions_with_registry_at(
+async fn refresh_hosts_with_registry_at(
     state_dir: &Path,
-    local_version: HerdrVersion,
     registry_dir: &Path,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<RefreshResult> {
@@ -165,11 +128,10 @@ async fn refresh_sessions_with_registry_at(
         .context("could not load synchronization account")?
     else {
         return Ok(RefreshResult {
-            sessions: Vec::new(),
+            hosts: Vec::new(),
             warnings,
         });
     };
-    let local_version = descriptor_version(local_version)?;
     let mut catalog = match state_catalog::load(state_dir, &account) {
         Ok(catalog) => catalog,
         Err(error) => {
@@ -188,22 +150,19 @@ async fn refresh_sessions_with_registry_at(
         .iter()
         .map(|record| (record.record_id, record.service_revision))
         .collect::<HashSet<_>>();
-    let baseline_pruned_revisions = catalog.pruned_revision_pairs().collect::<HashSet<_>>();
     let mut existing = std::mem::take(&mut catalog.records)
         .into_iter()
         .map(|record| (record.record_id, record))
         .collect::<BTreeMap<_, _>>();
     let mut accepted = Vec::with_capacity(index.records.len());
     let mut changed = Vec::new();
-    let mut saw_expired_record = false;
     for indexed in index.records {
         let previous = existing.remove(&indexed.record_id);
         if let Some(previous) = previous
             && previous.service_revision == indexed.revision
         {
             if previous.is_expired_at(now) {
-                saw_expired_record = true;
-                let error = anyhow::anyhow!("session access descriptor expired");
+                let error = anyhow::anyhow!("host access descriptor expired");
                 tracing::debug!(
                     record_id = %indexed.record_id,
                     reason = %error,
@@ -250,28 +209,23 @@ async fn refresh_sessions_with_registry_at(
             account_id: *account.account_id().as_bytes(),
             record_id: *indexed.record_id.as_bytes(),
             now,
-            local_version,
         };
-        let opened = match open_session_access_descriptor_cursorless_for_native_upgrade(
-            &envelope,
-            account.account_root_key(),
-            &context,
-        ) {
-            Ok(opened) => opened,
-            Err(error) => {
-                saw_expired_record |= error == SessionAccessError::Expired;
-                tracing::debug!(
-                    record_id = %indexed.record_id,
-                    reason = %error,
-                    "discarded invalid synchronized record during refresh"
-                );
-                warnings.push(RefreshWarning::RecordDiscarded {
-                    record_id: indexed.record_id,
-                    error: error.into(),
-                });
-                continue;
-            }
-        };
+        let opened =
+            match open_host_access_descriptor(&envelope, account.account_root_key(), &context) {
+                Ok(opened) => opened,
+                Err(error) => {
+                    tracing::debug!(
+                        record_id = %indexed.record_id,
+                        reason = %error,
+                        "discarded invalid synchronized record during refresh"
+                    );
+                    warnings.push(RefreshWarning::RecordDiscarded {
+                        record_id: indexed.record_id,
+                        error: error.into(),
+                    });
+                    continue;
+                }
+            };
         accepted.push(CatalogRecord::from_opened(
             indexed.record_id,
             fetched.revision,
@@ -280,24 +234,11 @@ async fn refresh_sessions_with_registry_at(
     }
     accepted.sort_by_key(|record| record.record_id);
     catalog.records = accepted;
-    // Expired descriptors may be republished immediately. Do not cache a partial
-    // listing for minutes when the service can already have a replacement revision.
-    catalog.refreshed_at = (!saw_expired_record
-        && !warnings
-            .iter()
-            .any(|warning| matches!(warning, RefreshWarning::RecordUnavailable { .. })))
-    .then_some(now);
-    state_catalog::save_refresh(
-        state_dir,
-        &account,
-        &baseline_revisions,
-        &baseline_pruned_revisions,
-        &catalog,
-    )
-    .context("could not save synchronized session catalog")?;
+    state_catalog::save_refresh(state_dir, &account, &baseline_revisions, &catalog)
+        .context("could not save synchronized host catalog")?;
 
     let listing =
-        state_catalog::sessions_excluding_local_endpoints(state_dir, &account, now, registry_dir)?;
+        state_catalog::hosts_excluding_local_endpoints(state_dir, &account, now, registry_dir)?;
     Ok(finish_refresh(listing, warnings))
 }
 
@@ -306,8 +247,8 @@ async fn refresh_sessions_with_registry_at(
 /// This does not change the discovery cache or any active SSH connection.
 pub(crate) async fn refresh_ssh_attachment(
     account: &state::AccountCredentials,
-    previous: &state_catalog::SyncedAttachment,
-) -> Result<state_catalog::SyncedAttachment> {
+    previous: &state_catalog::HostConnection,
+) -> Result<state_catalog::HostConnection> {
     let client = SyncHttpClient::new()?;
     let indexed = client
         .list_records(account)
@@ -329,16 +270,15 @@ pub(crate) async fn refresh_ssh_attachment(
         account_id: *account.account_id().as_bytes(),
         record_id: *previous.record_id.as_bytes(),
         now: super::utc_now_seconds(),
-        local_version: descriptor_version(HerdrVersion::new(0, 0, 0))?,
     };
-    let opened = open_session_access_descriptor_cursorless_for_native_upgrade(
-        &envelope,
-        account.account_root_key(),
-        &context,
-    )
-    .context("could not verify refreshed SSH publisher descriptor")?;
+    let opened = open_host_access_descriptor(&envelope, account.account_root_key(), &context)
+        .context("could not verify refreshed SSH publisher descriptor")?;
     let attachment =
         CatalogRecord::from_opened(previous.record_id, fetched.revision, &opened).ssh_attachment();
+    ensure!(
+        attachment.ssh_enabled,
+        "SSH access is disabled on this publisher"
+    );
     ensure!(
         attachment.endpoint_identity == previous.endpoint_identity,
         "SSH publisher identity changed during discovery refresh"
@@ -414,14 +354,14 @@ async fn fetch_changed_records(
 }
 
 fn finish_refresh(
-    listing: state_catalog::SessionListing,
+    listing: state_catalog::HostListing,
     mut warnings: Vec<RefreshWarning>,
 ) -> RefreshResult {
     if listing.registry_unavailable {
         push_registry_warning(&mut warnings);
     }
     RefreshResult {
-        sessions: listing.sessions,
+        hosts: listing.hosts,
         warnings,
     }
 }
@@ -435,28 +375,14 @@ fn push_registry_warning(warnings: &mut Vec<RefreshWarning>) {
     }
 }
 
-fn descriptor_version(version: HerdrVersion) -> Result<SessionAccessHerdrVersion> {
-    Ok(SessionAccessHerdrVersion::new(
-        u16::try_from(version.major())
-            .context("local Herdr major version exceeds sync protocol")?,
-        u16::try_from(version.minor())
-            .context("local Herdr minor version exceeds sync protocol")?,
-        u16::try_from(version.patch())
-            .context("local Herdr patch version exceeds sync protocol")?,
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use attached_session_sync_protocol::{
         account::RecordId,
         api::{Envelope, LiveRecordIndex, LiveRecordIndexEntry},
-        canonical::{
-            AttachedVersion as SessionAccessAttachedVersion, HerdrVersion as SessionAccessVersion,
-            SessionAccessDescriptor,
-        },
-        crypto::seal_session_access_descriptor,
+        canonical::{AttachedVersion as SessionAccessAttachedVersion, HostAccessDescriptor},
+        crypto::seal_host_access_descriptor,
     };
     use attached_tunnel_protocol::CapabilitySecret;
     use iroh_tickets::endpoint::EndpointTicket;
@@ -584,16 +510,15 @@ mod tests {
                 std::fs::remove_file(state_dir.join("sync-account.bundle")).unwrap();
                 let record_id = RecordId::from_bytes([71; 16]);
                 let now = super::super::utc_now_seconds();
-                let previous = state_catalog::SyncedAttachment {
+                let previous = state_catalog::HostConnection {
                     record_id,
                     service_revision: if scenario == 5 { 2 } else { 1 },
                     endpoint_ticket: ENDPOINT.into(),
                     endpoint_identity: ENDPOINT_ID,
                     attach_capability: [1; 32],
-                    attached_version: None,
-                    herdr_version: [0, 0, 0],
+                    attached_version: [0, 0, 0],
+                    ssh_enabled: true,
                     expires_at: now - chrono::Duration::seconds(1),
-                    session: String::new(),
                 };
                 let ticket = if scenario == 1 {
                     EndpointTicket::new(iroh::EndpointAddr::new(
@@ -604,18 +529,17 @@ mod tests {
                     ENDPOINT.to_owned()
                 };
                 let expired = scenario == 2;
-                let descriptor = SessionAccessDescriptor::new(
+                let descriptor = HostAccessDescriptor::new(
                     "renamed-publisher".into(),
                     now - chrono::Duration::seconds(90),
                     now + chrono::Duration::seconds(if expired { -1 } else { 90 }),
                     ticket,
                     CapabilitySecret::from_bytes([2; 32]),
                     SessionAccessAttachedVersion::new(0, 2, 12),
-                    SessionAccessVersion::new(99, 0, 0),
-                    Vec::new(),
+                    true,
                 )
                 .unwrap();
-                let (nonce, mut ciphertext) = seal_session_access_descriptor(
+                let (nonce, mut ciphertext) = seal_host_access_descriptor(
                     &descriptor,
                     account.account_root_key(),
                     account.account_id().as_bytes(),
@@ -658,7 +582,7 @@ mod tests {
                     );
                 }
                 server.await.unwrap();
-                assert!(!state_dir.join("sync-catalog.json").exists());
+                assert!(!state_dir.join("host-catalog.json").exists());
             }
         })
         .await
@@ -666,7 +590,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_discovery_is_refreshed_on_every_attach() {
+    async fn empty_discovery_is_refreshed_on_every_connect() {
         tokio::time::timeout(Duration::from_secs(5), async {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let root = crate::test_support::canonical_tempdir();
@@ -687,15 +611,10 @@ mod tests {
                 ],
             ));
             for _ in 0..2 {
-                let result = sessions_for_attach(&state_dir, HerdrVersion::new(3, 2, 1), false)
-                    .await
-                    .unwrap();
-                assert!(result.sessions.is_empty());
                 assert!(
-                    state_catalog::load(&state_dir, &account)
-                        .unwrap()
-                        .refreshed_at
-                        .is_some()
+                    ssh_host(&state_dir, &account, "missing", false)
+                        .await
+                        .is_err()
                 );
             }
             server.await.unwrap();
@@ -719,18 +638,17 @@ mod tests {
             let account = state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
             let now = super::super::utc_now_seconds();
             let id = RecordId::from_bytes([42; 16]);
-            let descriptor = SessionAccessDescriptor::new(
+            let descriptor = HostAccessDescriptor::new(
                 "publisher".into(),
                 now - Duration::from_secs(1),
                 now + Duration::from_secs(300),
                 ENDPOINT.into(),
                 CapabilitySecret::from_bytes([42; 32]),
                 SessionAccessAttachedVersion::new(0, 2, 8),
-                SessionAccessVersion::new(3, 2, 1),
-                vec!["work".into()],
+                true,
             )
             .unwrap();
-            let (nonce, ciphertext) = seal_session_access_descriptor(
+            let (nonce, ciphertext) = seal_host_access_descriptor(
                 &descriptor,
                 account.account_root_key(),
                 account.account_id().as_bytes(),
@@ -759,63 +677,43 @@ mod tests {
                     (index_path, 200, None, index(2)),
                 ],
             ));
-            let refreshed = refresh_sessions_with_registry_at(
-                &state_dir,
-                HerdrVersion::new(3, 2, 1),
-                &registry_dir,
-                now,
-            )
-            .await
-            .unwrap();
-            assert_eq!(refreshed.sessions.len(), 1);
-            assert_eq!(refreshed.sessions[0].target, "publisher/work");
+            let refreshed = refresh_hosts_with_registry_at(&state_dir, &registry_dir, now)
+                .await
+                .unwrap();
+            assert_eq!(refreshed.hosts.len(), 1);
+            assert_eq!(refreshed.hosts[0].host, "publisher");
             assert_eq!(
                 state_catalog::load(&state_dir, &account).unwrap().records[0].service_revision,
                 2
             );
             server.await.unwrap();
-            // The fixture service is now offline: a fresh attach must do no HTTP.
-            let cached = sessions_for_attach(&state_dir, HerdrVersion::new(3, 2, 1), false)
+            // A valid selected descriptor remains usable with discovery offline.
+            let cached = ssh_host(&state_dir, &account, "publisher", false)
                 .await
                 .unwrap();
-            assert_eq!(cached.sessions, refreshed.sessions);
+            assert_eq!(cached.service_revision, 2);
             assert!(
-                sessions_for_attach(&state_dir, HerdrVersion::new(3, 2, 1), true)
+                ssh_host(&state_dir, &account, "publisher", true)
                     .await
                     .is_err()
             );
             assert!(
-                cached_sessions(&state_dir, &registry_dir, now + Duration::from_secs(299))
-                    .unwrap()
-                    .is_some()
+                state_catalog::host(
+                    &state_dir,
+                    &account,
+                    "publisher",
+                    now + Duration::from_secs(299)
+                )
+                .is_ok()
             );
             assert!(
-                cached_sessions(&state_dir, &registry_dir, now + Duration::from_secs(300))
-                    .unwrap()
-                    .is_none()
-            );
-            assert!(
-                cached_sessions(&state_dir, &registry_dir, now - Duration::from_secs(1))
-                    .unwrap()
-                    .is_none()
-            );
-
-            // A fresh discovery timestamp never prolongs an expired descriptor.
-            let mut catalog = state_catalog::load(&state_dir, &account).unwrap();
-            catalog.refreshed_at = Some(now + Duration::from_secs(299));
-            state_catalog::save(&state_dir, &account, &catalog).unwrap();
-            assert!(
-                cached_sessions(&state_dir, &registry_dir, now + Duration::from_secs(300))
-                    .unwrap()
-                    .is_none()
-            );
-            // Catalogs written before caching was introduced require a refresh.
-            catalog.refreshed_at = None;
-            state_catalog::save(&state_dir, &account, &catalog).unwrap();
-            assert!(
-                cached_sessions(&state_dir, &registry_dir, now)
-                    .unwrap()
-                    .is_none()
+                state_catalog::host(
+                    &state_dir,
+                    &account,
+                    "publisher",
+                    now + Duration::from_secs(300)
+                )
+                .is_err()
             );
         })
         .await
@@ -825,7 +723,7 @@ mod tests {
     #[tokio::test]
     async fn unstable_deleted_and_invalid_records_do_not_hide_other_hosts() {
         tokio::time::timeout(Duration::from_secs(10), async {
-            for scenario in ["churn", "deleted", "http-error", "reindexed-deletion", "rollback", "index-rollback", "invalid", "expired", "pruned-replay"] {
+            for scenario in ["churn", "deleted", "http-error", "reindexed-deletion", "rollback", "index-rollback", "invalid", "expired"] {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let root = crate::test_support::canonical_tempdir();
                 let state_dir = root.path().join("state");
@@ -835,32 +733,19 @@ mod tests {
                 let changing = RecordId::from_bytes([42; 16]);
                 let stable = RecordId::from_bytes([43; 16]);
                 let sealed = |id: RecordId, expired: bool| {
-                    let descriptor = SessionAccessDescriptor::new(
+                    let descriptor = HostAccessDescriptor::new(
                         if id == stable { "stable" } else { "changing" }.into(),
                         now - Duration::from_secs(120),
                         if expired { now - Duration::from_secs(1) } else { now + Duration::from_secs(300) },
                         ENDPOINT.into(), CapabilitySecret::from_bytes([42; 32]),
-                        SessionAccessAttachedVersion::new(0, 2, 8), SessionAccessVersion::new(3, 2, 1), vec!["work".into()],
+                        SessionAccessAttachedVersion::new(0, 2, 8), true,
                     ).unwrap();
-                    let (nonce, ciphertext) = seal_session_access_descriptor(
+                    let (nonce, ciphertext) = seal_host_access_descriptor(
                         &descriptor, account.account_root_key(), account.account_id().as_bytes(), id.as_bytes(),
                     ).unwrap().into_parts();
                     Envelope::new(nonce, ciphertext).unwrap()
                 };
                 let mut envelope = sealed(changing, scenario == "expired");
-                if scenario == "pruned-replay" {
-                    let context = VerificationContext {
-                        account_id: *account.account_id().as_bytes(), record_id: *changing.as_bytes(), now,
-                        local_version: SessionAccessVersion::new(3, 2, 1),
-                    };
-                    let opened = open_session_access_descriptor_cursorless_for_native_upgrade(
-                        &CryptoEnvelope::new(envelope.nonce, envelope.ciphertext.clone()).unwrap(), account.account_root_key(), &context,
-                    ).unwrap();
-                    let mut catalog = state_catalog::Catalog::empty(&account);
-                    catalog.records.push(CatalogRecord::from_opened(changing, 2, &opened));
-                    state_catalog::save(&state_dir, &account, &catalog).unwrap();
-                    assert!(state_catalog::remove_if_revision(&state_dir, &account, changing, 2).unwrap());
-                }
                 if scenario == "invalid" {
                     envelope.ciphertext[0] ^= 1;
                 }
@@ -896,29 +781,21 @@ mod tests {
                 responses.push((format!("{index_path}/{stable}"), 200, Some(1), serde_json::to_vec(&sealed(stable, false)).unwrap()));
                 let server = tokio::spawn(serve_sequence(listener, responses));
                 let registry_dir = root.path().join("registry");
-                let refreshed = refresh_sessions_with_registry_at(
-                    &state_dir, HerdrVersion::new(3, 2, 1), &registry_dir, now,
+                let refreshed = refresh_hosts_with_registry_at(
+                    &state_dir, &registry_dir, now,
                 ).await.unwrap();
-                assert_eq!(refreshed.sessions.len(), 1, "{scenario}: {:?}", refreshed.sessions);
-                assert_eq!(refreshed.sessions[0].target, "stable/work", "{scenario}");
+                assert_eq!(refreshed.hosts.len(), 1, "{scenario}: {:?}", refreshed.hosts);
+                assert_eq!(refreshed.hosts[0].host, "stable", "{scenario}");
                 let persisted = state_catalog::load(&state_dir, &account).unwrap();
                 assert!(persisted.records.iter().all(|record| record.record_id == stable), "{scenario}");
-                if scenario == "expired" {
-                    assert!(persisted.refreshed_at.is_none(), "expired partial catalog was cached");
-                    assert!(
-                        cached_sessions(&state_dir, &registry_dir, now).unwrap().is_none(),
-                        "expired host was hidden behind a fresh partial catalog"
-                    );
-                } else if scenario == "invalid" {
-                    assert!(
-                        persisted.refreshed_at.is_some(),
-                        "permanently invalid records should not disable cache reuse"
-                    );
-                }
-                if !matches!(scenario, "invalid" | "expired" | "pruned-replay") {
+                if !matches!(scenario, "invalid" | "expired") {
                     assert!(refreshed.warnings.iter().any(|warning| matches!(warning, RefreshWarning::RecordUnavailable { record_id, .. } if *record_id == changing)), "{scenario}");
                 }
                 server.await.unwrap();
+                // The service has gone offline. Unavailable or expired neighbors
+                // must not invalidate the healthy publisher's cached SSH lease.
+                assert!(ssh_host(&state_dir, &account, "stable", false).await.is_ok(), "{scenario}");
+                assert!(ssh_host(&state_dir, &account, "changing", false).await.is_err(), "{scenario}");
             }
         }).await.expect("bounded reconciliation scenarios timed out");
     }
@@ -1050,12 +927,11 @@ mod tests {
             let registry_dir = root.path().join("registry-user/live-endpoints");
             state::test_support::create_account(&state_dir, &origin).unwrap();
             let account = state::load_account(&state_dir, ApiKeyScope::Download).unwrap();
-            let corrupt_catalog = state_dir.join("sync-catalog.json");
+            let corrupt_catalog = state_dir.join("host-catalog.json");
             std::fs::write(&corrupt_catalog, b"not JSON").unwrap();
             std::fs::set_permissions(&corrupt_catalog, std::fs::Permissions::from_mode(0o600))
                 .unwrap();
             let now = super::super::utc_now_seconds();
-            let local = HerdrVersion::new(3, 2, 1);
             let remote_secret = iroh::SecretKey::from_bytes(&[0x42; 32]);
             let mut remote_addr = ENDPOINT
                 .parse::<EndpointTicket>()
@@ -1069,7 +945,7 @@ mod tests {
                     5_u8,
                     "aging-host",
                     "soonexpired",
-                    SessionAccessVersion::new(3, 2, 1),
+                    SessionAccessAttachedVersion::new(3, 2, 1),
                     remote_endpoint.clone(),
                     now - Duration::from_secs(300),
                     now + Duration::from_secs(1),
@@ -1078,7 +954,7 @@ mod tests {
                     6_u8,
                     "invalid-host",
                     "corrupt",
-                    SessionAccessVersion::new(3, 2, 1),
+                    SessionAccessAttachedVersion::new(3, 2, 1),
                     remote_endpoint.clone(),
                     now - Duration::from_secs(1),
                     now + Duration::from_secs(300),
@@ -1087,7 +963,7 @@ mod tests {
                     7_u8,
                     "expired-host",
                     "stale",
-                    SessionAccessVersion::new(3, 2, 1),
+                    SessionAccessAttachedVersion::new(3, 2, 1),
                     remote_endpoint.clone(),
                     now - Duration::from_secs(300),
                     now - Duration::from_secs(1),
@@ -1096,7 +972,7 @@ mod tests {
                     8_u8,
                     "duplicate-host",
                     "work",
-                    SessionAccessVersion::new(3, 2, 1),
+                    SessionAccessAttachedVersion::new(3, 2, 1),
                     ENDPOINT.to_owned(),
                     now - Duration::from_secs(1),
                     now + Duration::from_secs(300),
@@ -1105,7 +981,7 @@ mod tests {
                     9_u8,
                     "duplicate-host",
                     "work",
-                    SessionAccessVersion::new(3, 2, 1),
+                    SessionAccessAttachedVersion::new(3, 2, 1),
                     remote_endpoint.clone(),
                     now - Duration::from_secs(1),
                     now + Duration::from_secs(300),
@@ -1114,7 +990,7 @@ mod tests {
                     10_u8,
                     "patch-host",
                     "patch",
-                    SessionAccessVersion::new(3, 2, 0),
+                    SessionAccessAttachedVersion::new(3, 2, 0),
                     remote_endpoint.clone(),
                     now - Duration::from_secs(1),
                     now + Duration::from_secs(300),
@@ -1123,7 +999,7 @@ mod tests {
                     11_u8,
                     "minor-host",
                     "minor",
-                    SessionAccessVersion::new(3, 1, 9),
+                    SessionAccessAttachedVersion::new(3, 1, 9),
                     remote_endpoint.clone(),
                     now - Duration::from_secs(1),
                     now + Duration::from_secs(300),
@@ -1132,7 +1008,7 @@ mod tests {
                     12_u8,
                     "major-host",
                     "major",
-                    SessionAccessVersion::new(2, 9, 9),
+                    SessionAccessAttachedVersion::new(2, 9, 9),
                     remote_endpoint,
                     now - Duration::from_secs(1),
                     now + Duration::from_secs(300),
@@ -1140,20 +1016,20 @@ mod tests {
             ];
             let mut entries = Vec::new();
             let mut records = BTreeMap::new();
-            for (byte, host, session, version, endpoint_ticket, issued_at, expires_at) in fixtures {
+            for (byte, host, _session, version, endpoint_ticket, issued_at, expires_at) in fixtures
+            {
                 let record_id = RecordId::from_bytes([byte; 16]);
-                let descriptor = SessionAccessDescriptor::new(
+                let descriptor = HostAccessDescriptor::new(
                     host.to_owned(),
                     issued_at,
                     expires_at,
                     endpoint_ticket,
                     CapabilitySecret::from_bytes([byte; 32]),
-                    SessionAccessAttachedVersion::new(0, 2, 0),
                     version,
-                    vec![session.to_owned()],
+                    true,
                 )
                 .unwrap();
-                let crypto = seal_session_access_descriptor(
+                let crypto = seal_host_access_descriptor(
                     &descriptor,
                     account.account_root_key(),
                     account.account_id().as_bytes(),
@@ -1183,10 +1059,9 @@ mod tests {
             ));
             let _guard = crate::endpoint_registry::register(&registry_dir, ENDPOINT_ID).unwrap();
 
-            let refreshed =
-                refresh_sessions_with_registry_at(&state_dir, local, &registry_dir, now)
-                    .await
-                    .unwrap();
+            let refreshed = refresh_hosts_with_registry_at(&state_dir, &registry_dir, now)
+                .await
+                .unwrap();
             assert_eq!(refreshed.warnings.len(), 3, "{:?}", refreshed.warnings);
             assert!(
                 refreshed.warnings.iter().any(|warning| warning
@@ -1215,30 +1090,29 @@ mod tests {
                 "{:?}",
                 refreshed.warnings
             );
-            assert_eq!(refreshed.sessions.len(), 5);
+            assert_eq!(refreshed.hosts.len(), 5);
             assert!(
                 refreshed
-                    .sessions
+                    .hosts
                     .iter()
-                    .all(|session| session.attached_version == Some([0, 2, 0]))
+                    .all(|session| session.attached_version[0] >= 2)
             );
             assert!(
                 refreshed
-                    .sessions
+                    .hosts
                     .iter()
-                    .any(|session| session.target == "aging-host/soonexpired")
+                    .any(|session| session.host == "aging-host")
             );
 
-            let refreshed_after_expiration = refresh_sessions_with_registry_at(
+            let refreshed_after_expiration = refresh_hosts_with_registry_at(
                 &state_dir,
-                local,
                 &registry_dir,
                 now + Duration::from_secs(2),
             )
             .await
             .unwrap();
             assert_eq!(
-                refreshed_after_expiration.sessions.len(),
+                refreshed_after_expiration.hosts.len(),
                 4,
                 "an expired cached record hid otherwise valid sessions"
             );
@@ -1253,16 +1127,6 @@ mod tests {
             );
             let persisted_catalog = state_catalog::load(&state_dir, &account).unwrap();
             assert!(
-                persisted_catalog.refreshed_at.is_none(),
-                "a partial catalog with an expired host was marked fresh"
-            );
-            assert!(
-                cached_sessions(&state_dir, &registry_dir, now + Duration::from_secs(2))
-                    .unwrap()
-                    .is_none(),
-                "an expired host was hidden behind a reusable partial catalog"
-            );
-            assert!(
                 persisted_catalog.records.iter().all(|record| {
                     ![
                         RecordId::from_bytes([5; 16]),
@@ -1275,54 +1139,37 @@ mod tests {
             );
             assert_eq!(
                 refreshed
-                    .sessions
+                    .hosts
                     .iter()
-                    .filter(|candidate| candidate.target == "duplicate-host/work")
+                    .filter(|candidate| candidate.host == "duplicate-host")
                     .count(),
                 1,
                 "fresh refresh did not filter only the active exact endpoint"
             );
-            for (host, session, expected) in [
-                ("patch-host", "patch", [3, 2, 0]),
-                ("minor-host", "minor", [3, 1, 9]),
-                ("major-host", "major", [2, 9, 9]),
+            for (host, expected) in [
+                ("patch-host", [3, 2, 0]),
+                ("minor-host", [3, 1, 9]),
+                ("major-host", [2, 9, 9]),
             ] {
-                assert!(refreshed.sessions.iter().any(|candidate| {
-                    candidate.target == format!("{host}/{session}")
-                        && candidate.herdr_version == expected
-                }));
-                let persisted = state_catalog::attachment(&state_dir, &account, host, session, now)
-                    .unwrap()
-                    .expect("persisted attachment remains selectable");
-                assert_eq!(persisted.herdr_version, expected);
-                let remote = HerdrVersion::new(
-                    u32::from(expected[0]),
-                    u32::from(expected[1]),
-                    u32::from(expected[2]),
-                );
                 assert!(
-                    super::super::attach::decide_upgrade(
-                        local,
-                        remote,
-                        true,
-                        false,
-                        &mut std::io::Cursor::new(b""),
-                        &mut Vec::new(),
-                    )
-                    .unwrap()
+                    refreshed
+                        .hosts
+                        .iter()
+                        .any(|candidate| candidate.host == host
+                            && candidate.attached_version == expected)
                 );
+                let persisted = state_catalog::host(&state_dir, &account, host, now).unwrap();
+                assert_eq!(persisted.attached_version, expected);
             }
             server.await.unwrap().unwrap();
 
-            let error = refresh_sessions_with_registry(&state_dir, local, &registry_dir)
+            let error = refresh_hosts_with_registry(&state_dir, &registry_dir)
                 .await
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("record index"), "{error}");
             assert!(
-                state_catalog::attachment(&state_dir, &account, "patch-host", "patch", now,)
-                    .unwrap()
-                    .is_some(),
+                state_catalog::host(&state_dir, &account, "patch-host", now).is_ok(),
                 "a failed refresh replaced the previous catalog"
             );
         })

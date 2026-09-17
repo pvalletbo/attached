@@ -7,7 +7,6 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use attached_session_sync_protocol::account::ApiKeyScope;
-use attached_tunnel_protocol::HerdrVersion;
 use iroh::{Endpoint, endpoint::presets};
 use iroh_tickets::endpoint::EndpointTicket;
 use tokio::{
@@ -80,7 +79,7 @@ pub(crate) async fn local_proxy(socket: PathBuf) -> Result<i32> {
 
 async fn open(
     endpoint: &Endpoint,
-    attachment: &sync::state_catalog::SyncedAttachment,
+    attachment: &sync::state_catalog::HostConnection,
     public_key: &str,
 ) -> Result<(
     iroh::endpoint::Connection,
@@ -153,17 +152,7 @@ pub(crate) async fn connect(
     trust_new_host_key: bool,
 ) -> Result<i32> {
     let account = sync::state::load_account(path, ApiKeyScope::Download)?;
-    // No Herdr executable or exact-version compatibility check belongs on this carrier.
-    if no_cache
-        || sync::state_catalog::ssh_host(path, &account, target, sync::utc_now_seconds()).is_err()
-    {
-        let refreshed = sync::refresh::refresh_sessions(path, HerdrVersion::new(0, 0, 0)).await?;
-        for warning in refreshed.warnings {
-            eprintln!("Warning: {warning}");
-        }
-    }
-    let attachment =
-        sync::state_catalog::ssh_host(path, &account, target, sync::utc_now_seconds())?;
+    let attachment = sync::refresh::ssh_host(path, &account, target, no_cache).await?;
     let consumer = iroh::SecretKey::from_bytes(
         account
             .consumer_identity_secret()
@@ -196,7 +185,7 @@ pub(crate) async fn connect(
 async fn run(
     endpoint: &Endpoint,
     path: &Path,
-    attachment: sync::state_catalog::SyncedAttachment,
+    attachment: sync::state_catalog::HostConnection,
     account: sync::state::AccountCredentials,
     command: Vec<String>,
     expose_config: bool,

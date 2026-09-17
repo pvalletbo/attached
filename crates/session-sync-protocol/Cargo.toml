@@ -7,14 +7,14 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 publish.workspace = true
-description = "Bounded protocol and cryptography primitives for Herdr session synchronization"
+description = "Bounded protocol and cryptography primitives for encrypted host discovery"
 
 [lints]
 workspace = true
 
 [features]
-default = ["session-access"]
-session-access = [
+default = ["host-access"]
+host-access = [
     "dep:chacha20poly1305",
     "dep:chrono",
     "dep:attached-tunnel-protocol",

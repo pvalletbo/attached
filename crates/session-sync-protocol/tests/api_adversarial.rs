@@ -150,5 +150,5 @@ fn errors_and_remaining_routes_are_compact_and_stable() {
         )
     );
     assert_eq!(CACHE_CONTROL_VALUE, "no-store");
-    assert_eq!(AUTHENTICATE_VALUE, "Bearer realm=\"herdr-sync-v1\"");
+    assert_eq!(AUTHENTICATE_VALUE, "Bearer realm=\"attached-sync-v1\"");
 }
