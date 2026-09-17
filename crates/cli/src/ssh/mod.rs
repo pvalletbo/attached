@@ -2,8 +2,10 @@
 //! russh implements SSH; Attached implements the deliberately limited exec/shell service.
 mod account;
 mod client;
+mod configuration;
 mod descriptor;
 mod exec;
+mod export;
 mod state;
 
 use anyhow::{Context, Result, ensure};
@@ -19,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) use attached_tunnel_protocol::SSH_ALPN as ALPN;
 pub(crate) use client::{connect, local_proxy};
+pub(crate) use export::export;
 pub(crate) use state::set_access;
 const SETUP_TIMEOUT: Duration = Duration::from_secs(20);
 

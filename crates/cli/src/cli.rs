@@ -76,7 +76,8 @@ enum Command {
     ///
     /// Uses system OpenSSH and automatic, connection-scoped keys. Publisher consent:
     /// `attached ssh-access enable`. Commands run as the publisher's OS account.
-    /// For concurrent relayed connections, use one --expose-config broker: separate
+    /// For automatic OpenSSH aliases for all hosts, run `attached export-ssh-config`.
+    /// For concurrent relayed connections, use one broker: separate
     /// Attached processes share the consumer Iroh identity and can displace one
     /// another on relays.
     Ssh {
@@ -98,6 +99,23 @@ enum Command {
         /// Command interpreted by the publisher's account shell; omit for a non-PTY shell.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
+    },
+
+    /// Automatically configure OpenSSH for every authorized host; keep running until Ctrl-C.
+    ///
+    /// Run once in a terminal, then use `ssh attached-HOST [command]` without symlinks
+    /// or -F. Requires an imported download account and publisher SSH consent.
+    /// Installs a reversible Include at the top of ~/.ssh/config, preserving existing
+    /// settings. New hosts appear automatically. Duplicate labels use only
+    /// attached-ENDPOINT-ID aliases. Ctrl-C, SIGTERM, or SIGHUP removes the Include
+    /// and temporary keys. Supports Linux and macOS; no background service is installed.
+    /// Uses the existing non-PTY command/shell service (not SFTP or port forwarding).
+    ExportSshConfig {
+        /// Seconds between host discovery refreshes; unavailable hosts are retried.
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        refresh_interval: u64,
+        #[arg(long, hide = true)]
+        state_dir: Option<PathBuf>,
     },
 
     /// Grant or revoke persistent account-level SSH access for the configured consumer.
@@ -275,6 +293,18 @@ impl Cli {
                     trust_new_host_key,
                 )
                 .await
+            }
+            Command::ExportSshConfig {
+                refresh_interval,
+                state_dir,
+            } => {
+                use std::io::IsTerminal;
+                local_encryption::configure_noninteractive(
+                    !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal(),
+                );
+                let state_dir = resolved_state_dir(state_dir, &configuration)?;
+                crate::ssh::export(&state_dir, std::time::Duration::from_secs(refresh_interval))
+                    .await
             }
             Command::SshAccess { command, state_dir } => {
                 let state_dir = resolved_state_dir(state_dir, &configuration)?;
@@ -471,6 +501,32 @@ mod tests {
     }
 
     #[test]
+    fn ssh_export_is_one_command_for_all_hosts_with_a_bounded_refresh_interval() {
+        let cli = Cli::try_parse_from(["attached", "export-ssh-config"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::ExportSshConfig {
+                refresh_interval: 30,
+                ..
+            }
+        ));
+        assert!(
+            Cli::try_parse_from(["attached", "export-ssh-config", "--refresh-interval", "1"])
+                .is_ok()
+        );
+        for value in ["0", "3601", "-1", "nan"] {
+            assert!(
+                Cli::try_parse_from(["attached", "export-ssh-config", "--refresh-interval", value])
+                    .is_err()
+            );
+        }
+        assert!(Cli::try_parse_from(["attached", "export-ssh-config", "office"]).is_err());
+        assert!(
+            Cli::try_parse_from(["attached", "export-ssh-config", "--trust-new-host-key"]).is_err()
+        );
+    }
+
+    #[test]
     fn exposes_only_the_simplified_command_surface() {
         for args in [
             vec![
@@ -500,6 +556,7 @@ mod tests {
                 "/tmp/publish.bundle",
             ],
             vec!["attached", "sessions", "list"],
+            vec!["attached", "export-ssh-config"],
             vec![
                 "attached",
                 "serve",

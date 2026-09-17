@@ -114,7 +114,7 @@ impl PasswordPrompt for TtyPasswordPrompt {
     fn read_password(&self, prompt: &str) -> Result<Zeroizing<Vec<u8>>> {
         ensure!(
             !NONINTERACTIVE.load(Ordering::SeqCst),
-            "Attached credentials are locked; run `attached ssh --expose-config HOST` in a terminal, or configure an unlocked 1Password CLI for noninteractive SSH"
+            "Attached credentials are locked; run `attached export-ssh-config` in a terminal, or configure an unlocked 1Password CLI for noninteractive SSH"
         );
         let password = rpassword::prompt_password(prompt)
             .context("could not read the encryption password from the controlling terminal")?;
