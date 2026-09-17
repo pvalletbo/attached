@@ -1,12 +1,14 @@
 # Cloudflare stack research: ephemeral development machines for AI agents
 
-> Research prepared on **16 September 2026 (UTC)** against the supplied PID.
+> Research prepared on **16 September 2026 (UTC)** against the supplied PID; **Computer reassessed on 17 September 2026** for an alpha that accepts preview dependencies.
 > **AI contribution:** This document was researched and written by an AI assistant at the human operator's explicit request.
 > This is a design assessment, not an implementation. No Cloudflare resources were deployed and no runtime compatibility tests were performed.
 
 ## Executive recommendation
 
-**Cloudflare is a credible backend for a Linux-first MVP, with important qualifications.** Use **Workers + Durable Objects + Workflows + Sandbox SDK on Containers + R2**, while keeping **Herdr, the coding agent, and the Attached publisher inside one isolated workspace**. Keep the existing Attached discovery service and Iroh transport; do not replace them with a web terminal or Cloudflare Tunnel.
+**For this preview-tolerant alpha, evaluate `@cloudflare/computer` with its Linux container backend first.** The candidate stack is **Workers + Durable Objects + Workflows + Computer on Containers + R2**, keeping **Herdr, the coding agent, and the Attached publisher inside one isolated workspace**. Keep the existing Attached discovery service and Iroh transport; do not replace them with a web terminal, a DO-hosted agent, or Cloudflare Tunnel.
+
+This revises the original Sandbox-first recommendation: **preview status alone is not a reason to reject Computer for this alpha**. Its durable filesystem and incremental synchronization are a strong match for recovering a small working tree after machine loss. Adoption remains conditional on the tests below; **Sandbox SDK + native scratch disk + R2 checkpoints is the fallback if Computer's filesystem or lifecycle integration is a worse fit**.
 
 This is no longer a proposal dependent on the original Containers beta: **Containers and Sandboxes became generally available on 13 April 2026**.[C01]
 
@@ -16,13 +18,17 @@ However, the PID is **not fully achievable by assembling the existing Attached r
 2. **Iroh relay connectivity under Cloudflare's restrictive outbound policy needs a real deployed test.** The protocols appear compatible, but HTTPS support alone is insufficient: WebSocket upgrades, TLS trust, and reconnect behavior matter.
 3. **Keeping a workspace running preserves its live Herdr session; restoring files does not restore that session's processes or memory.** Cloudflare can replace a container and explicitly does not guarantee a minimum uninterrupted lifetime.[C02], [C03]
 
-**Decision:** proceed to a small compatibility/security validation phase before committing to this compute backend. If those tests pass, Cloudflare is a reasonable first provider. If exact process-preserving suspension or a more conventional long-lived machine is essential, use a VM-oriented backend instead, while retaining Cloudflare for orchestration and durable storage.
+**Decision:** use a Computer-first validation phase, not an unconditional implementation commitment. Prefer it if the target repository fits a small durable source tree, build outputs can live on native scratch disk, and unattended synchronization/recovery work reliably. Choose Sandbox if those tests fail; choose a VM-oriented provider if exact process-preserving suspension or larger machines are essential.
 
-**Do not base the MVP on `@cloudflare/computer` yet.** It is remarkably close to the product's language and worth tracking, but its current repository explicitly says **preview only, unstable APIs, not suitable for production**.[C10], [C11]
+**The crucial limitation is technical, not the preview label:** Computer `0.3.0` does **not** make every container filesystem write immediately durable. Its container has a separate local store; the host explicitly pushes/pulls changes, normally around `runtime.exec()` calls. An agent running overnight under Herdr needs an independently scheduled pull loop. Computer also does not preserve RAM/PTYs, solve Attached revocation, or establish Iroh compatibility.[C51], [C53], [C54]
+
+The repository still warns **preview only, unstable APIs, not suitable for production**. Accept that explicitly for the alpha, pin versions, and keep portable exports; do not confuse accepting API churn with accepting silent data loss or broader credentials.[C10], [C11]
 
 ## 1. Research scope and evidence
 
 Sources were retrieved live on 16 September 2026, including Cloudflare's current documentation, product-specific changelog feeds, the April and August product announcements relevant to this PID, September updates, SDK package metadata, Iroh documentation, and alternative providers' documentation.
+
+The 17 September follow-up inspected Computer's published **`0.3.0`** source at npm `gitHead` **`8d8cbac36bed96147a08e1d6cb4565581e65cbd3`** (published 11 September), compared with upstream `main` **`7ce8259324d40d32e7b2db9d371ea5b19f4c8f63`**. New Computer citations are pinned where possible. Its specifications explicitly describe forward-looking intent, so implementation claims below rely on release source/examples, not the design specification alone.[C46], [C51]
 
 Attached was inspected at `main` commit **`d334f7d75eb2b58059e9deeaaa73a61e799a476c`**, version **0.2.14**. Open PRs are not treated as shipped functionality.
 
@@ -45,7 +51,7 @@ These are the recent releases that materially affect this product, rather than a
 | **Docker-in-Docker — 17 Feb; directory backups — 23 Feb 2026** | Rootless nested Docker and directory backup/restore to R2 are documented. | Older assessments saying “no Docker” or “no persistence” are too broad. Neither feature gives unrestricted VM administration or memory snapshots.[C07], [C08] |
 | **Dynamic Workers — 24 Mar 2026, open beta** | Workers can instantiate isolated Worker-compatible code at runtime, with controlled bindings and egress. | Good for small generated tools, not a substitute for the Linux workspace required by Herdr and Attached.[C49] |
 | **Native Containers `exec()` — 18 Jun 2026** | Containers can launch and observe additional processes directly. | Raw Containers are now a viable lower-level alternative to Sandbox SDK, not just an HTTP-server runtime.[C09] |
-| **`@cloudflare/computer` — 3 Aug 2026, early preview** | SQLite-backed durable virtual filesystem; container/FUSE and Dynamic Worker execution backends. | Very relevant future persistence/runtime abstraction, but not a drop-in durable Herdr machine and explicitly not production-ready.[C10], [C11] |
+| **`@cloudflare/computer` — 3 Aug 2026, early preview** | SQLite-backed durable virtual filesystem; container/FUSE and Dynamic Worker execution backends. | First candidate for this preview-tolerant alpha, using the Linux backend. Still not a drop-in durable Herdr machine: container writes require host-driven synchronization.[C10], [C11], [C53] |
 | **Inbound TCP / Socket Workers / gRPC — 3 Aug 2026, private beta** | Spectrum can pass inbound TCP to Workers and Containers. | Do not rely on old blanket claims that Cloudflare never accepts TCP. Equally, do not assume GA or UDP support. The MVP should not need this feature.[C12] |
 | **Artifacts + CI SDK integration — 4 Aug 2026** | Git-compatible versioned storage can trigger Workflows; `@cloudflare/ci` runs isolated build/test steps. Artifacts documentation still labels access **closed beta**. | Attractive future internal repository/result store. Do not make obtaining beta access a prerequisite for the MVP.[C13], [C14] |
 | **Cloudflare Agents — 4 Aug 2026** | Agent-aware traces and a dashboard for instrumented harnesses; session “replay” displays recorded data. | Optional observability, not restoration of a Herdr process and not a reason to replace the user's coding agent.[C15] |
@@ -70,7 +76,7 @@ The npm registry returned these tags during research:
 
 The **“1.0 preview” product name does not mean the npm package is already version 1.0**. Likewise, npm's `latest` tag is not a production-readiness guarantee for Computer. Recheck these tags at implementation time and pin the SDK and corresponding container image together.[C17], [C26]
 
-For an exploratory implementation, evaluate the Sandbox preview first, following Cloudflare's recommendation. For a release that must avoid preview APIs, use the stable line behind a small backend adapter, or use raw Containers. Do not copy deprecated `exposePort()` or old default-session patterns into new work.[C27]
+Evaluate **Computer's container backend first for this alpha**. If choosing the Sandbox fallback, evaluate its preview as Cloudflare recommends; for a release that must avoid preview APIs, use the stable line or raw Containers. Computer and Sandbox are alternative runtime integrations over Containers here, not SDKs that must be stacked together. Do not copy deprecated Sandbox `exposePort()` or old default-session patterns into new work.[C27], [C52]
 
 ## 3. Recommended stack
 
@@ -79,12 +85,13 @@ For an exploratory implementation, evaluate the Sandbox preview first, following
 | Component | Choice | Responsibility / boundary |
 | --- | --- | --- |
 | Local control surface | Small CLI; Rust is a natural fit beside Attached | Inspect Git, present approvals, create/connect/stop/destroy, download results. No local agent execution or directory sharing. |
-| Public control API | **Cloudflare Worker, TypeScript** | Authenticate the developer, validate requests, enforce ownership and quotas, initiate lifecycle operations. TypeScript fits the first-party Sandbox/Containers SDKs. |
-| Workspace state | **SQLite-backed Durable Object** | One authoritative workspace state machine; generation, lease, approvals, image/revision, artifact manifest and revocation. Keep this separate from the SDK-owned Sandbox DO so sandbox destruction cannot erase grants or tombstones. |
+| Public control API | **Cloudflare Worker, TypeScript** | Authenticate the developer, validate requests, enforce ownership and quotas, initiate lifecycle operations. TypeScript fits Computer and the first-party Containers SDKs. |
+| Workspace state | **SQLite-backed Durable Object** | One authoritative state machine; generation, lease, approvals, image/revision, artifact manifest and revocation. Keep separate from the Computer filesystem/container DO so filesystem reset or compute destruction cannot erase grants or tombstones. |
 | User workspace index | Small account Durable Object | List workspace IDs and ownership. No D1 database is required for a one-developer MVP. |
 | Durable orchestration | **Cloudflare Workflows** | Idempotent provisioning, preparation, checkpoint/stop, cleanup, retries, and compensation after partial failure. Not the agent's execution environment. |
-| Isolated machine | **Sandbox SDK on Containers** | One sandbox per workspace; full Linux userspace with Herdr, Attached, agent, shells, tooling, and all their children inside the boundary. |
-| Work and result storage | **R2 Standard** | Initial Git bundles, immutable checkpoints, output bundles/patches, selected agent state and artifacts. Keep build caches disposable. |
+| Isolated machine | **Computer's `CloudflareContainerBackend` on Containers** | One container VM per workspace, running `computerd`, Herdr, Attached, agent, tooling and all their children. Sandbox SDK is the fallback, not an additional required layer. |
+| Active durable files | **Computer filesystem in a separate SQLite DO** | Small source tree, `.git` and selected agent state; explicit host-driven synchronization with the container's FUSE mount. Native scratch for dependency/build caches and runtime sockets. |
+| Recovery history and results | **R2 Standard** | Initial Git bundles, immutable checkpoints and portable output bundles/patches. Retain history outside the mutable Computer filesystem. |
 | Credential broker / egress | Trusted Worker handlers + Worker secrets | Mint/refresh constrained external credentials and enforce workspace capabilities outside untrusted execution. |
 | Existing discovery | **Attached's existing Rust Worker + account Durable Objects** | Retain encrypted session discovery; extend credentials/lifecycle deliberately rather than replacing the service. |
 | Interactive transport | **Attached + Iroh** | End-to-end encrypted Herdr connectivity. Prefer a tested relay-capable path; no user-configured IP, inbound port, or SSH. |
@@ -93,6 +100,40 @@ For an exploratory implementation, evaluate the Sandbox preview first, following
 Use **one prebuilt, pinned Linux/amd64 workspace image** initially. Include the chosen agent runtime, Git, Herdr, Attached, a supervisor, and the project's required toolchain. For this Rust-oriented repository, include Rust plus the runtime needed by the selected agent; do not promise universal devcontainer compatibility.
 
 Start evaluation around **`standard-3`: 2 vCPU, 8 GiB RAM, 16 GB disk**, then benchmark the actual build. Large Rust dependency trees can exhaust that disk. This is a proposed starting point, not a measured sizing recommendation.[C28]
+
+### Computer versus Sandbox for this alpha
+
+**Computer can be used without adopting Cloudflare's agent framework.** Its container example is a plain Durable Object plus `computerd` in a custom Linux image. Add the existing Herdr/Attached binaries and chosen agent to that image; Herdr still creates and owns the interactive PTY. Computer manages files and runtime plumbing, not the user interaction. The Worker-shell/JavaScript backends cannot run those unchanged native binaries and are not the proposed solution.[C51], [C52]
+
+| Dimension | Computer + Linux container | Sandbox SDK + native disk + R2 |
+| --- | --- | --- |
+| Durable working tree | Files stored in DO SQLite after synchronization; incremental push/pull and reconstruction already provided. | Application-managed checkpoints of ephemeral native files; directory backup/restore available. |
+| Long-running Herdr | Possible in Linux, but requires explicit supervision, timeout/output handling, keep-alive and periodic pulls. Not the same as a short `runtime.exec()` tool call. | Background-process/PTY support is a more direct SDK fit; supervision and keep-alive still need validation. |
+| Build-tool compatibility | Source files use FUSE; published container store is in memory. Keep bulky build/dependency data outside it. | Active work uses native container disk; fewer filesystem compatibility/performance unknowns. |
+| Recovery after replacement | Reconstruct synchronized files, restart processes; no RAM or terminal-session snapshot. | Restore a checkpoint, restart processes; same memory-continuity limitation. |
+| Malicious execution | Same underlying Containers boundary; external approvals, broker, history and revocation still required. | Same requirements; Sandbox offers documented credential/egress helpers. |
+| Best initial fit | Small, bounded source workspace where durable file access and incremental recovery justify integration work. | I/O-heavy workspace or fastest route to a conventional long-running Linux process environment. |
+
+The case for Computer is **reusing its durable-filesystem and incremental-sync implementation instead of owning all of that machinery**, not its agent branding. It is not demonstrated to outperform Sandbox for this repository. That is why the recommendation is Computer-first evaluation with a concrete fallback, rather than declaring it the universally better backend.
+
+#### What the inspected release actually implements
+
+1. **DO writes and container writes have different durability boundaries.** `workspace.fs` accesses DO-backed storage. Container programs write to a separate SQLite/VFS store through FUSE. `Workspace.push()`/`pull()` explicitly synchronize the stores; `runtime.exec()` pushes before spawning and pulls after its event stream is drained. The `0.3.0` changelog explicitly removed the daemon's own sync loop. Waiting for an overnight Herdr process to exit before pulling leaves its work unsaved in the DO.[C51], [C53], [C54], [C63]
+2. **This is not a synchronous write-through POSIX disk.** The inspected FUSE `fsync` only addresses the local VFS; it does not wait for DO synchronization. A successful file write/close/`fsync` inside the container is not proof it survives immediate container loss. The earlier assessment's “future write-through” description was too strong.[C56], [C57]
+3. **Filesystem size and RAM are coupled.** The package documents approximately **10 GB per workspace**, sharing DO storage, and an in-memory container filesystem. Metadata, chunks and runtime/build memory require headroom; a nominal 10 GB tree is not a sensible target on an 8 GiB machine. Keep toolchains in the image and bulky caches/build outputs on native scratch. The FUSE write/truncate paths also enforce a **256 MiB file limit**; large Git packfiles need testing. The `0.3.0` changelog says `node_modules` is synchronized by default: do not assume `.gitignore` excludes files from replication.[C51], [C56], [C57], [C63]
+4. **Unreleased on-disk storage is promising, not part of the pinned baseline.** Inspected `main` adds `COMPUTERD_DB=/absolute/path`; `0.3.0` still constructs its process-lifetime store in memory. A deliberately pinned unreleased build could reduce memory pressure, but a database on ephemeral container disk is still lost on replacement. It does not eliminate DO synchronization or the DO size limit.[C57], [C62]
+5. **FUSE is a real workload trade-off.** Upstream reports one deployed `standard-2` benchmark: installing 854 packages took **124.7 s on Computer versus 63.9 s on native disk** (about 1.95×). Some metadata-heavy operations were faster, while large sequential I/O was substantially slower. These are vendor measurements, not this project's benchmark or a blanket “FUSE is always slow” claim.[C58]
+
+#### Required integration, even for an alpha
+
+- **Use a small durable tree plus disposable scratch.** Mount the repository and selected recoverable agent files under `/workspace`; place compiler output, dependency caches, secrets and live runtime sockets elsewhere. For Rust, an external `CARGO_TARGET_DIR` is a straightforward candidate. Test Git locking/renames, executable permissions, symlinks, file watchers and any agent SQLite state. The inspected FUSE implementation returns `ENOSYS` for `mknod`; do not require Herdr's Unix sockets to live in the durable mount.[C56]
+- **Run Herdr independently of an HTTP request or a drained exec stream.** Prefer an image supervisor with a readiness barrier after source restoration. If launching through Computer exec, deliberately override its **320,000 ms default timeout** and handle output subscriptions: an undrained live stream can backpressure the child. Source supports `timeoutMs: 0`, but the external workspace lease must still bound execution. This is not a PTY API; Herdr supplies the PTY.[C54], [C55]
+- **Schedule pulls while the agent is still running.** A trusted DO alarm/orchestrator must iterate `Workspace.pull()` to completion, persist freshness and retry after interruption, independently of laptop traffic. The API is an async iterable, not merely a promise to await. Fence by runtime generation; never report an empty replacement runtime as proof the old one was saved. Restrict host-side edits while the container is the active writer, and quiesce writers before a consistent export.[C53]
+- **Keep live execution and durable synchronization separate.** Computer's backend has a default 20-second connection heartbeat; that is neither a file-sync loop nor an overnight lifetime guarantee. Configure/test the container inactivity policy and external lease. Reconnecting a DO to a surviving container is different from recovering a replaced process.[C59], [C60]
+- **Use the restrictive egress integration, not the permissive tutorial.** The simple container example selects direct Internet access. Computer also provides `none` and `http-gateway` modes; the latter disables direct Internet and routes HTTP/HTTPS through a trusted gateway. Apply the same broker and Iroh/TLS/WebSocket tests as section 9. Computer does not remove those risks.[C52], [C59], [C61]
+- **Keep immutable recovery history and authority outside the writable tree.** A malicious agent can delete/corrupt files and have that deletion synchronized. The current DO filesystem is not automatically an immutable recovery checkpoint. Retain external R2 history, separate approvals/revocation state, export before incompatible upgrades, and pin matching SDK/daemon versions. Delete retained filesystem data under an explicit retention policy; stopping compute does not purge DO storage.
+
+**Selection rule:** choose Computer for the alpha if a representative repository passes the FUSE/resource tests and continuous, laptop-independent pulls meet the agreed recovery window. Choose Sandbox if the source tree cannot be kept small, tools require unsupported filesystem semantics, or this integration costs more than the checkpoint approach. Accepting preview risk does not waive those criteria.
 
 ### Optional, deferred, or inappropriate services
 
@@ -103,7 +144,7 @@ Start evaluation around **`standard-3`: 2 vCPU, 8 GiB RAM, 16 GB disk**, then be
 - **Queues:** useful later for larger cleanup/export fan-out; not required alongside Workflows and DO alarms for one workspace.
 - **D1:** useful later for cross-workspace queries. **KV is not the authoritative revocation/state store**: authorization needs current, strongly coordinated state, not an eventually propagated cache.[C50]
 - **Dynamic Workers / Workers for Platforms:** appropriate for isolated Worker-compatible code, not running the unchanged native Herdr/Attached binaries and arbitrary Linux tools. Workers' Node compatibility is not a full Linux host.[C30], [C31]
-- **Agents SDK / Think / Computer:** do not move the coding-agent loop into a DO just to follow a Cloudflare example. The PID explicitly places the agent inside the workspace and does not require a new framework.
+- **Agents SDK / Think:** optional and not needed to use Computer. Do not move the coding-agent loop into a DO just to follow an example; the PID explicitly places the agent inside the Linux workspace.
 - **Browser Run / Kitesurf / Agent Memory / AI Search / Vectorize:** adjacent capabilities, not prerequisites for this MVP. An optional external browser is a separately authorized capability, not a substitute for local project tests.
 - **Tunnel, Spectrum, Realtime/TURN:** not replacements for Iroh. Cloudflare's HTTP preview URLs or browser terminal APIs would create a second interaction/transport path unnecessarily.
 
@@ -122,10 +163,12 @@ Cloudflare Worker: control API
        +-- Workflows: provision / checkpoint / stop / destroy
        +-- R2: input bundles, immutable checkpoints, results
        +-- Trusted egress/credential broker
-       |
-       v
-One Cloudflare Sandbox / Container VM boundary per workspace
-  local scratch filesystem + checked-out approved repositories
+       +-- Computer filesystem DO: host-driven push/pull
+       |          | durable files after synchronization
+       v          v
+One Cloudflare Container VM boundary per workspace
+  computerd -> FUSE /workspace: approved repositories
+  native scratch: build caches, runtime sockets, temporary files
   supervisor -> Herdr server -> coding agent / shells / children
   Attached publisher
        |                        |
@@ -151,13 +194,13 @@ Cloudflare and the orchestrator remain trusted infrastructure: they control the 
 | 1. Create from a clean local Git revision | Feasible | Support exact-SHA remote checkout and a bundle upload for local-only/unpushed commits. A clean tree does not mean the commit exists on GitHub. |
 | 2. Repository-owned configuration | Feasible, application code | Versioned declarative schema; validation and explicit user approval. No automatic privilege grants. |
 | 3. Additional repositories/capabilities | Feasible, application code | Record approvals and enforce repository-, operation-, and workspace-scoped broker rules. |
-| 4. Start Herdr and coding agent | Plausible, unverified combination | Full Linux, processes and PTYs are documented. Test this exact image, native binaries, Unix sockets, and agent. |
+| 4. Start Herdr and coding agent | Plausible, unverified combination | Computer's container backend runs native Linux processes; Herdr owns the PTY. Test the exact image, native sockets, supervision and agent. |
 | 5. Start `attached serve` | Plausible, bootstrap work needed | Bundle injection exists; fully unattended encryption-password setup is not shipped on inspected `main`. |
 | 6. Existing Attached account discovery | Existing foundation | Publish into that account, not a newly created account per workspace. New scoped credentials must remain compatible with owner discovery. |
 | 7. Herdr over Attached | Conditional | Validate Iroh relay WebSockets and TLS with production egress restrictions. No need for direct UDP as a prerequisite. |
 | 8. Continue while laptop is disconnected | Feasible while container survives | Provider-side keep-alive and a bounded lease; no dependence on a live CLI request. |
 | 9. Reconnect to the same Herdr session | Yes while original processes survive | After replacement, only application/file-level recovery is available; not the identical live session. |
-| 10. Retrieve and review changes | Feasible | Continuous durable checkpoints plus Git bundle/patch export, including uncommitted and approved untracked results. |
+| 10. Retrieve and review changes | Feasible, host-driven persistence required | Periodic Computer pulls while Herdr runs, plus immutable checkpoints and Git bundle/patch export including uncommitted/untracked results. |
 | 11. Destroy and revoke workspace credentials | Not supported by current Attached as-is | Add selective publish revocation, discovery invalidation, generation fencing, and external credential cleanup. Terminating a VM alone does not revoke a stolen token. |
 
 ### Two different promises
@@ -182,7 +225,7 @@ These findings are based on code, not just the README.
 - `attached serve` accepts publisher credentials through **`ATTACHED_PUBLISH_BUNDLE` or `--bundle-file`**. Do not copy the owner's download bundle or whole local Attached state directory into a workspace.[A02]
 - The server checks the **authorized consumer's Iroh public identity** after the handshake. A publisher does not receive that consumer's private key.[A03]
 - Publishers refresh descriptors every **30 seconds**, with a **90-second descriptor lifetime**. This helps dead hosts disappear from discovery, but is not revocation of the publisher's credential.[A04]
-- A reusable application-runtime Docker image already installs Herdr and Attached. At the inspected commit it pins **Attached 0.2.9 / Herdr 0.8.2**, not the repository's latest Attached version. Reuse the packaging approach, not those versions blindly; a Sandbox image also needs the matching SDK runtime.[A05]
+- A reusable application-runtime Docker image already installs Herdr and Attached. At the inspected commit it pins **Attached 0.2.9 / Herdr 0.8.2**, not the repository's latest Attached version. Reuse the packaging approach, not those versions blindly. A Computer image needs the matching `computerd` and FUSE libraries; a Sandbox fallback image needs its matching SDK runtime.[A05], [C52]
 
 ### Security and automation gaps
 
@@ -223,15 +266,15 @@ For the MVP, explicitly reject or require separate approval for submodules, Git 
 
 The Workflow would:
 
-1. Create the sandbox with the pinned image, resource size, **deny-by-default egress**, and a hard lease, for example 12 hours approved by the user.
-2. Establish scoped input/checkpoint access and the credential broker policy before running untrusted setup.
-3. Restore the approved source, verify the SHA, and create a workspace branch. Clone extra repositories with read-only access unless writes were separately approved.
+1. Create the Computer/container workspace with the pinned image, resource size, **deny-by-default egress**, and a hard lease, for example 12 hours approved by the user.
+2. Establish scoped input/checkpoint access, a host-side periodic pull schedule and the credential broker policy before running untrusted setup.
+3. Restore the approved source, complete the required DO/container synchronization, verify the SHA, and create a workspace branch. Clone extra repositories with read-only access unless writes were separately approved.
 4. Execute setup inside the sandbox with time/output limits. Prefer prebuilt toolchains and dependency caches over privileged package installation at every start.
 5. Bootstrap a scoped Attached publisher, start Herdr and the chosen agent, and supervise them independently of the initiating HTTP request.
 6. Wait for real readiness: correct Herdr session/socket, publisher healthy, initial checkpoint recorded, and publication acknowledged. Distinguish “published” from “client connection verified.”
 7. Mark the workspace ready and return its display label. The user's existing Attached client can discover it normally.
 
-On the preview SDK, `exec(argv)` yields a supervised process handle when launch succeeds; it does not wait for process completion. Store process references **and the runtime generation**, but never mistake them for persistent process identity after a restart.[C17], [C33]
+For Computer, follow the supervisor/timeout/output rules in section 3; do not wait for Herdr to exit to save files. **For the Sandbox fallback only**, its preview SDK's `exec(argv)` yields a supervised process handle when launch succeeds. Do not mix that API with Computer's `runtime.exec(source, options)`. In either case, store process references **and the runtime generation**, never treating them as persistent process identity after replacement.[C17], [C33], [C54]
 
 The prebuilt image's supervisor must forward shutdown signals and reap children. Herdr should own the agent's interactive PTY/session; the product should not create a competing browser terminal.
 
@@ -239,7 +282,7 @@ The prebuilt image's supervisor must forward shutdown signals and reap children.
 
 - `attached attach` remains the normal interaction path into local Herdr.
 - Ending the local connection does **not** end the workspace lease or agent work.
-- Keep the container alive from Cloudflare, not with a laptop heartbeat. Sandbox documents `keepAlive: true`; raw Containers can use explicit activity-expiry handling. A background process or outbound Iroh connection must not be assumed to reset the SDK's idle timer automatically.[C03], [C34]
+- Keep the container alive from Cloudflare, not with a laptop heartbeat. Computer exposes container inactivity control; its connection heartbeat is not a file checkpoint. Validate the actual lifetime policy. **For the Sandbox fallback**, `keepAlive: true` is documented. Do not assume a background process or outbound Iroh connection automatically resets an SDK idle timer.[C03], [C34], [C59], [C60]
 - On reconnect, route to the same workspace/generation if alive. If its container was replaced, show **interrupted / recovered**, restore files and supported agent state, and start a new runtime rather than pretending the old PTY survived.
 - Refresh external credentials from the broker while the lease is valid, even if the laptop is offline. The agent cannot extend its own lease or approve more access.
 
@@ -268,7 +311,7 @@ Use DO alarms plus a scheduled reconciler as independent expiry/cleanup mechanis
 
 **Disconnect:** keep executing.
 
-**Stop:** quiesce work, produce and verify a final checkpoint, terminate compute, and revoke its runtime grants. Retain results. On Cloudflare, restarting from this state is file/application recovery, not RAM resume.
+**Stop:** quiesce work, finish Computer's pull to the DO, produce and verify a final immutable checkpoint, terminate compute, and revoke its runtime grants. Retain results. On Cloudflare, restarting from this state is file/application recovery, not RAM resume.
 
 **Destroy:** terminate compute and invalidate the workspace permanently, including its grants and publication; keep completed results for a separately approved retention period, such as seven days. Offer a distinct purge action for deleting results.
 
@@ -280,7 +323,9 @@ Mark destruction complete only when compute termination and required credential 
 
 ### Recommended MVP storage strategy
 
-Use **local scratch disk for the active repository and toolchain operations**, with **R2 for immutable checkpoints and result export**.
+For the Computer candidate, use **DO-backed files synchronized with `/workspace` for the small active repository**, **native scratch for toolchain/build/cache operations**, and **R2 for immutable checkpoints and portable export**. Start with one active writer in the container. Schedule host pulls throughout the lease; DO-backed data only includes changes that reached the DO.
+
+For the Sandbox fallback, use **native scratch for the active repository too**, with R2 checkpoints as the main recovery mechanism. In either design, the mutable current tree is not a substitute for independent recovery history.
 
 A checkpoint should include:
 
@@ -293,9 +338,9 @@ A checkpoint should include:
 
 Upload new checkpoint objects first, verify completion, then atomically advance the manifest reference in the workspace DO. Keep the previous valid checkpoint until the new one is committed. The workspace must not be able to overwrite/delete older checkpoints or write outside its own output namespace.
 
-Proposed initial recovery target: **at most five minutes of unsaved work under healthy checkpointing**, with immediate checkpoints after meaningful completed work. This is a target to test, not a Cloudflare guarantee. Pause writers or use a consistent staging snapshot; a tar of a tree being modified can be internally inconsistent. If checkpoints fail, report degraded durability and stop/pause further work according to policy rather than claiming it is saved.
+Proposed initial recovery target: **at most five minutes of unsaved work under healthy synchronization/checkpointing**, with immediate checkpoints after meaningful completed work. Computer may support much more frequent incremental pulls; measure their completion latency rather than equating scheduling frequency with durability. This is a target to test, not a Cloudflare guarantee. Pause writers, complete the pull and export a consistent tree; a live sync or tar is not automatically an application-consistent multi-file snapshot. If synchronization/checkpoints fail, report degraded durability and stop/pause further work according to policy rather than claiming it is saved.
 
-**No periodic backup promises zero loss of the most recent writes.** If the product requires every acknowledged filesystem write to survive immediate machine loss, a durable write-through filesystem or a stronger persistence backend is required. Also, malicious code can corrupt its *current* work; immutable external history limits the damage but cannot guarantee that an agent produces useful output.
+**No periodic backup or asynchronous replication promises zero loss of the most recent writes.** If every acknowledged container filesystem write must survive immediate machine loss, a stronger persistence backend/acknowledgement protocol is required; **Computer `0.3.0` does not establish that guarantee**. Also, malicious code can corrupt its *current* work; immutable external history limits the damage but cannot guarantee that an agent produces useful output.
 
 ### Cloudflare persistence options compared
 
@@ -304,7 +349,7 @@ Proposed initial recovery target: **at most five minutes of unsaved work under h
 | Container local disk | Ephemeral; lost on stop/sleep/replacement. | Active scratch only.[C02], [C03] |
 | Sandbox directory backup to R2 | Filesystem snapshot, not process/memory snapshot. Production restore uses a copy-on-write overlay; some directory renames can fail with `EXDEV`. | Evaluate for environment acceleration/checkpoints. Test Git and build-tool behavior on restored trees.[C08] |
 | R2 bucket mount | Object storage through filesystem tooling; network latency and filesystem-semantics trade-offs. Production mount overlays the target path. | Use for artifacts/datasets, not assume it is a durable SSD suitable for `.git`, SQLite, or `node_modules` without tests.[C35] |
-| `@cloudflare/computer` | DO/SQLite-authoritative filesystem projected into a container by FUSE, or used by isolate backends. | Promising future write-through workspace option; still preview-only, with filesystem compatibility, performance and limits to validate. It does not preserve Herdr RAM.[C10], [C11] |
+| `@cloudflare/computer` | Durable DO filesystem synchronized with a separate container-local FUSE/VFS store; host-driven push/pull, not synchronous write-through. | First alpha candidate for a small source tree. Test periodic pulls during live Herdr work, FUSE compatibility, RAM/size and recovery. No Herdr RAM persistence.[C51], [C53], [C56] |
 | Artifacts | Durable versioned Git-compatible repository store; imports/forks, repo-scoped expiring/revocable read/write tokens. | Best Cloudflare-native Git option if closed-beta access is obtained. Keep uncommitted changes checkpointed separately.[C14], [C36] |
 
 Important operational details:
@@ -384,7 +429,8 @@ Container shutdown and image rollouts can terminate a live session. The platform
 | Local GPU execution | Listed Containers sizes do not supply a GPU; Workers AI is a remote inference API, not a CUDA device in this machine. | GPU-capable provider such as Modal or a GPU VM. |
 | Strong arbitrary-protocol egress enforcement plus direct QUIC | Documented trusted interception is HTTP(S)-focused; restrictive mode conflicts with arbitrary UDP paths. | Relay-only connectivity if validated, or a VM with an externally enforced firewall/proxy. |
 | Guaranteed uninterrupted overnight runtime | Cloudflare explicitly guarantees no fixed uninterrupted instance lifetime. | A conventional non-preemptible VM may better fit operational expectations, but still needs failure recovery. |
-| Production dependency on Computer or Artifacts without qualification | Computer says not production-ready; Artifacts requires closed-beta access. | R2 + ordinary Git hosting now; reconsider later. |
+| Large durable source tree or filesystem semantics unsupported by Computer | Computer's approximately 10 GB/shared DO limit and published in-memory container store may be a tighter constraint than the container disk. | Sandbox + native scratch + R2, or a VM with persistent disk.[C51] |
+| Production guarantees beyond accepted alpha risk | Computer explicitly says not production-ready; this alpha accepts that warning, not a production guarantee. Artifacts still requires closed-beta access. | Pin and validate Computer for the alpha; reassess support/availability before production. |
 
 **Raw Containers are a useful fallback within Cloudflare**, particularly if Sandbox API churn is the problem. They do not remove the same underlying resource, disk, network, or runtime-replacement constraints.
 
@@ -424,7 +470,7 @@ For example, 22 eight-hour runs on `standard-3` at 25% average CPU are approxima
 
 - **R2 Standard:** $0.015/GB-month, $4.50/million Class A operations, $0.36/million Class B operations; 10 GB-month, 1 million Class A and 10 million Class B operations included. R2 egress is free, but that does **not** mean Containers egress is free.[C38]
 - **Containers egress:** listed overage rates are $0.025/GB in North America/Europe, $0.05/GB in Oceania/Korea/Taiwan and $0.04/GB elsewhere, with regional included allotments. Relay traffic contributes to the relevant network usage.[C41]
-- **Workers and Durable Objects:** billed separately from container resources. Keep-alive/control activity can incur DO duration; do not assume it is always hibernated or free.[C42]
+- **Workers and Durable Objects:** billed separately from container resources. Computer adds SQL filesystem storage and row operations: Paid includes **5 GB-month, 25 billion rows read and 50 million rows written/month**; overages are **$0.20/GB-month, $0.001/million rows read and $1/million rows written**. A filesystem operation can touch multiple rows. Computer's accepted WebSocket/heartbeat can also incur DO duration; do not assume hibernation. Measure sync overhead and build-time/RAM amplification, not just stored bytes. Container prices above still apply.[C42], [C59]
 - **Workflows:** step/storage billing took effect on **10 August 2026**. Paid includes 500,000 steps/month and 1 GB-month; overage is $0.80/100,000 steps and $0.20/GB-month, plus Workers request/CPU pricing. Avoid returning bundles or secrets as workflow step state.[C43]
 - **Models and relays:** provider inference charges and production Iroh relay capacity are additional. Actual agent/model usage can dominate compute cost.
 - **Observability:** budget separately for logs/traces and retention; payload logging can expose source code or credentials. August's agent-tracing announcement schedules billing changes for 1 October 2026.[C15]
@@ -459,10 +505,10 @@ These are proposed tests for a future approved spike. **They were not run as par
 
 | Gate | Experiment and acceptance condition |
 | --- | --- |
-| **1. Exact runtime compatibility** | Run pinned Herdr, Attached and the chosen coding agent in a deployed Linux/amd64 sandbox. Verify PTY behavior, Unix sockets, signals, child cleanup and a representative repository build within resource limits. |
+| **1. Exact runtime compatibility** | Run pinned Computer/daemon, Herdr, Attached and the agent in a deployed Linux/amd64 container with real FUSE, not the local dev shim. Compare a representative build with native disk; measure peak RAM, durable-tree size and restore time. Verify Git/agent file semantics, PTY, sockets outside the mount, signals and child cleanup. |
 | **2. Attached relay under least privilege** | Connect from the existing account with UDP unavailable and deny-by-default egress. Prove WebSocket upgrade/TLS operation and reconnection without enabling general Internet access. |
-| **3. Overnight independence** | Run at least 12 hours with the laptop offline and no client requests. Check keep-alive, external credential renewal, checkpoint timestamps and reconnect to the same surviving Herdr process. Repeat; one run is not a reliability guarantee. |
-| **4. Destructive recovery** | Force idle stop, restart, OOM/kill and a deployment replacement. Retrieve the last complete checkpoint, identify the lost runtime accurately, and relaunch from durable data without claiming memory continuity. |
+| **3. Overnight independence** | Run at least 12 hours with the laptop offline and no client requests. Verify explicit timeout/supervision, keep-alive, credential renewal and periodic pulls while Herdr remains running. Disconnect exec-output observers and check for blocked processes. Reconnect to the same surviving Herdr process. Repeat; one run is not a reliability guarantee. |
+| **4. Destructive recovery** | Write through the live agent without completing a Computer exec; prove periodic pulls make those files durable. Kill before/after a completed pull, interrupt sync, restart the DO, force OOM and replace the container. Measure loss against the five-minute target and resume synchronization safely. Report a new runtime honestly; test portable R2 recovery independently of Computer's schema. |
 | **5. Publisher isolation/revocation** | A workspace cannot enumerate another session, mutate another publisher record, or connect as the owner. After destroy, replay its stolen token from a different machine and require rejection. |
 | **6. Hostile network behavior** | Attempt unauthorized repos, redirects, raw IPs, alternate ports, IPv6, DNS tunneling, metadata/private destinations and direct broker requests. Test the effective policy, not just configuration values. |
 | **7. Artifact durability and safety** | Include committed, uncommitted, binary, renamed and untracked files. Kill during upload; the previous manifest must remain valid. Test disk-full, unsafe archives and retrieval into a clean review worktree. |
@@ -471,7 +517,9 @@ These are proposed tests for a future approved spike. **They were not run as par
 
 ### Go / no-go
 
-**Go with Cloudflare compute** if relay connectivity works under the accepted policy, representative projects fit the limits, durable recovery meets the agreed loss window, and workspace-scoped Attached revocation is designed and validated.
+**Go with Computer on Cloudflare** if relay connectivity works under the accepted policy, representative projects fit FUSE/RAM/storage limits, host-driven synchronization during long-running Herdr execution meets the agreed loss window, and workspace-scoped Attached revocation is designed and validated.
+
+**Use Sandbox on Cloudflare instead** if the underlying container/network fits but Computer's filesystem or supervision integration does not. Keep only the selected runtime integration in the MVP; no provider-selection product is needed.
 
 **Choose a VM backend** if session-memory preservation, larger disks/compute, unrestricted development tooling, or stronger network controls are necessary for the first target projects.
 
@@ -482,13 +530,13 @@ These are proposed tests for a future approved spike. **They were not run as par
 For a quick independent review:
 
 1. [Containers/Sandboxes GA][C01] and [current Containers limitations/lifetime][C03].
-2. [Sandbox SDK 1.0 preview][C17] and [process/container lifetime semantics][C32].
-3. [Cloudflare outbound traffic enforcement][C05] and [Iroh firewall/TLS requirements][N01].
-4. [Sandbox backups][C08] versus [Computer's current production-readiness warning][C11].
+2. [Computer's release README][C51], [container example][C52], and [explicit synchronization source][C53].
+3. [Cloudflare outbound traffic enforcement][C05], [Computer gateway integration][C61], and [Iroh firewall/TLS requirements][N01].
+4. [Computer's published performance measurements][C58] versus [Sandbox preview][C17], [backups][C08], and [lifetime semantics][C32].
 5. [Artifacts availability][C14] and [repo token scope/revocation][C36].
 6. [Current Attached authorization code][A06] and [unmerged unattended-bootstrap PR][A07].
 
-Linked sources were consulted on **16 September 2026**. Announcement dates indicate release announcements; they are not assumed to supersede current availability warnings or prove compatibility with Attached.
+Linked sources were consulted on **16 September 2026**, with Computer release/source follow-up on **17 September**. Announcement dates indicate release announcements; they are not assumed to supersede availability warnings or prove compatibility with Attached. Accepting a preview dependency is an explicit alpha trade-off, not evidence that its untested behavior works.
 
 [C01]: https://developers.cloudflare.com/changelog/post/2026-04-13-containers-sandbox-ga/
 [C02]: https://developers.cloudflare.com/containers/concepts/architecture/
@@ -540,6 +588,19 @@ Linked sources were consulted on **16 September 2026**. Announcement dates indic
 [C48]: https://developers.cloudflare.com/artifacts/platform/limits/
 [C49]: https://developers.cloudflare.com/changelog/post/2026-03-24-dynamic-workers-open-beta/
 [C50]: https://developers.cloudflare.com/kv/concepts/how-kv-works/
+[C51]: https://github.com/cloudflare/computer/blob/8d8cbac36bed96147a08e1d6cb4565581e65cbd3/packages/computer/README.md
+[C52]: https://github.com/cloudflare/computer/tree/8d8cbac36bed96147a08e1d6cb4565581e65cbd3/examples/container
+[C53]: https://github.com/cloudflare/computer/blob/8d8cbac36bed96147a08e1d6cb4565581e65cbd3/packages/computer/src/workspace.ts
+[C54]: https://github.com/cloudflare/computer/blob/8d8cbac36bed96147a08e1d6cb4565581e65cbd3/packages/computer/src/shell.ts
+[C55]: https://github.com/cloudflare/computer/blob/8d8cbac36bed96147a08e1d6cb4565581e65cbd3/packages/computerd/src/exec/runner.ts
+[C56]: https://github.com/cloudflare/computer/blob/8d8cbac36bed96147a08e1d6cb4565581e65cbd3/packages/computerd/src/fuse/driver.ts
+[C57]: https://github.com/cloudflare/computer/blob/8d8cbac36bed96147a08e1d6cb4565581e65cbd3/packages/computerd/src/fuse/vfs.ts
+[C58]: https://github.com/cloudflare/computer/blob/8d8cbac36bed96147a08e1d6cb4565581e65cbd3/docs/19_performance.md
+[C59]: https://github.com/cloudflare/computer/blob/8d8cbac36bed96147a08e1d6cb4565581e65cbd3/packages/computer/src/backends/container/cloudflare-container.ts
+[C60]: https://github.com/cloudflare/computer/blob/8d8cbac36bed96147a08e1d6cb4565581e65cbd3/packages/computer/src/backends/container/container-host.ts
+[C61]: https://github.com/cloudflare/computer/tree/8d8cbac36bed96147a08e1d6cb4565581e65cbd3/examples/egress
+[C62]: https://github.com/cloudflare/computer/blob/7ce8259324d40d32e7b2db9d371ea5b19f4c8f63/packages/computerd/README.md
+[C63]: https://github.com/cloudflare/computer/blob/8d8cbac36bed96147a08e1d6cb4565581e65cbd3/packages/computer/CHANGELOG.md
 [A01]: https://github.com/pvalletbo/attached/blob/d334f7d75eb2b58059e9deeaaa73a61e799a476c/crates/session-sync-worker/wrangler.toml
 [A02]: https://github.com/pvalletbo/attached/blob/d334f7d75eb2b58059e9deeaaa73a61e799a476c/crates/cli/src/publish_account.rs
 [A03]: https://github.com/pvalletbo/attached/blob/d334f7d75eb2b58059e9deeaaa73a61e799a476c/crates/cli/src/server.rs
