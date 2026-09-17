@@ -32,6 +32,21 @@ impl Descriptors {
         }
     }
 
+    /// Apply authenticated full-catalog observations without delaying the export
+    /// loop behind an on-demand refresh. A busy refresh owns the newer decision;
+    /// the exporter retries this observation on its next tick. Never roll back
+    /// a lease already renewed independently by a connection.
+    pub(super) fn observe(&self, next: &HostConnection) {
+        if let Ok(mut state) = self.state.try_lock()
+            && next.endpoint_identity == state.current.endpoint_identity
+            && next.record_id == state.current.record_id
+            && next.service_revision >= state.current.service_revision
+            && next != &state.current
+        {
+            state.current = next.clone();
+        }
+    }
+
     pub(super) async fn get(
         &self,
         account: &AccountCredentials,
@@ -131,6 +146,23 @@ mod tests {
         previous.expires_at = sync::utc_now_seconds() + chrono::Duration::seconds(300);
         previous.attach_capability = [3; 32];
         previous
+    }
+
+    #[tokio::test]
+    async fn catalog_observations_never_roll_back_or_substitute_a_publisher() {
+        let original = descriptor(false);
+        let cache = Descriptors::new(original.clone());
+        let next = renewed(original.clone());
+        cache.observe(&next);
+        cache.observe(&original);
+        assert!(cache.state.lock().await.current == next);
+        let mut substituted = renewed(next.clone());
+        substituted.endpoint_identity = [0; 32];
+        cache.observe(&substituted);
+        assert!(cache.state.lock().await.current == next);
+        let lock = cache.state.lock().await;
+        cache.observe(&renewed(next.clone())); // Must not wait/deadlock behind setup.
+        assert!(lock.current == next);
     }
 
     #[tokio::test]

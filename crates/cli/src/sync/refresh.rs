@@ -123,25 +123,55 @@ async fn refresh_hosts_with_registry_at(
     registry_dir: &Path,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<RefreshResult> {
-    let mut warnings = Vec::new();
     let Some(account) = state::load_account_optional(state_dir, ApiKeyScope::Download)
         .context("could not load synchronization account")?
     else {
         return Ok(RefreshResult {
             hosts: Vec::new(),
-            warnings,
+            warnings: Vec::new(),
         });
     };
-    let mut catalog = match state_catalog::load(state_dir, &account) {
+    refresh_unlocked_at(state_dir, registry_dir, &account, now).await
+}
+
+/// A foreground SSH exporter keeps its account unlocked for its entire lifetime.
+/// Discovery must not reopen an account bundle or launch a password prompt on each poll.
+pub(crate) async fn refresh_hosts_unlocked(
+    state_dir: &Path,
+    account: &state::AccountCredentials,
+) -> Result<RefreshResult> {
+    let registry = crate::endpoint_registry::default_dir();
+    let mut result = refresh_unlocked_at(
+        state_dir,
+        registry.as_deref().unwrap_or(Path::new("")),
+        account,
+        super::utc_now_seconds(),
+    )
+    .await?;
+    if registry.is_err() {
+        push_registry_warning(&mut result.warnings);
+    }
+    result.hosts = state_catalog::all_ssh_hosts(state_dir, account, super::utc_now_seconds())?;
+    Ok(result)
+}
+
+async fn refresh_unlocked_at(
+    state_dir: &Path,
+    registry_dir: &Path,
+    account: &state::AccountCredentials,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<RefreshResult> {
+    let mut warnings = Vec::new();
+    let mut catalog = match state_catalog::load(state_dir, account) {
         Ok(catalog) => catalog,
         Err(error) => {
             warnings.push(RefreshWarning::CatalogRebuilt(error));
-            state_catalog::Catalog::empty(&account)
+            state_catalog::Catalog::empty(account)
         }
     };
     let client = SyncHttpClient::new().context("could not initialize synchronization refresh")?;
     let index = client
-        .list_records(&account)
+        .list_records(account)
         .await
         .context("could not refresh the synchronized record index")?;
 
@@ -180,7 +210,7 @@ async fn refresh_hosts_with_registry_at(
         changed.push(indexed);
     }
 
-    for (indexed, fetched) in fetch_changed_records(&client, &account, changed).await {
+    for (indexed, fetched) in fetch_changed_records(&client, account, changed).await {
         let fetched = match fetched {
             Ok(Some(fetched)) => fetched,
             result => {
@@ -234,11 +264,11 @@ async fn refresh_hosts_with_registry_at(
     }
     accepted.sort_by_key(|record| record.record_id);
     catalog.records = accepted;
-    state_catalog::save_refresh(state_dir, &account, &baseline_revisions, &catalog)
+    state_catalog::save_refresh(state_dir, account, &baseline_revisions, &catalog)
         .context("could not save synchronized host catalog")?;
 
     let listing =
-        state_catalog::hosts_excluding_local_endpoints(state_dir, &account, now, registry_dir)?;
+        state_catalog::hosts_excluding_local_endpoints(state_dir, account, now, registry_dir)?;
     Ok(finish_refresh(listing, warnings))
 }
 

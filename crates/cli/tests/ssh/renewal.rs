@@ -67,10 +67,10 @@ fn snapshot(
     }
 }
 
-struct StreamSsh {
-    key: russh::keys::PublicKey,
-    commands: Arc<AtomicUsize>,
-    streams: std::collections::HashSet<russh::ChannelId>,
+pub(super) struct StreamSsh {
+    pub(super) key: russh::keys::PublicKey,
+    pub(super) commands: Arc<AtomicUsize>,
+    pub(super) streams: std::collections::HashSet<russh::ChannelId>,
 }
 impl russh::server::Handler for StreamSsh {
     type Error = anyhow::Error;
@@ -144,7 +144,7 @@ impl russh::server::Handler for StreamSsh {
     }
 }
 
-fn ssh(config: &Path, alias: &str, command: &str) -> tokio::process::Command {
+pub(super) fn ssh(config: &Path, alias: &str, command: &str) -> tokio::process::Command {
     let mut process = tokio::process::Command::new("ssh");
     process
         .arg("-F")
@@ -158,7 +158,7 @@ fn ssh(config: &Path, alias: &str, command: &str) -> tokio::process::Command {
     process
 }
 
-async fn round_trip(
+pub(super) async fn round_trip(
     stdin: &mut tokio::process::ChildStdin,
     stdout: &mut tokio::process::ChildStdout,
     bytes: &[u8],

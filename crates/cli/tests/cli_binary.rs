@@ -2,6 +2,8 @@
 //! behavior (including production encryption/KDF) runs in CARGO_BIN_EXE_attached.
 #[path = "discovery/mod.rs"]
 mod discovery;
+#[path = "ssh/export.rs"]
+mod ssh_export;
 #[path = "ssh/renewal.rs"]
 mod ssh_renewal;
 mod support;
@@ -370,8 +372,19 @@ async fn help_version_completions_and_usage_errors_are_real_process_contracts() 
     let help = fixture.run(&["--help"]).await;
     help.assert_code(0);
     assert!(help.stdout.contains("sessions"));
+    assert!(help.stdout.contains("export-ssh-config"));
     assert!(!help.stdout.contains("__handoff-serve"));
     assert!(help.stderr.is_empty());
+    let export_help = fixture.run(&["export-ssh-config", "--help"]).await;
+    export_help.assert_code(0);
+    assert!(
+        export_help
+            .stdout
+            .contains("Usage: attached export-ssh-config")
+    );
+    assert!(export_help.stdout.contains("--refresh-interval"));
+    assert!(export_help.stderr.is_empty());
+    assert!(!fixture.path("home/.ssh").exists());
     let version = fixture.run(&["--version"]).await;
     version.assert_code(0);
     assert_eq!(
@@ -382,11 +395,17 @@ async fn help_version_completions_and_usage_errors_are_real_process_contracts() 
         let output = fixture.run(&["completions", shell]).await;
         output.assert_code(0);
         assert!(output.stdout.contains("attached"), "{shell}: {output:?}");
+        assert!(
+            output.stdout.contains("export-ssh-config"),
+            "{shell}: {output:?}"
+        );
         assert!(output.stderr.is_empty(), "{shell}: {output:?}");
     }
     for args in [
         vec!["unknown"],
         vec!["attach", "host/work", "--", "sh"],
+        vec!["export-ssh-config", "office"],
+        vec!["export-ssh-config", "--refresh-interval", "0"],
         vec!["account", "import", "--bundle-file", "x", "--bundle-stdin"],
     ] {
         let output = fixture.run(&args).await;

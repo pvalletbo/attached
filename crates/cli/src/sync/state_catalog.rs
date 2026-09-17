@@ -318,6 +318,16 @@ fn encode_catalog(catalog: &Catalog) -> Result<Zeroizing<Vec<u8>>> {
     Ok(encoded)
 }
 
+/// SSH configuration exports include local publishers too: unlike the human
+/// discovery listing, they must provide aliases for every advertised SSH host.
+pub(super) fn all_ssh_hosts(
+    state_dir: &Path,
+    account: &AccountCredentials,
+    now: DateTime<Utc>,
+) -> Result<Vec<SyncedHost>> {
+    hosts_with_filter(state_dir, account, now, |_| false)
+}
+
 fn hosts_with_filter(
     state_dir: &Path,
     account: &AccountCredentials,
@@ -827,6 +837,13 @@ mod tests {
             "locally served session was listed twice"
         );
         assert!(!listed.registry_unavailable);
+        let exported = all_ssh_hosts(&state_dir, &account, timestamp(1_700_000_000)).unwrap();
+        assert_eq!(
+            exported.len(),
+            1,
+            "SSH exports must not omit a local publisher"
+        );
+        assert_eq!(exported[0].host, "office");
     }
 
     #[test]
