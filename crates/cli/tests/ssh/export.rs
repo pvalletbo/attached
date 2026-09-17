@@ -543,6 +543,56 @@ async fn exporter_retains_live_hosts_during_outages_expires_aliases_and_recovers
 }
 
 #[tokio::test]
+async fn exporter_rebuilds_transport_after_suspension_without_unlocking_again() {
+    let fixture = CliFixture::new();
+    let discovery = Discovery::new().await;
+    let consumer = iroh::SecretKey::generate().to_bytes();
+    import_with_identity(&fixture, &discovery.origin, consumer).await;
+    let office = Publisher::new(consumer, 66).await;
+    office.advertise(&discovery, "Office", 1, true, 300).await;
+    let broker = start(&fixture);
+    let configured = wait_config(&fixture, |text| text.contains(" attached-office\n")).await;
+    let old_keys = runtime_files(&configured);
+    let config = fixture.path("home/.ssh/config");
+    check_command(&config, "attached-office").await;
+    let mut active = ssh(&config, "attached-office", "cat")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = active.stdin.take().unwrap();
+    let mut stdout = active.stdout.take().unwrap();
+    round_trip(&mut stdin, &mut stdout, b"before-suspend\n").await;
+    fs::remove_file(fixture.path("home/.config/attached/sync-account.bundle")).unwrap();
+    fs::remove_file(fixture.path("bin/op")).unwrap();
+
+    // Suspend only the exporter, not the fixture/runtime. This deterministically
+    // exercises a missed heartbeat without suspending the CI machine or relying
+    // on a public relay. Unit tests separately cover clocks that pause in sleep.
+    let pid = rustix::process::Pid::from_raw(broker.id().unwrap() as i32).unwrap();
+    rustix::process::kill_process(pid, rustix::process::Signal::STOP).unwrap();
+    tokio::time::sleep(Duration::from_secs(32)).await;
+    rustix::process::kill_process(pid, rustix::process::Signal::CONT).unwrap();
+    let recovered = wait_config(&fixture, |text| {
+        text.contains(" attached-office\n") && text != configured
+    })
+    .await;
+    for key in old_keys {
+        assert!(!key.exists(), "old transport retained a temporary key");
+    }
+    let ended = timeout(DEADLINE, active.wait()).await.unwrap().unwrap();
+    assert!(!ended.success());
+    check_command(&config, "attached-office").await;
+    // Recovery must never replay the cat or any other previous SSH command.
+    assert_eq!(office.commands.load(Ordering::SeqCst), 3);
+    stop(broker, rustix::process::Signal::TERM).await;
+    for key in runtime_files(&recovered) {
+        assert!(!key.exists());
+    }
+    office.stop().await;
+    discovery.stop().await;
+}
+
+#[tokio::test]
 async fn exporter_cleans_up_on_hangup_and_restarts_without_manual_configuration() {
     let fixture = CliFixture::new();
     let discovery = Discovery::new().await;
