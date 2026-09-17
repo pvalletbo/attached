@@ -187,9 +187,10 @@ mod tests {
         let error = run_lookup_with_limits(oversized, Duration::from_secs(2), 16)
             .err()
             .expect("oversized lookup output should fail");
+        let message = format!("{error:#}");
         assert!(
-            error.to_string().contains("produced more than 16 bytes"),
-            "{error:#}"
+            message.contains("produced more than 16 bytes"),
+            "{message}"
         );
 
         let mut stalled = Command::new("/bin/sh");
@@ -197,7 +198,8 @@ mod tests {
         let error = run_lookup_with_limits(stalled, Duration::from_millis(50), 16)
             .err()
             .expect("stalled lookup should fail");
-        assert!(error.to_string().contains("timed out"), "{error:#}");
+        let message = format!("{error:#}");
+        assert!(message.contains("timed out"), "{message}");
     }
 
     #[test]
