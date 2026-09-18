@@ -22,6 +22,30 @@ cargo install --git https://github.com/pvalletbo/attached.git --locked attached
 Run `attached --version` to verify the installation. The client needs OpenSSH (`ssh` and
 `ssh-keygen`). Linux and macOS are supported.
 
+## 1Password support
+
+Attached can use [1Password](https://1password.com/) to generate and store its local encryption
+password instead of asking you to enter one. Install the
+[1Password CLI](https://developer.1password.com/docs/cli/get-started/) and make sure `op` is available
+on your PATH and authenticated, with 1Password unlocked when Attached needs it.
+
+To use 1Password by default on a machine, create or edit `$HOME/.config/attached/config.toml`:
+
+```toml
+password_source = "1password"
+```
+
+Attached reads this setting on each invocation, so you do not need to pass `--use-1password` every
+time. The configuration file contains no password; Attached retrieves it through `op`. If 1Password
+is unavailable, the operation fails rather than falling back to a manually entered password.
+
+For a new setup, configure this before `attached account create` or the first `attached serve`.
+Attached creates an **Attached encryption password** item if one does not already exist, then
+reuses it. Changing this setting does not migrate or re-encrypt credentials already protected with
+a manually chosen password.
+
+For a single invocation without changing the configuration, use the `--use-1password` flag.
+
 ## Connect to your first machine
 
 On the **client**:
@@ -59,8 +83,9 @@ herdr
 You must have two available hosts:
 
 * **Client**: the local host from which you will control the remote session
-* **Publisher**: the remote host serving a Herdr session to the client. This may be any kind of machine,
-as long as it can run Herdr (a Docker container works as well)
+* **Publisher**: the remote host running `attached serve` and providing SSH access to the client.
+  This may be any machine that can run Attached, including a Docker container. An active Herdr
+  session is not required.
 
 ### Establishing the tunnel
 
@@ -83,22 +108,21 @@ end-to-end encrypted in either case.
 The publisher and client must also share the information needed to establish the tunnel. The
 publisher encrypts and authenticates a host descriptor, then uploads it to the passive
 synchronization service. The client retrieves and decrypts the descriptor using the account
-credentials shared out of band by `attached account export`. The service stores the encrypted
-record but cannot read or modify its contents without detection.
+credentials shared out of band by `attached account export`. The service cannot decrypt the
+contents or forge modified descriptors that pass authentication. It can still overwrite, delete,
+withhold, or replay stored ciphertext.
 
-Apart from sharing the Iroh connection details, the publisher and client need to share information 
-about the active Herdr sessions, such as the hostname and active session names.
-To share this information securely, we rely on a backend service that stores the information in 
-an encrypted form so that it can never read or write the data. The publisher encrypts the information
-and pushes it to the server. The client can then retrieve and decrypt it and start an attachment if 
-active sessions are available. Among other technical details, the following information is shared:
+The following machine-level information is shared:
 
 * **Host label**: a descriptive name for the host
 * **Iroh endpoint ticket**: used by the consumer to establish the P2P tunnel
-* **Attach capability**: a shared secret that the consumer must present to authorize the tunnel
+* **Tunnel capability**: a shared secret that the consumer must present to authorize the tunnel
 * **Attached version**: the running version of the Attached binary
-* **Herdr version**: the running version of Herdr
-* **Sessions**: a list of the Herdr session names running on the remote machine
+* **SSH-enabled status**: whether the publisher advertises SSH access
+* **Publication and expiration times**: when the descriptor was issued and when it stops being valid
+
+Attached does not publish Herdr versions or session names. Herdr discovers and manages its own
+sessions over SSH after connecting to the machine.
 
 ### Security model and limitations
 
@@ -117,9 +141,11 @@ If private keys and encryption keys are not leaked, the design provides these pr
 - **Sensitive local data is encrypted at rest.** Private keys, account bundles, discovery data, and
   other credentials are protected by the local encryption password or configured password provider.
 
+Running `attached serve` with a valid publish bundle automatically enables SSH for that bundle's
+authorized consumer as the publisher's current OS account; there is no separate enable step.
 Before application traffic is admitted, Attached checks the account's authorized consumer Iroh
-identity. SSH additionally checks the tunnel capability, explicit publisher consent, a
-connection-scoped client key, and the publisher's pinned SSH host key. 
+identity. SSH additionally checks the tunnel capability, a connection-scoped client key, and the
+publisher's pinned SSH host key.
 
 Important limitations:
 
@@ -127,7 +153,8 @@ Important limitations:
   download/owner bundles and their decryption credentials as remote-shell-equivalent secrets.
 - A compromised synchronization service can hide records, deny service, or replay valid
   advertisements until expiration. Authenticated encryption is not an availability guarantee.
-- SSH revocation is local to each publisher. General account-token revocation and per-client
+- To end SSH access, stop `attached serve` on each publisher. This does not undo commands or
+  terminate deliberately detached processes. General account-token revocation and per-client
   identities are not yet implemented.
 
 ## Development
