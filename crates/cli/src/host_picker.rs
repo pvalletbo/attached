@@ -65,6 +65,32 @@ pub async fn select(hosts: &[SyncedHost]) -> Result<Option<String>> {
     .map(Some)
 }
 
+/// Public discovery metadata only; never serialize connection descriptors or capabilities.
+pub fn render_json(hosts: &[SyncedHost]) -> Result<String> {
+    #[derive(serde::Serialize)]
+    struct Host<'a> {
+        host: &'a str,
+        endpoint_id: &'a str,
+        ssh_target: String,
+        attached_version: String,
+        published_at: Option<DateTime<Utc>>,
+    }
+    let rows = hosts
+        .iter()
+        .map(|host| {
+            let [major, minor, patch] = host.attached_version;
+            Host {
+                host: &host.host,
+                endpoint_id: &host.target,
+                ssh_target: format!("attached-{}", host.target),
+                attached_version: format!("{major}.{minor}.{patch}"),
+                published_at: host.published_at,
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok(format!("{}\n", serde_json::to_string(&rows)?))
+}
+
 pub fn render_list(hosts: &[SyncedHost]) -> Result<String> {
     let (input, header) = render_input_at(hosts, Utc::now())?;
     let mut output = format!("{header}\n");
@@ -192,6 +218,25 @@ mod tests {
             assert!(rendered.contains(&host.target));
         }
     }
+    #[test]
+    fn json_listing_is_stable_public_metadata_even_with_duplicate_labels() {
+        let mut hosts = hosts();
+        hosts[0].published_at = Some("2026-09-17T12:00:00Z".parse().unwrap());
+        let rendered = render_json(&hosts).unwrap();
+        let rows: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 2);
+        for (row, host) in rows.as_array().unwrap().iter().zip(&hosts) {
+            assert_eq!(row.as_object().unwrap().len(), 5);
+            assert_eq!(row["host"], "office");
+            assert_eq!(row["endpoint_id"], host.target);
+            assert_eq!(row["ssh_target"], format!("attached-{}", host.target));
+            assert_eq!(row["attached_version"], "0.2.14");
+        }
+        assert_eq!(rows[0]["published_at"], "2026-09-17T12:00:00Z");
+        assert!(rows[1]["published_at"].is_null());
+        assert_eq!(render_json(&[]).unwrap(), "[]\n");
+    }
+
     #[test]
     fn picker_uses_identity_even_when_labels_collide_and_rejects_invalid_output() {
         let hosts = hosts();

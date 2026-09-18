@@ -173,6 +173,11 @@ const DEFAULT_SERVICE_ORIGIN: &str = "https://herdr.attached.sh";
 enum SessionsCommand {
     /// Refresh and list SSH-enabled machines (not application sessions).
     List {
+        /// Print a JSON array with host labels, stable endpoint IDs, SSH aliases,
+        /// Attached versions, and publication times. Never includes credentials.
+        #[arg(long)]
+        json: bool,
+
         /// Override persistent state location (primarily for testing).
         #[arg(long, hide = true)]
         state_dir: Option<PathBuf>,
@@ -381,7 +386,11 @@ impl Cli {
                 Ok(0)
             }
             Command::Sessions { command } => match command {
-                SessionsCommand::List { state_dir } => {
+                SessionsCommand::List { json, state_dir } => {
+                    use std::io::IsTerminal;
+                    local_encryption::configure_noninteractive(
+                        !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal(),
+                    );
                     let state_dir = resolved_state_dir(state_dir, &configuration)?;
                     sync::state::load_account(&state_dir, ApiKeyScope::Download)
                         .context("`sessions list` requires a download account bundle")?;
@@ -391,7 +400,11 @@ impl Cli {
                     for warning in refresh_warnings_to_display(&refreshed.warnings, self.verbose) {
                         eprintln!("Warning: {warning}");
                     }
-                    let rendered = host_picker::render_list(&refreshed.hosts)?;
+                    let rendered = if json {
+                        host_picker::render_json(&refreshed.hosts)?
+                    } else {
+                        host_picker::render_list(&refreshed.hosts)?
+                    };
                     write_session_list(&mut stdout().lock(), &rendered)?;
                     Ok(0)
                 }
@@ -556,6 +569,7 @@ mod tests {
                 "/tmp/publish.bundle",
             ],
             vec!["attached", "sessions", "list"],
+            vec!["attached", "sessions", "list", "--json"],
             vec!["attached", "export-ssh-config"],
             vec![
                 "attached",
