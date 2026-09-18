@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{
         Mutex,
@@ -124,7 +125,6 @@ impl PasswordPrompt for TtyPasswordPrompt {
 
 struct UserPasswordProvider<P> {
     prompt: P,
-    cached: Mutex<Option<Zeroizing<Vec<u8>>>>,
 }
 
 impl<P: PasswordPrompt> PasswordProvider for UserPasswordProvider<P> {
@@ -134,14 +134,8 @@ impl<P: PasswordPrompt> PasswordProvider for UserPasswordProvider<P> {
         _directory: &crate::secure_state::StateDir,
         create: bool,
     ) -> Result<Zeroizing<Vec<u8>>> {
-        let mut cached = self
-            .cached
-            .lock()
-            .map_err(|_| anyhow::anyhow!("encryption password cache is unavailable"))?;
-        if let Some(password) = cached.as_ref() {
-            return Ok(Zeroizing::new(password.to_vec()));
-        }
-
+        // The master-key cache is scoped by salt. Do not reuse a plaintext
+        // password across workspaces: they may have different local passwords.
         let prompt = if create {
             "Create Attached encryption password: "
         } else {
@@ -160,7 +154,6 @@ impl<P: PasswordPrompt> PasswordProvider for UserPasswordProvider<P> {
             );
         }
 
-        *cached = Some(Zeroizing::new(password.to_vec()));
         Ok(password)
     }
 }
@@ -174,14 +167,9 @@ fn validate_password(password: &[u8]) -> Result<()> {
     Ok(())
 }
 
-struct CachedMasterKey {
-    salt: [u8; KDF_SALT_BYTES],
-    key: Zeroizing<[u8; MASTER_KEY_BYTES]>,
-}
-
 struct PasswordMasterKeyStore<P> {
     passwords: P,
-    cached_key: Mutex<Option<CachedMasterKey>>,
+    cached_keys: Mutex<BTreeMap<[u8; KDF_SALT_BYTES], Zeroizing<[u8; MASTER_KEY_BYTES]>>>,
 }
 
 impl<P: PasswordProvider> MasterKeyStore for PasswordMasterKeyStore<P> {
@@ -193,30 +181,25 @@ impl<P: PasswordProvider> MasterKeyStore for PasswordMasterKeyStore<P> {
     ) -> Result<Zeroizing<[u8; MASTER_KEY_BYTES]>> {
         let salt = load_or_create_kdf_salt(directory, create)?;
         let mut cached = self
-            .cached_key
+            .cached_keys
             .lock()
             .map_err(|_| anyhow::anyhow!("encryption key cache is unavailable"))?;
-        if let Some(cached) = cached.as_ref()
-            && cached.salt == salt
-        {
-            return Ok(Zeroizing::new(*cached.key));
+        if let Some(key) = cached.get(&salt) {
+            return Ok(Zeroizing::new(**key));
         }
 
         let password = self.passwords.password(directory, create)?;
         let key = derive_master_key(&password, &salt)?;
-        *cached = Some(CachedMasterKey {
-            salt,
-            key: Zeroizing::new(*key),
-        });
+        cached.insert(salt, Zeroizing::new(*key));
         Ok(key)
     }
 
     fn remove(&self) -> Result<()> {
         self.passwords.remove()?;
-        *self
-            .cached_key
+        self.cached_keys
             .lock()
-            .map_err(|_| anyhow::anyhow!("encryption key cache is unavailable"))? = None;
+            .map_err(|_| anyhow::anyhow!("encryption key cache is unavailable"))?
+            .clear();
         Ok(())
     }
 }
@@ -550,9 +533,8 @@ static USER_PASSWORD_STORE: LazyLock<
 > = LazyLock::new(|| PasswordMasterKeyStore {
     passwords: UserPasswordProvider {
         prompt: TtyPasswordPrompt,
-        cached: Mutex::new(None),
     },
-    cached_key: Mutex::new(None),
+    cached_keys: Mutex::new(BTreeMap::new()),
 });
 
 #[cfg(not(test))]
@@ -564,7 +546,7 @@ static ONE_PASSWORD_STORE: LazyLock<PasswordMasterKeyStore<OnePasswordProvider<P
             },
             cached: Mutex::new(None),
         },
-        cached_key: Mutex::new(None),
+        cached_keys: Mutex::new(BTreeMap::new()),
     });
 
 // Uninstall deliberately preserves a shared 1Password-managed password because
@@ -961,22 +943,44 @@ mod tests {
     }
 
     #[test]
-    fn user_password_creation_prompts_for_confirmation_and_caches_the_result() {
-        let (_root, directory) = test_state_directory();
-        let provider = UserPasswordProvider {
-            prompt: FakePrompt::new([
-                "correct horse battery staple",
-                "correct horse battery staple",
-            ]),
-            cached: Mutex::new(None),
+    fn user_password_creation_confirms_once_and_caches_keys_per_workspace() {
+        let (_root, first_directory) = test_state_directory();
+        let (_other, second_directory) = test_state_directory();
+        let store = PasswordMasterKeyStore {
+            passwords: UserPasswordProvider {
+                prompt: FakePrompt::new([
+                    "first workspace password",
+                    "first workspace password",
+                    "different password",
+                    "different password",
+                ]),
+            },
+            cached_keys: Mutex::new(BTreeMap::new()),
         };
-
-        let first = provider.password(&directory, true).unwrap();
-        let second = provider.password(&directory, false).unwrap();
-
-        assert_eq!(first.as_slice(), b"correct horse battery staple");
-        assert_eq!(second.as_slice(), first.as_slice());
-        assert_eq!(provider.prompt.prompts.lock().unwrap().len(), 2);
+        let first = store.load_or_create(&first_directory, true).unwrap();
+        let second = store.load_or_create(&second_directory, true).unwrap();
+        assert_ne!(first, second);
+        for _ in 0..3 {
+            assert_eq!(
+                first,
+                store.load_or_create(&first_directory, false).unwrap()
+            );
+            assert_eq!(
+                second,
+                store.load_or_create(&second_directory, false).unwrap()
+            );
+        }
+        assert_eq!(store.passwords.prompt.prompts.lock().unwrap().len(), 4);
+        let first_salt = load_or_create_kdf_salt(&first_directory, false).unwrap();
+        let second_salt = load_or_create_kdf_salt(&second_directory, false).unwrap();
+        assert_eq!(
+            first,
+            derive_master_key(b"first workspace password", &first_salt).unwrap()
+        );
+        assert_eq!(
+            second,
+            derive_master_key(b"different password", &second_salt).unwrap()
+        );
     }
 
     #[test]
@@ -984,15 +988,12 @@ mod tests {
         let (_root, directory) = test_state_directory();
         let mismatch = UserPasswordProvider {
             prompt: FakePrompt::new(["first password", "different password"]),
-            cached: Mutex::new(None),
         };
         let error = mismatch.password(&directory, true).unwrap_err().to_string();
         assert!(error.contains("do not match"), "{error}");
-        assert!(mismatch.cached.lock().unwrap().is_none());
 
         let empty = UserPasswordProvider {
             prompt: FakePrompt::new([""]),
-            cached: Mutex::new(None),
         };
         let error = empty.password(&directory, false).unwrap_err().to_string();
         assert!(error.contains("cannot be empty"), "{error}");
@@ -1027,7 +1028,7 @@ mod tests {
         let directory = crate::secure_state::StateDir::open(&state).unwrap();
         let store = PasswordMasterKeyStore {
             passwords: FixedPasswordProvider(b"correct horse battery staple"),
-            cached_key: Mutex::new(None),
+            cached_keys: Mutex::new(BTreeMap::new()),
         };
 
         let first = store.load_or_create(&directory, true).unwrap();
@@ -1070,7 +1071,7 @@ mod tests {
             passwords: CountingPasswordProvider {
                 calls: AtomicUsize::new(0),
             },
-            cached_key: Mutex::new(None),
+            cached_keys: Mutex::new(BTreeMap::new()),
         };
 
         let first = store.load_or_create(&first_directory, false).unwrap();
@@ -1080,6 +1081,11 @@ mod tests {
 
         let second = store.load_or_create(&second_directory, false).unwrap();
         assert_ne!(first, second);
+        assert_eq!(store.passwords.calls.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(
+            first,
+            store.load_or_create(&first_directory, false).unwrap()
+        );
         assert_eq!(store.passwords.calls.load(AtomicOrdering::SeqCst), 2);
     }
 

@@ -515,8 +515,8 @@ fn assert_remote_listing(output: &support::CliOutput) {
     let lines = output.stdout.lines().collect::<Vec<_>>();
     assert_eq!(lines.len(), 2, "{output:?}");
     assert_eq!(
-        lines[1].split_whitespace().take(1).collect::<Vec<_>>(),
-        ["remote"]
+        lines[1].split_whitespace().take(2).collect::<Vec<_>>(),
+        ["default", "remote"]
     );
 }
 

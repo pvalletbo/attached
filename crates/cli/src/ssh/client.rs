@@ -264,11 +264,23 @@ impl Broker {
             &self.runtime,
             &std::env::current_exe()?,
         )?;
-        Ok(config.replacen(
-            &format!("Host {}\n", self.alias),
-            &format!("Host {aliases}\n"),
-            1,
-        ))
+        let target = aliases
+            .split_whitespace()
+            .next()
+            .context("missing stable SSH alias")?;
+        // Keep the per-broker HostKeyAlias/known_hosts pin, but expose the
+        // workspace-qualified HostName to OpenSSH and discovery integrations.
+        Ok(config
+            .replacen(
+                &format!("Host {}\n", self.alias),
+                &format!("Host {aliases}\n"),
+                1,
+            )
+            .replacen(
+                &format!("HostName {}\n", self.alias),
+                &format!("HostName {target}\n"),
+                1,
+            ))
     }
 
     /// Retirement stops admission, but does not interrupt established SSH streams.

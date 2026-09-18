@@ -22,6 +22,7 @@ mod serve_handoff;
 mod server;
 mod ssh;
 mod sync;
+mod workspace;
 
 #[cfg(test)]
 mod test_support;

@@ -1,6 +1,9 @@
 //! Real OpenSSH reads the installed *user* configuration (not a broker's -F
 //! snippet). -F only isolates the test from the OS account's actual ~/.ssh/config:
 //! OpenSSH intentionally resolves that default via getpwuid, not the HOME variable.
+#[path = "workspaces.rs"]
+mod workspaces;
+
 use super::ssh_renewal::{StreamSsh, round_trip, ssh};
 use super::*;
 use std::{
@@ -52,9 +55,36 @@ impl Discovery {
                     };
                     let path = headers.split_whitespace().nth(1).unwrap();
                     requests.fetch_add(1, Ordering::SeqCst);
-                    let records = records.lock().await;
-                    if let Some(records) = records.as_ref() {
+                    let mut records = records.lock().await;
+                    if let Some(records) = records.as_mut() {
                         let prefix = format!("/v1/accounts/{ACCOUNT}/records");
+                        if headers.starts_with("PUT ") {
+                            let id =
+                                RecordId::parse(path.strip_prefix(&format!("{prefix}/")).unwrap())
+                                    .unwrap();
+                            let length = headers
+                                .lines()
+                                .filter_map(|line| line.split_once(':'))
+                                .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+                                .unwrap()
+                                .1
+                                .trim()
+                                .parse::<usize>()
+                                .unwrap();
+                            assert!(length <= 16384);
+                            let mut bytes = vec![0; length];
+                            stream.read_exact(&mut bytes).await.unwrap();
+                            let revision = records.get(&id).map_or(1, |record| record.revision + 1);
+                            records.insert(id, Publication { revision, bytes });
+                            reply(
+                                &mut stream,
+                                "204 No Content",
+                                b"",
+                                &format!("ETag: \"{revision}\"\r\n"),
+                            )
+                            .await;
+                            continue;
+                        }
                         if path == prefix {
                             let index = LiveRecordIndex::new(
                                 records
@@ -279,6 +309,10 @@ async fn wait_config(fixture: &CliFixture, check: impl Fn(&str) -> bool) -> Stri
 }
 
 fn start(fixture: &CliFixture) -> tokio::process::Child {
+    start_with(fixture, &[])
+}
+
+fn start_with(fixture: &CliFixture, extra: &[&str]) -> tokio::process::Child {
     fixture
         .command(&[
             "--use-1password",
@@ -286,6 +320,7 @@ fn start(fixture: &CliFixture) -> tokio::process::Child {
             "--refresh-interval",
             "1",
         ])
+        .args(extra)
         .stdout(fs::File::create(fixture.path("export.stdout")).unwrap())
         .stderr(fs::File::create(fixture.path("export.stderr")).unwrap())
         .spawn()

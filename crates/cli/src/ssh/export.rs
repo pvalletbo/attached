@@ -2,11 +2,11 @@
 use std::{
     collections::{BTreeMap, HashSet},
     path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use attached_session_sync_protocol::account::ApiKeyScope;
 use iroh::{Endpoint, endpoint::presets};
 use tokio::{sync::mpsc, task::JoinSet};
@@ -18,6 +18,7 @@ use crate::sync::{
     state::AccountCredentials,
     state_catalog::{HostConnection, SyncedHost},
 };
+use crate::workspace::{self, Workspace};
 
 const PREPARE_CONCURRENCY: usize = 8;
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
@@ -67,54 +68,154 @@ impl Drop for RunningHost {
     }
 }
 
-pub(crate) async fn export(path: &Path, refresh_interval: Duration) -> Result<i32> {
+/// One configuration owner, with independent per-workspace snapshots. Publishing
+/// one workspace must never replace another workspace's aliases or keys.
+struct PublishedConfigs {
+    managed: ManagedConfig,
+    snapshots: Mutex<BTreeMap<String, String>>,
+}
+
+struct WorkspaceConfig {
+    name: String,
+    shared: Arc<PublishedConfigs>,
+}
+
+impl WorkspaceConfig {
+    fn publish(&self, configuration: &str) -> Result<()> {
+        let mut snapshots = self
+            .shared
+            .snapshots
+            .lock()
+            .map_err(|_| anyhow::anyhow!("SSH configuration lock failed"))?;
+        snapshots.insert(self.name.clone(), configuration.into());
+        self.shared
+            .managed
+            .publish(&snapshots.values().cloned().collect::<String>())
+    }
+}
+
+pub(crate) async fn export(
+    workspaces: Vec<Workspace>,
+    refresh_interval: Duration,
+    all: bool,
+) -> Result<i32> {
     use tokio::signal::unix::{SignalKind, signal};
-    let account = Arc::new(sync::state::load_account(path, ApiKeyScope::Download)?);
+    let mut accounts = Vec::new();
+    for workspace in workspaces {
+        crate::secure_state::prepare_private_dir(&workspace.path)?;
+        eprintln!("Unlocking workspace `{}`...", workspace.name);
+        let account = sync::state::load_account_optional(&workspace.path, ApiKeyScope::Download)
+            .with_context(|| format!("could not unlock workspace `{}`", workspace.name))?;
+        match account {
+            Some(account) => accounts.push((workspace, Arc::new(account))),
+            None if all => {}
+            None => anyhow::bail!(
+                "workspace `{}` has no consumer credentials; import a download-only bundle",
+                workspace.name
+            ),
+        }
+    }
+    ensure!(
+        !accounts.is_empty(),
+        "no consumer workspaces are configured; use `attached account create` or `attached account import`"
+    );
     // Register before touching user configuration, so all normal terminal/session
     // shutdown paths run the same cleanup, including a signal during discovery.
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut terminate = signal(SignalKind::terminate())?;
     let mut hangup = signal(SignalKind::hangup())?;
     let home = std::env::var_os("HOME").context("HOME is not set")?;
-    let managed = ManagedConfig::install(Path::new(&home))?;
-    let consumer = iroh::SecretKey::from_bytes(
-        account
-            .consumer_identity_secret()
-            .context("download bundle has no consumer identity")?,
-    );
+    let shared = Arc::new(PublishedConfigs {
+        managed: ManagedConfig::install(Path::new(&home))?,
+        snapshots: Mutex::new(BTreeMap::new()),
+    });
     let cancellation = CancellationToken::new();
     let _cancel = cancellation.clone().drop_guard();
     let run = async {
         loop {
-            // Never one endpoint per host: relays would displace the same
-            // consumer identity. Fully close the old endpoint before rebinding.
-            // Keep relay support even when the catalog is empty or local-only.
-            let endpoint = Endpoint::builder(presets::N0)
-                .secret_key(consumer.clone())
-                .bind()
-                .await?;
-            let result = run(
-                &endpoint,
-                path,
-                account.clone(),
-                &managed,
-                refresh_interval,
-                cancellation.child_token(),
-            )
-            .await;
-            // All brokers and keys are gone. Do not leave stale proxy paths
-            // published while the next endpoint is binding/discovering hosts.
-            let unpublished = managed.publish("");
-            // QUIC draining can otherwise outlive shutdown/resume when a peer
-            // is unreachable. Drop the last endpoint handle even if draining
-            // times out, so the old relay registration cannot outlive this loop.
-            if tokio::time::timeout(Duration::from_secs(3), endpoint.close())
-                .await
-                .is_err()
-            {
-                tracing::debug!("SSH exporter stopped waiting for QUIC close acknowledgements");
+            // Reuse an endpoint even if the same account was imported under two
+            // names. Separate endpoints for one identity would displace each
+            // other on relays. Publishers use their own, distinct identities.
+            let mut endpoints = BTreeMap::new();
+            for (_, account) in &accounts {
+                let consumer = iroh::SecretKey::from_bytes(
+                    account
+                        .consumer_identity_secret()
+                        .context("download bundle has no consumer identity")?,
+                );
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    endpoints.entry(consumer.public())
+                {
+                    entry.insert(
+                        Endpoint::builder(presets::N0)
+                            .secret_key(consumer)
+                            .bind()
+                            .await?,
+                    );
+                }
             }
-            drop(endpoint);
+            let iteration = cancellation.child_token();
+            let mut tasks = JoinSet::new();
+            for (workspace, account) in &accounts {
+                let identity = iroh::SecretKey::from_bytes(
+                    account
+                        .consumer_identity_secret()
+                        .expect("validated identity"),
+                )
+                .public();
+                let endpoint = endpoints[&identity].clone();
+                let workspace = workspace.clone();
+                let account = account.clone();
+                let managed = WorkspaceConfig {
+                    name: workspace.name,
+                    shared: shared.clone(),
+                };
+                let token = iteration.child_token();
+                tasks.spawn(async move {
+                    run(
+                        &endpoint,
+                        &workspace.path,
+                        account,
+                        &managed,
+                        refresh_interval,
+                        token,
+                    )
+                    .await
+                });
+            }
+            let result = match tasks.join_next().await {
+                Some(result) => result
+                    .context("SSH workspace task failed")
+                    .and_then(|result| result),
+                None => Err(anyhow::anyhow!("no SSH workspace tasks")),
+            };
+            // A resume rebuilds all endpoints together. Always cancel and drain
+            // every task before removing config or rebinding shared identities.
+            iteration.cancel();
+            while let Some(other) = tasks.join_next().await {
+                if let Err(error) = other
+                    .context("SSH workspace task failed")
+                    .and_then(|result| result)
+                {
+                    tracing::warn!(%error, "SSH workspace stopped during shutdown");
+                }
+            }
+            let unpublished = shared.managed.publish("");
+            shared
+                .snapshots
+                .lock()
+                .map_err(|_| anyhow::anyhow!("SSH configuration lock failed"))?
+                .clear();
+            futures_util::future::join_all(endpoints.values().map(|endpoint| async move {
+                if tokio::time::timeout(Duration::from_secs(3), endpoint.close())
+                    .await
+                    .is_err()
+                {
+                    tracing::debug!("SSH exporter stopped waiting for QUIC close acknowledgements");
+                }
+            }))
+            .await;
+            drop(endpoints);
             unpublished?;
             if result? == RunExit::Shutdown || cancellation.is_cancelled() {
                 return Ok::<_, anyhow::Error>(());
@@ -126,7 +227,12 @@ pub(crate) async fn export(path: &Path, refresh_interval: Duration) -> Result<i3
     };
     tokio::pin!(run);
     eprintln!(
-        "SSH forwarding enabled. Use ssh attached-HOST [command] or ssh attached-ENDPOINT-ID [command]. Discovering hosts every {} seconds; keep this terminal running. Ctrl-C removes the managed Include and temporary keys.",
+        "SSH forwarding enabled for {}. Named workspaces use ssh attached-WORKSPACE--HOST; default keeps attached-HOST. Discovering every {} seconds; keep this terminal running. Ctrl-C removes the managed Include and temporary keys. Restart to change the exported workspace selection.",
+        accounts
+            .iter()
+            .map(|(workspace, _)| workspace.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
         refresh_interval.as_secs()
     );
     let result = tokio::select! {
@@ -172,7 +278,7 @@ async fn run(
     endpoint: &Endpoint,
     path: &Path,
     account: Arc<AccountCredentials>,
-    managed: &ManagedConfig,
+    managed: &WorkspaceConfig,
     refresh_interval: Duration,
     cancellation: CancellationToken,
 ) -> Result<RunExit> {
@@ -228,7 +334,7 @@ async fn run(
                 snapshot = discoveries.recv() => {
                     match snapshot.context("SSH discovery task ended unexpectedly")? {
                         Ok(snapshot) => { known = snapshot; }
-                        Err(error) => eprintln!("Warning: SSH discovery failed: {error:#}; retaining only unexpired hosts and retrying"),
+                        Err(error) => eprintln!("Warning [{}]: SSH discovery failed: {error:#}; retaining only unexpired hosts and retrying", managed.name),
                     }
                 }
                 completed = preparing.join_next(), if !preparing.is_empty() => {
@@ -286,7 +392,7 @@ async fn run(
                     (target, result)
                 });
             }
-            let aliases = aliases(&known);
+            let aliases = aliases(&known, &managed.name);
             let mut configuration = String::new();
             for (target, host) in &running {
                 configuration.push_str(&host.broker.configuration(&aliases[target])?);
@@ -327,7 +433,7 @@ fn preparation_order(
     candidates
 }
 
-fn aliases(hosts: &Snapshot) -> BTreeMap<String, String> {
+fn aliases(hosts: &Snapshot, workspace: &str) -> BTreeMap<String, String> {
     let mut counts = BTreeMap::<String, usize>::new();
     for host in hosts.values() {
         *counts.entry(host.label.to_ascii_lowercase()).or_default() += 1;
@@ -335,12 +441,18 @@ fn aliases(hosts: &Snapshot) -> BTreeMap<String, String> {
     hosts
         .iter()
         .map(|(target, host)| {
-            let stable = format!("attached-{target}");
+            let stable = workspace::ssh_target(workspace, target);
             let label = host.label.to_ascii_lowercase();
             // ID-shaped labels must never impersonate an absent publisher's identity.
             // Case-insensitive duplicates are ambiguous even if one host is offline.
-            let aliases = if counts[&label] == 1 && label.parse::<iroh::EndpointId>().is_err() {
-                format!("{stable} attached-{label}")
+            // Reserve `--` for named workspaces even when a default publisher
+            // has a label shaped like `work--office`. Never let a mutable label
+            // impersonate a workspace-qualified alias (including absent hosts).
+            let aliases = if counts[&label] == 1
+                && label.parse::<iroh::EndpointId>().is_err()
+                && (workspace != workspace::DEFAULT || !label.contains("--"))
+            {
+                format!("{stable} {}", workspace::ssh_target(workspace, &label))
             } else {
                 stable
             };
@@ -434,9 +546,39 @@ mod tests {
     }
 
     #[test]
+    fn workspace_aliases_do_not_collide_or_allow_cross_workspace_label_spoofing() {
+        let (identities, mut hosts) = fixture_hosts();
+        let work = aliases(&hosts, "work");
+        let personal = aliases(&hosts, "personal");
+        assert_eq!(
+            work[&identities[2].to_string()],
+            format!("attached-work--{} attached-work--laptop", identities[2])
+        );
+        for alias in work.values().flat_map(|aliases| aliases.split_whitespace()) {
+            assert!(
+                !personal
+                    .values()
+                    .any(|aliases| aliases.split_whitespace().any(|other| other == alias))
+            );
+        }
+        hosts.get_mut(&identities[2].to_string()).unwrap().label = "work--laptop".into();
+        let default = aliases(&hosts, workspace::DEFAULT);
+        assert_eq!(
+            default[&identities[2].to_string()],
+            format!("attached-{}", identities[2])
+        );
+        // Duplicate labels remain disallowed inside each workspace, even if
+        // the same label is perfectly valid in another workspace.
+        assert_eq!(
+            work[&identities[0].to_string()],
+            format!("attached-work--{}", identities[0])
+        );
+    }
+
+    #[test]
     fn aliases_are_namespaced_case_insensitive_and_never_impersonate_identities() {
         let (identities, hosts) = fixture_hosts();
-        let names = aliases(&hosts);
+        let names = aliases(&hosts, workspace::DEFAULT);
         for id in [&identities[0], &identities[1], &identities[3]] {
             assert_eq!(names[&id.to_string()], format!("attached-{id}"));
         }

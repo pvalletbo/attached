@@ -22,6 +22,9 @@ use crate::{
 
 const ACCOUNT_FILE: &str = "sync-account.bundle";
 const ACCOUNT_LOCK: &str = "sync-account.lock";
+const PUBLISH_FILE: &str = "sync-account.publish.bundle";
+const DOWNLOAD_FILE: &str = "sync-account.download.bundle";
+const ACCOUNT_FILES: [&str; 3] = [ACCOUNT_FILE, PUBLISH_FILE, DOWNLOAD_FILE];
 const MAX_ACCOUNT_STATE_BYTES: usize = MAX_BUNDLE_ENCODED_BYTES;
 const MAX_STORED_ACCOUNT_BYTES: usize = stored_limit(MAX_ACCOUNT_STATE_BYTES);
 
@@ -97,6 +100,49 @@ impl AccountCredentials {
         self.consumer_identity_secret.as_ref()
     }
 
+    fn consumer_public_key(&self) -> Option<AuthorizedConsumerIdentity> {
+        self.authorized_consumer_identity.or_else(|| {
+            self.consumer_identity_secret
+                .map(|secret| ConsumerIdentitySecret::from_bytes(secret).authorized_identity())
+        })
+    }
+
+    fn same_account(&self, other: &Self) -> bool {
+        self.service_origin == other.service_origin
+            && self.account_id == other.account_id
+            && self.account_root_key == other.account_root_key
+            && self.consumer_public_key() == other.consumer_public_key()
+    }
+
+    fn encode(&self) -> Result<String> {
+        let origin = ServiceOrigin::parse(&self.service_origin)
+            .map_err(|_| anyhow::anyhow!("invalid stored service origin"))?;
+        let token = ApiToken::from_bytes(self.api_token);
+        let root = AccountRootKey::from_bytes(self.account_root_key);
+        let bundle = match self.api_key_scope {
+            ApiKeyScope::Publish => ScopedAccountBundle::from_parts(
+                origin,
+                self.account_id,
+                self.api_key_scope,
+                token,
+                root,
+                self.authorized_consumer_identity,
+            ),
+            ApiKeyScope::Download => ScopedAccountBundle::from_download_parts(
+                origin,
+                self.account_id,
+                token,
+                root,
+                ConsumerIdentitySecret::from_bytes(
+                    self.consumer_identity_secret
+                        .context("download bundle has no consumer identity")?,
+                ),
+            ),
+        }
+        .map_err(|_| anyhow::anyhow!("invalid stored account credentials"))?;
+        Ok(AccountBundle::Scoped(bundle).encode())
+    }
+
     pub fn bearer_value(&self) -> String {
         let token = ApiToken::from_bytes(self.api_token);
         let encoded = token.encode();
@@ -107,44 +153,71 @@ impl AccountCredentials {
     }
 }
 
-fn into_export_scope(
-    stored: AccountBundle,
-    required_scope: ApiKeyScope,
-) -> Result<ScopedAccountBundle> {
-    let bundle = match stored {
-        AccountBundle::Scoped(bundle) => bundle,
-        AccountBundle::Owner(bundle) => bundle.into_scoped(required_scope),
-    };
-    ensure!(
-        bundle.api_key_scope() == required_scope,
-        "the configured account bundle is {}-only; a {} bundle is required",
-        scope_name(bundle.api_key_scope()),
-        scope_name(required_scope)
-    );
-    Ok(bundle)
+#[derive(Default)]
+struct StoredAccounts {
+    publish: Option<AccountCredentials>,
+    download: Option<AccountCredentials>,
 }
 
-fn into_operational_scope(
-    stored: AccountBundle,
-    required_scope: ApiKeyScope,
-) -> Result<ScopedAccountBundle> {
-    match (stored, required_scope) {
-        (AccountBundle::Owner(_), ApiKeyScope::Publish) => bail!(
-            "account-creator state also contains the download key and cannot be used by `serve`; start `serve` with a publish bundle on a separate serving host"
-        ),
-        (stored, required_scope) => into_export_scope(stored, required_scope),
+impl StoredAccounts {
+    fn add(&mut self, bundle: AccountBundle) -> Result<()> {
+        if let AccountBundle::Owner(owner) = bundle {
+            self.add(AccountBundle::Scoped(owner.scoped(ApiKeyScope::Publish)))?;
+            return self.add(AccountBundle::Scoped(
+                owner.into_scoped(ApiKeyScope::Download),
+            ));
+        }
+        let AccountBundle::Scoped(bundle) = bundle else {
+            unreachable!()
+        };
+        let credentials = AccountCredentials::from_bundle(bundle);
+        if let Some(existing) = self.publish.as_ref().or(self.download.as_ref()) {
+            ensure!(
+                existing.same_account(&credentials),
+                "a different synchronization account is already configured in this workspace (account, service, encryption key, or consumer identity mismatch); select a different --workspace"
+            );
+        }
+        let slot = match credentials.api_key_scope {
+            ApiKeyScope::Publish => &mut self.publish,
+            ApiKeyScope::Download => &mut self.download,
+        };
+        if let Some(existing) = slot {
+            ensure!(
+                existing.api_token == credentials.api_token,
+                "different credentials for this account role are already configured; refusing to replace them"
+            );
+        } else {
+            *slot = Some(credentials);
+        }
+        Ok(())
+    }
+
+    fn get(&self, scope: ApiKeyScope) -> Option<&AccountCredentials> {
+        match scope {
+            ApiKeyScope::Publish => self.publish.as_ref(),
+            ApiKeyScope::Download => self.download.as_ref(),
+        }
+    }
+
+    fn take(self, scope: ApiKeyScope) -> Option<AccountCredentials> {
+        match scope {
+            ApiKeyScope::Publish => self.publish,
+            ApiKeyScope::Download => self.download,
+        }
     }
 }
 
 pub fn ensure_account_slot_available(state_dir: &Path) -> Result<()> {
     prepare_private_dir(state_dir)?;
     with_exclusive_lock(state_dir, ACCOUNT_LOCK, |directory| {
-        ensure!(
-            directory
-                .read_secret_optional_bounded(ACCOUNT_FILE, MAX_STORED_ACCOUNT_BYTES)?
-                .is_none(),
-            "a synchronization account is already configured"
-        );
+        for name in ACCOUNT_FILES {
+            ensure!(
+                directory
+                    .read_secret_optional_bounded(name, MAX_STORED_ACCOUNT_BYTES)?
+                    .is_none(),
+                "a synchronization account is already configured; select a new --workspace"
+            );
+        }
         Ok(())
     })
 }
@@ -189,41 +262,61 @@ fn export_account_with_store(
     scope: ApiKeyScope,
     store: &dyn MasterKeyStore,
 ) -> Result<String> {
-    let stored = load_stored_account_with_store(state_dir, store)?
-        .context("no synchronization account is configured")?;
-    Ok(AccountBundle::Scoped(into_export_scope(stored, scope)?).encode())
+    let accounts = load_accounts_with_store(state_dir, store)?;
+    accounts
+        .get(scope)
+        .with_context(|| {
+            format!(
+                "no {} credentials are configured in this workspace",
+                scope_name(scope)
+            )
+        })?
+        .encode()
 }
 
 fn install_account(state_dir: &Path, encoded: &[u8], allow_idempotent: bool) -> Result<()> {
     if encoded.len() > MAX_ACCOUNT_STATE_BYTES {
         bail!("account bundle exceeds local state limit");
     }
+    let incoming =
+        AccountBundle::parse(encoded).map_err(|_| anyhow::anyhow!("invalid account bundle"))?;
     prepare_private_dir(state_dir)?;
     with_exclusive_lock(state_dir, ACCOUNT_LOCK, |directory| {
-        if let Some(existing) =
-            directory.read_secret_optional_bounded(ACCOUNT_FILE, MAX_STORED_ACCOUNT_BYTES)?
-        {
-            let legacy = !is_envelope(&existing);
-            let existing = decrypt_account(directory, existing, false)?;
-            if allow_idempotent && existing.as_slice() == encoded {
-                if legacy {
-                    with_master_key(directory, true, |key| {
-                        let encrypted = seal(
-                            key,
-                            Purpose::SyncAccount,
-                            &existing,
-                            MAX_ACCOUNT_STATE_BYTES,
-                        )?;
-                        directory.atomic_replace(ACCOUNT_FILE, &encrypted)
-                    })?;
-                }
-                return Ok(());
-            }
-            anyhow::bail!("a different synchronization account is already configured");
+        // Validate without migrating: a rejected import must not change even
+        // legacy plaintext state. New roles only ever supplement matching accounts.
+        let mut accounts = read_accounts(directory, active_store(), false)?;
+        let occupied = accounts.publish.is_some() || accounts.download.is_some();
+        ensure!(
+            !occupied || allow_idempotent,
+            "a synchronization account is already configured"
+        );
+        let (scope, already_present) = match &incoming {
+            AccountBundle::Scoped(bundle) => (
+                Some(bundle.api_key_scope()),
+                accounts.get(bundle.api_key_scope()).is_some(),
+            ),
+            AccountBundle::Owner(_) => (None, false),
+        };
+        accounts.add(incoming)?;
+        if occupied {
+            // After validating the new role, also protect any legacy primary
+            // bundle. Supplementing it must not leave the original plaintext.
+            read_accounts(directory, active_store(), true)?;
         }
+        if already_present {
+            return Ok(());
+        }
+        let name = if occupied {
+            match scope.context("cannot supplement an account with owner credentials")? {
+                ApiKeyScope::Publish => PUBLISH_FILE,
+                ApiKeyScope::Download => DOWNLOAD_FILE,
+            }
+        } else {
+            ACCOUNT_FILE
+        };
         let installed = with_master_key(directory, true, |key| {
             let encrypted = seal(key, Purpose::SyncAccount, encoded, MAX_ACCOUNT_STATE_BYTES)?;
-            directory.create_noclobber(ACCOUNT_FILE, &encrypted)
+            directory.create_noclobber(name, &encrypted)
         })?;
         if installed {
             Ok(())
@@ -235,17 +328,20 @@ fn install_account(state_dir: &Path, encoded: &[u8], allow_idempotent: bool) -> 
 
 #[tracing::instrument(name = "load_sync_account", level = "debug", skip_all)]
 pub fn load_account(state_dir: &Path, required_scope: ApiKeyScope) -> Result<AccountCredentials> {
-    load_account_optional(state_dir, required_scope)?
-        .context("no synchronization account is configured")
+    load_account_optional(state_dir, required_scope)?.with_context(|| format!(
+        "no {} credentials are configured in this workspace; import a {}-only bundle (a publish bundle never grants consumer access)",
+        scope_name(required_scope), scope_name(required_scope)
+    ))
 }
 
 #[cfg(test)]
 pub fn has_download_account(state_dir: &Path) -> Result<bool> {
-    Ok(match load_stored_account(state_dir)? {
-        None => false,
-        Some(AccountBundle::Scoped(bundle)) => bundle.api_key_scope() == ApiKeyScope::Download,
-        Some(AccountBundle::Owner(_)) => true,
-    })
+    Ok(load_account_optional(state_dir, ApiKeyScope::Download)?.is_some())
+}
+
+pub(crate) fn capabilities(state_dir: &Path) -> Result<(bool, bool)> {
+    let accounts = load_accounts_with_store(state_dir, active_store())?;
+    Ok((accounts.publish.is_some(), accounts.download.is_some()))
 }
 
 #[tracing::instrument(name = "load_optional_sync_account", level = "debug", skip_all)]
@@ -253,46 +349,54 @@ pub fn load_account_optional(
     state_dir: &Path,
     required_scope: ApiKeyScope,
 ) -> Result<Option<AccountCredentials>> {
-    load_stored_account(state_dir)?
-        .map(|stored| {
-            into_operational_scope(stored, required_scope).map(AccountCredentials::from_bundle)
-        })
-        .transpose()
-}
-
-fn load_stored_account(state_dir: &Path) -> Result<Option<AccountBundle>> {
-    load_stored_account_with_store(state_dir, active_store())
+    Ok(load_accounts_with_store(state_dir, active_store())?.take(required_scope))
 }
 
 #[tracing::instrument(name = "read_sync_account", level = "debug", skip_all)]
-fn load_stored_account_with_store(
+fn load_accounts_with_store(
     state_dir: &Path,
     store: &dyn MasterKeyStore,
-) -> Result<Option<AccountBundle>> {
+) -> Result<StoredAccounts> {
     with_locked_existing(state_dir, ACCOUNT_LOCK, |directory| {
-        let Some(encoded) =
-            directory.read_secret_optional_bounded(ACCOUNT_FILE, MAX_STORED_ACCOUNT_BYTES)?
-        else {
-            return Ok(None);
-        };
-        let encoded = decrypt_account_with_store(directory, store, encoded, true)?;
-        AccountBundle::parse(&encoded)
-            .map(Some)
-            .map_err(|_| anyhow::anyhow!("stored synchronization account is invalid"))
+        read_accounts(directory, store, true)
     })
 }
 
-fn decrypt_account(
+fn read_accounts(
     directory: &StateDir,
-    encoded: Zeroizing<Vec<u8>>,
-    migrate_legacy: bool,
-) -> Result<Zeroizing<Vec<u8>>> {
-    decrypt_account_with_store(directory, active_store(), encoded, migrate_legacy)
+    store: &dyn MasterKeyStore,
+    migrate: bool,
+) -> Result<StoredAccounts> {
+    let mut accounts = StoredAccounts::default();
+    for name in ACCOUNT_FILES {
+        let Some(encoded) =
+            directory.read_secret_optional_bounded(name, MAX_STORED_ACCOUNT_BYTES)?
+        else {
+            continue;
+        };
+        let encoded = decrypt_account_with_store(directory, store, name, encoded, migrate)?;
+        let bundle = AccountBundle::parse(&encoded)
+            .map_err(|_| anyhow::anyhow!("stored synchronization account is invalid"))?;
+        if name != ACCOUNT_FILE {
+            let expected = if name == PUBLISH_FILE {
+                ApiKeyScope::Publish
+            } else {
+                ApiKeyScope::Download
+            };
+            ensure!(
+                matches!(&bundle, AccountBundle::Scoped(bundle) if bundle.api_key_scope() == expected),
+                "stored account role does not match its slot"
+            );
+        }
+        accounts.add(bundle)?;
+    }
+    Ok(accounts)
 }
 
 fn decrypt_account_with_store(
     directory: &StateDir,
     store: &dyn MasterKeyStore,
+    name: &str,
     encoded: Zeroizing<Vec<u8>>,
     migrate_legacy: bool,
 ) -> Result<Zeroizing<Vec<u8>>> {
@@ -306,7 +410,7 @@ fn decrypt_account_with_store(
     if migrate_legacy {
         with_master_key_store(directory, store, true, |key| {
             let encrypted = seal(key, Purpose::SyncAccount, &encoded, MAX_ACCOUNT_STATE_BYTES)?;
-            directory.atomic_replace(ACCOUNT_FILE, &encrypted)
+            directory.atomic_replace(name, &encrypted)
         })?;
         tracing::info!(
             event = "local_secret_migrated",
@@ -490,26 +594,29 @@ mod tests {
                 .all(|byte| { byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') })
         );
 
-        let publish = into_export_scope(
-            AccountBundle::parse(encoded.as_bytes()).unwrap(),
-            ApiKeyScope::Publish,
-        )
-        .unwrap();
-        let download = into_export_scope(
-            AccountBundle::parse(encoded.as_bytes()).unwrap(),
-            ApiKeyScope::Download,
-        )
-        .unwrap();
+        let mut accounts = StoredAccounts::default();
+        accounts
+            .add(AccountBundle::parse(encoded.as_bytes()).unwrap())
+            .unwrap();
+        let publish = parse_scoped(
+            &accounts
+                .get(ApiKeyScope::Publish)
+                .unwrap()
+                .encode()
+                .unwrap(),
+        );
+        let download = parse_scoped(
+            &accounts
+                .get(ApiKeyScope::Download)
+                .unwrap()
+                .encode()
+                .unwrap(),
+        );
         assert_eq!(publish.api_key_scope(), ApiKeyScope::Publish);
         assert_eq!(download.api_key_scope(), ApiKeyScope::Download);
+        assert!(publish.consumer_identity_secret().is_none());
+        assert!(download.consumer_identity_secret().is_some());
         assert_same_account_with_distinct_tokens(publish, download);
-        let error = into_operational_scope(
-            AccountBundle::parse(encoded.as_bytes()).unwrap(),
-            ApiKeyScope::Publish,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("cannot be used by `serve`"), "{error}");
     }
 
     #[test]
@@ -536,10 +643,12 @@ mod tests {
         assert_eq!(publish.api_key_scope(), ApiKeyScope::Publish);
         assert_eq!(download.api_key_scope(), ApiKeyScope::Download);
         assert_same_account_with_distinct_tokens(publish, download);
-        let error = load_account(&state, ApiKeyScope::Publish)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("cannot be used by `serve`"), "{error}");
+        assert_eq!(
+            load_account(&state, ApiKeyScope::Publish)
+                .unwrap()
+                .api_key_scope(),
+            ApiKeyScope::Publish
+        );
         assert_eq!(
             load_account(&state, ApiKeyScope::Download)
                 .unwrap()
@@ -576,7 +685,7 @@ mod tests {
         let error = load_account(&publisher_state, ApiKeyScope::Download)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("publish-only"), "{error}");
+        assert!(error.contains("download-only"), "{error}");
     }
 
     #[test]
@@ -609,8 +718,17 @@ mod tests {
         let state = root.path().join("state");
         prepare_private_dir(&state).unwrap();
         let original = AccountBundle::Scoped(fixture_owner().scoped(ApiKeyScope::Publish)).encode();
-        let different =
-            AccountBundle::Scoped(fixture_owner().scoped(ApiKeyScope::Download)).encode();
+        let different = AccountBundle::Scoped(
+            ScopedAccountBundle::from_download_parts(
+                ServiceOrigin::parse("https://other.example").unwrap(),
+                fixture_account_id(),
+                ApiToken::from_bytes([2; 32]),
+                AccountRootKey::from_bytes([3; 32]),
+                ConsumerIdentitySecret::from_bytes([4; 32]),
+            )
+            .unwrap(),
+        )
+        .encode();
         std::fs::write(state.join(ACCOUNT_FILE), original.as_bytes()).unwrap();
         std::fs::set_permissions(
             state.join(ACCOUNT_FILE),
@@ -630,6 +748,152 @@ mod tests {
             std::fs::read(state.join(ACCOUNT_FILE)).unwrap(),
             original.as_bytes()
         );
+    }
+
+    #[test]
+    fn complementary_roles_coexist_in_both_import_orders_without_replacing_state() {
+        for first_scope in [ApiKeyScope::Publish, ApiKeyScope::Download] {
+            let root = crate::test_support::canonical_tempdir();
+            let first = AccountBundle::Scoped(fixture_owner().scoped(first_scope)).encode();
+            let second_scope = if first_scope == ApiKeyScope::Publish {
+                ApiKeyScope::Download
+            } else {
+                ApiKeyScope::Publish
+            };
+            let second = AccountBundle::Scoped(fixture_owner().scoped(second_scope)).encode();
+            import_account(root.path(), first.as_bytes()).unwrap();
+            let primary = std::fs::read(root.path().join(ACCOUNT_FILE)).unwrap();
+            assert!(
+                load_account_optional(root.path(), second_scope)
+                    .unwrap()
+                    .is_none()
+            );
+            import_account(root.path(), second.as_bytes()).unwrap();
+            import_account(root.path(), first.as_bytes()).unwrap();
+            import_account(root.path(), second.as_bytes()).unwrap();
+            assert_eq!(capabilities(root.path()).unwrap(), (true, true));
+            assert_eq!(export_account(root.path(), first_scope).unwrap(), first);
+            assert_eq!(export_account(root.path(), second_scope).unwrap(), second);
+            assert_eq!(
+                std::fs::read(root.path().join(ACCOUNT_FILE)).unwrap(),
+                primary
+            );
+            for name in ACCOUNT_FILES {
+                if let Ok(bytes) = std::fs::read(root.path().join(name)) {
+                    assert!(is_envelope(&bytes));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn adding_a_role_migrates_a_matching_legacy_primary_without_changing_credentials() {
+        let root = crate::test_support::canonical_tempdir();
+        prepare_private_dir(root.path()).unwrap();
+        let publish = AccountBundle::Scoped(fixture_owner().scoped(ApiKeyScope::Publish)).encode();
+        let download =
+            AccountBundle::Scoped(fixture_owner().scoped(ApiKeyScope::Download)).encode();
+        let directory = StateDir::open(root.path()).unwrap();
+        directory
+            .create_noclobber(ACCOUNT_FILE, publish.as_bytes())
+            .unwrap();
+        import_account(root.path(), download.as_bytes()).unwrap();
+        assert!(is_envelope(
+            &std::fs::read(root.path().join(ACCOUNT_FILE)).unwrap()
+        ));
+        assert!(is_envelope(
+            &std::fs::read(root.path().join(DOWNLOAD_FILE)).unwrap()
+        ));
+        assert_eq!(
+            export_account(root.path(), ApiKeyScope::Publish).unwrap(),
+            publish
+        );
+        assert_eq!(
+            export_account(root.path(), ApiKeyScope::Download).unwrap(),
+            download
+        );
+    }
+
+    #[test]
+    fn invalid_supplemental_state_fails_closed_without_replacing_primary_credentials() {
+        let root = crate::test_support::canonical_tempdir();
+        let publish = AccountBundle::Scoped(fixture_owner().scoped(ApiKeyScope::Publish)).encode();
+        let download =
+            AccountBundle::Scoped(fixture_owner().scoped(ApiKeyScope::Download)).encode();
+        import_account(root.path(), publish.as_bytes()).unwrap();
+        import_account(root.path(), download.as_bytes()).unwrap();
+        let primary = std::fs::read(root.path().join(ACCOUNT_FILE)).unwrap();
+        let directory = StateDir::open(root.path()).unwrap();
+        for invalid in [b"corrupt".as_slice(), primary.as_slice()] {
+            directory.atomic_replace(DOWNLOAD_FILE, invalid).unwrap();
+            assert!(load_account(root.path(), ApiKeyScope::Publish).is_err());
+            assert!(load_account(root.path(), ApiKeyScope::Download).is_err());
+            assert!(import_account(root.path(), download.as_bytes()).is_err());
+            assert_eq!(
+                std::fs::read(root.path().join(ACCOUNT_FILE)).unwrap(),
+                primary
+            );
+        }
+    }
+
+    #[test]
+    fn complementary_role_requires_matching_service_account_root_and_consumer() {
+        for (origin, id, key, identity) in [
+            (
+                "https://other.example",
+                fixture_account_id(),
+                [3; 32],
+                [4; 32],
+            ),
+            (
+                "https://sync.example",
+                AccountId::parse("01900000-0000-7000-8000-000000000001").unwrap(),
+                [3; 32],
+                [4; 32],
+            ),
+            (
+                "https://sync.example",
+                fixture_account_id(),
+                [9; 32],
+                [4; 32],
+            ),
+            (
+                "https://sync.example",
+                fixture_account_id(),
+                [3; 32],
+                [9; 32],
+            ),
+        ] {
+            let root = crate::test_support::canonical_tempdir();
+            let publish =
+                AccountBundle::Scoped(fixture_owner().scoped(ApiKeyScope::Publish)).encode();
+            import_account(root.path(), publish.as_bytes()).unwrap();
+            let before = std::fs::read(root.path().join(ACCOUNT_FILE)).unwrap();
+            let download = AccountBundle::Scoped(
+                ScopedAccountBundle::from_download_parts(
+                    ServiceOrigin::parse(origin).unwrap(),
+                    id,
+                    ApiToken::from_bytes([2; 32]),
+                    AccountRootKey::from_bytes(key),
+                    ConsumerIdentitySecret::from_bytes(identity),
+                )
+                .unwrap(),
+            )
+            .encode();
+            let error = import_account(root.path(), download.as_bytes())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("different synchronization account"),
+                "{error}"
+            );
+            assert_eq!(
+                std::fs::read(root.path().join(ACCOUNT_FILE)).unwrap(),
+                before
+            );
+            assert!(!root.path().join(DOWNLOAD_FILE).exists());
+            assert_eq!(capabilities(root.path()).unwrap(), (true, false));
+        }
     }
 
     #[test]
