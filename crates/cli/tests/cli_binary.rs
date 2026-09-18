@@ -2,6 +2,8 @@
 //! behavior (including production encryption/KDF) runs in CARGO_BIN_EXE_attached.
 #[path = "discovery/mod.rs"]
 mod discovery;
+#[path = "encryption/environment.rs"]
+mod encryption_environment;
 #[path = "ssh/export.rs"]
 mod ssh_export;
 #[path = "ssh/renewal.rs"]
