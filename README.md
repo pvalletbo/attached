@@ -5,6 +5,8 @@ It uses the new remote machines feature added in Herdr 0.9.0, which uses SSH to 
 hosts, but hiding the complexity of managing SSH keys and networking details by using ephemeral 
 SSH keys and peer to peer tunnels using [Iroh](https://www.iroh.computer/).
 
+![Attached setup and remote machine access in Herdr](demo/attached-demo.gif)
+
 ## Install
 
 ```bash
