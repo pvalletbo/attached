@@ -50,6 +50,9 @@ enum Command {
     },
 
     /// Publish this machine and serve authorized SSH tunnels.
+    ///
+    /// SSH access is enabled by default for the publish bundle's consumer.
+    /// Commands run as this OS account; stop serving to end access.
     Serve {
         /// Stable label shown for this host in synchronized catalogs.
         #[arg(long)]
@@ -74,8 +77,8 @@ enum Command {
 
     /// Execute a command or a non-PTY shell through an authorized publisher tunnel.
     ///
-    /// Uses system OpenSSH and automatic, connection-scoped keys. Publisher consent:
-    /// `attached ssh-access enable`. Commands run as the publisher's OS account.
+    /// Uses system OpenSSH and automatic, connection-scoped keys.
+    /// Commands run as the publisher's OS account; SSH is enabled by default.
     /// For automatic OpenSSH aliases for all hosts, run `attached export-ssh-config`.
     /// For concurrent relayed connections, use one broker: separate
     /// Attached processes share the consumer Iroh identity and can displace one
@@ -104,7 +107,7 @@ enum Command {
     /// Automatically configure OpenSSH for every authorized host; keep running until Ctrl-C.
     ///
     /// Run once in a terminal, then use `ssh attached-HOST [command]` without symlinks
-    /// or -F. Requires an imported download account and publisher SSH consent.
+    /// or -F. Requires an imported download account and a running publisher.
     /// Installs a reversible Include at the top of ~/.ssh/config, preserving existing
     /// settings. New hosts appear automatically. Duplicate labels use only
     /// attached-ENDPOINT-ID aliases. Ctrl-C, SIGTERM, or SIGHUP removes the Include
@@ -115,14 +118,6 @@ enum Command {
         #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
         refresh_interval: u64,
         #[arg(long, hide = true)]
-        state_dir: Option<PathBuf>,
-    },
-
-    /// Grant or revoke persistent account-level SSH access for the configured consumer.
-    SshAccess {
-        #[command(subcommand)]
-        command: SshAccessCommand,
-        #[arg(long, hide = true, global = true)]
         state_dir: Option<PathBuf>,
     },
 
@@ -157,14 +152,6 @@ enum Command {
         #[arg(short = 'y', long)]
         yes: bool,
     },
-}
-
-#[derive(Subcommand)]
-enum SshAccessCommand {
-    /// Permit arbitrary shell execution as this publisher OS account. Persists until disabled.
-    Enable,
-    /// Reject new SSH connections and cancel existing ones within one second.
-    Disable,
 }
 
 const DEFAULT_SERVICE_ORIGIN: &str = "https://herdr.attached.sh";
@@ -310,11 +297,6 @@ impl Cli {
                 let state_dir = resolved_state_dir(state_dir, &configuration)?;
                 crate::ssh::export(&state_dir, std::time::Duration::from_secs(refresh_interval))
                     .await
-            }
-            Command::SshAccess { command, state_dir } => {
-                let state_dir = resolved_state_dir(state_dir, &configuration)?;
-                crate::ssh::set_access(&state_dir, matches!(command, SshAccessCommand::Enable))?;
-                Ok(0)
             }
             Command::SshLocalProxy { .. } => unreachable!(),
             Command::Account { command } => {
@@ -482,7 +464,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ssh_cli_preserves_openssh_style_commands_and_explicit_consent() {
+    fn ssh_cli_preserves_openssh_style_commands_and_removes_access_toggle() {
         let cli = Cli::try_parse_from(["attached", "ssh", "host", "printf", "%s", "--remote-flag"])
             .unwrap();
         assert!(
@@ -508,7 +490,7 @@ mod tests {
             Cli::try_parse_from(["attached", "ssh", "--expose-config", "host", "cmd"]).is_err()
         );
         for action in ["enable", "disable"] {
-            assert!(Cli::try_parse_from(["attached", "ssh-access", action]).is_ok());
+            assert!(Cli::try_parse_from(["attached", "ssh-access", action]).is_err());
         }
         assert!(Cli::try_parse_from(["attached", "ssh-access"]).is_err());
     }
@@ -759,14 +741,21 @@ mod tests {
             "serve",
             "sessions",
             "ssh",
-            "ssh-access",
             "update",
             "completions",
             "uninstall",
         ] {
             assert!(help.contains(command), "{help}");
         }
-        for removed in ["attach", "connect", "remote", "session", "admin", "sync"] {
+        for removed in [
+            "attach",
+            "connect",
+            "remote",
+            "session",
+            "admin",
+            "sync",
+            "ssh-access",
+        ] {
             assert!(!help.contains(&format!("  {removed}  ")), "{help}");
         }
         assert!(!help.contains(account_clipboard::HELPER_COMMAND), "{help}");
@@ -813,6 +802,7 @@ mod tests {
             assert!(!generated.is_empty(), "empty {shell} completion script");
             assert!(generated.contains("sessions"), "{shell}: {generated}");
             assert!(generated.contains("completions"), "{shell}: {generated}");
+            assert!(!generated.contains("ssh-access"), "{shell}: {generated}");
         }
     }
 

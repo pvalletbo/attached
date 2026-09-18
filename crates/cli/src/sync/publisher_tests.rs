@@ -5,7 +5,7 @@ use attached_session_sync_protocol::crypto::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
-async fn publication_advertises_one_machine_and_tracks_explicit_ssh_consent() {
+async fn publication_advertises_ssh_by_default_and_tracks_account_availability() {
     tokio::time::timeout(Duration::from_secs(15), async {
         let root = crate::test_support::canonical_tempdir();
         let path = root.path().join("publisher");
@@ -19,7 +19,7 @@ async fn publication_advertises_one_machine_and_tracks_explicit_ssh_consent() {
         let record_id = derive_record_id(account.account_id().as_bytes(), identity.as_bytes());
         let response_started = std::cell::Cell::new(None);
         let server = async {
-            for (revision, enabled) in [(1, false), (2, true), (3, false)] {
+            for (revision, enabled) in [(1, true), (2, false), (3, true)] {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut bytes = Vec::new();
                 let (header_end, length) = loop {
@@ -67,9 +67,10 @@ async fn publication_advertises_one_machine_and_tracks_explicit_ssh_consent() {
             assert!(publisher.next_refresh_at.unwrap() <= response_started.get().unwrap() + REPUBLISH_INTERVAL,
                 "HTTP response latency postponed the next publication deadline");
             assert_eq!(publisher.publish_snapshot("office", endpoint.clone(), &key).await.unwrap(), PublishOutcome::Unchanged);
-            crate::ssh::set_access(&path, true).unwrap();
+            assert!(!path.join("ssh-access.json").exists());
+            std::fs::remove_file(path.join("sync-account.bundle")).unwrap();
             assert_eq!(publisher.publish_snapshot("office", endpoint.clone(), &key).await.unwrap(), PublishOutcome::Published { revision: 2 });
-            crate::ssh::set_access(&path, false).unwrap();
+            state::import_account(&path, bundle.as_bytes()).unwrap();
             assert_eq!(publisher.publish_snapshot("office", endpoint, &key).await.unwrap(), PublishOutcome::Published { revision: 3 });
         };
         tokio::join!(server, client);

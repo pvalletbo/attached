@@ -328,6 +328,13 @@ const fn scope_name(scope: ApiKeyScope) -> &'static str {
 pub(crate) mod test_support {
     use super::*;
 
+    pub(crate) fn create_publisher(state_dir: &Path, service_origin: &str) -> Result<()> {
+        let creator = crate::test_support::canonical_tempdir();
+        create_account(creator.path(), service_origin)?;
+        let bundle = export_account(creator.path(), ApiKeyScope::Publish)?;
+        import_account(state_dir, bundle.as_bytes())
+    }
+
     pub(crate) fn create_account(state_dir: &Path, service_origin: &str) -> Result<()> {
         let service_origin = ServiceOrigin::parse(service_origin)
             .map_err(|_| anyhow::anyhow!("invalid sync service origin"))?;
