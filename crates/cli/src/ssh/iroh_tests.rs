@@ -12,8 +12,9 @@ use tokio::time::timeout;
 
 const DEADLINE: Duration = Duration::from_secs(20);
 
-async fn endpoint() -> Endpoint {
+async fn endpoint(key: iroh::SecretKey) -> Endpoint {
     Endpoint::builder(presets::N0)
+        .secret_key(key)
         .clear_ip_transports()
         .bind_addr_with_opts(
             (Ipv4Addr::LOCALHOST, 0),
@@ -51,25 +52,20 @@ struct Harness {
     server: tokio::task::JoinHandle<Result<()>>,
 }
 impl Harness {
-    async fn new(change_policy: impl FnOnce(&mut state::Policy)) -> Self {
+    async fn new(change_account: impl FnOnce(&Path)) -> Self {
+        Self::with_consumer(iroh::SecretKey::from_bytes(&[0x43; 32]), change_account).await
+    }
+
+    async fn with_consumer(key: iroh::SecretKey, change_account: impl FnOnce(&Path)) -> Self {
         let root = crate::test_support::canonical_tempdir();
-        crate::secure_state::prepare_private_dir(root.path()).unwrap();
-        let publisher = endpoint().await;
-        let consumer = endpoint().await;
-        let mut policy = state::Policy {
-            consumer: *consumer.id().as_bytes(),
-            uid: rustix::process::geteuid().as_raw(),
-            username: "attached-test".into(),
-            home: root.path().to_owned(),
-            shell: "/bin/sh".into(),
-            enabled: true,
-            generation: [1; 32],
-        };
-        change_policy(&mut policy);
-        crate::secure_state::StateDir::open(root.path())
-            .unwrap()
-            .atomic_replace("ssh-access.json", &serde_json::to_vec(&policy).unwrap())
+        crate::sync::state::test_support::create_publisher(root.path(), "https://sync.example")
             .unwrap();
+        let publisher = endpoint(iroh::SecretKey::generate()).await;
+        let consumer = endpoint(key).await;
+        let authorized = iroh::SecretKey::from_bytes(&[0x43; 32]).public();
+        let policy = state::policy(root.path(), authorized.as_bytes()).unwrap();
+        assert!(!root.path().join("ssh-access.json").exists());
+        change_account(root.path());
         let (connection, server_connection) = timeout(DEADLINE, async {
             tokio::join!(consumer.connect(publisher.addr(), ALPN), async {
                 publisher.accept().await.unwrap().await
@@ -141,7 +137,7 @@ impl Harness {
         assert!(
             client
                 .authenticate_publickey(
-                    "attached-test",
+                    self.policy.username.clone(),
                     PrivateKeyWithHashAlg::new(Arc::new(self.client_key.clone()), None)
                 )
                 .await
@@ -204,15 +200,23 @@ async fn iroh_multiplexes_shell_commands_and_preserves_binary_eof() {
 }
 
 #[tokio::test]
-async fn iroh_rejects_wrong_consumer_revoked_policy_and_capability() {
-    for mutation in 0..3 {
-        let harness = Harness::new(|policy| match mutation {
-            0 => policy.consumer = [0; 32],
-            1 => policy.enabled = false,
+async fn iroh_rejects_wrong_consumer_missing_or_corrupt_account_and_capability() {
+    for mutation in 0..4 {
+        let key = if mutation == 0 {
+            iroh::SecretKey::generate()
+        } else {
+            iroh::SecretKey::from_bytes(&[0x43; 32])
+        };
+        let harness = Harness::with_consumer(key, |path| match mutation {
+            1 => std::fs::remove_file(path.join("sync-account.bundle")).unwrap(),
+            2 => crate::secure_state::StateDir::open(path)
+                .unwrap()
+                .atomic_replace("sync-account.bundle", b"corrupt")
+                .unwrap(),
             _ => {}
         })
         .await;
-        let capability = if mutation == 2 {
+        let capability = if mutation == 3 {
             CapabilitySecret::generate()
         } else {
             harness.capability.clone()
@@ -229,7 +233,7 @@ async fn iroh_requires_registered_ssh_key_and_exact_username() {
         let mut client = harness.ssh().await;
         assert!(
             !client
-                .authenticate_none("attached-test")
+                .authenticate_none(&harness.policy.username)
                 .await
                 .unwrap()
                 .success()
@@ -242,7 +246,11 @@ async fn iroh_requires_registered_ssh_key_and_exact_username() {
         assert!(
             !client
                 .authenticate_publickey(
-                    if wrong_user { "root" } else { "attached-test" },
+                    if wrong_user {
+                        "not-the-publisher"
+                    } else {
+                        &harness.policy.username
+                    },
                     PrivateKeyWithHashAlg::new(Arc::new(key), None)
                 )
                 .await
@@ -359,14 +367,17 @@ async fn pipelined_environment_denials_preserve_exec_reply_over_iroh() {
 }
 
 #[tokio::test]
-async fn revocation_cancels_active_command_process_group() {
-    let mut harness = Harness::new(|_| {}).await;
+async fn removing_publish_bundle_cancels_active_command_process_group() {
+    let harness = Harness::new(|_| {}).await;
     let client = harness.authenticated().await;
     let mut channel = client.channel_open_session().await.unwrap();
     channel
         .exec(
             true,
-            "printf ready; sleep 2; printf survived >should-not-exist",
+            format!(
+                "printf ready; sleep 2; printf survived >'{}'",
+                harness.root.path().join("should-not-exist").display()
+            ),
         )
         .await
         .unwrap();
@@ -379,14 +390,7 @@ async fn revocation_cancels_active_command_process_group() {
     })
     .await
     .unwrap();
-    harness.policy.enabled = false;
-    crate::secure_state::StateDir::open(harness.root.path())
-        .unwrap()
-        .atomic_replace(
-            "ssh-access.json",
-            &serde_json::to_vec(&harness.policy).unwrap(),
-        )
-        .unwrap();
+    std::fs::remove_file(harness.root.path().join("sync-account.bundle")).unwrap();
     timeout(Duration::from_secs(5), harness.connection.closed())
         .await
         .unwrap();
@@ -396,8 +400,8 @@ async fn revocation_cancels_active_command_process_group() {
 }
 
 #[tokio::test]
-async fn revocation_stops_backpressured_output_without_hanging_shutdown() {
-    let mut harness = Harness::new(|_| {}).await;
+async fn corrupting_publish_bundle_stops_backpressured_output_without_hanging_shutdown() {
+    let harness = Harness::new(|_| {}).await;
     let client = harness.authenticated().await;
     let channel = client.channel_open_session().await.unwrap();
     channel
@@ -406,13 +410,9 @@ async fn revocation_stops_backpressured_output_without_hanging_shutdown() {
         .unwrap();
     // Deliberately never drain channel output.
     tokio::time::sleep(Duration::from_millis(500)).await;
-    harness.policy.enabled = false;
     crate::secure_state::StateDir::open(harness.root.path())
         .unwrap()
-        .atomic_replace(
-            "ssh-access.json",
-            &serde_json::to_vec(&harness.policy).unwrap(),
-        )
+        .atomic_replace("sync-account.bundle", b"corrupt")
         .unwrap();
     timeout(Duration::from_secs(5), harness.connection.closed())
         .await
@@ -428,7 +428,10 @@ async fn channel_close_cleans_up_child_without_interrupting_other_channels() {
     channel
         .exec(
             true,
-            "printf ready; sleep 2; printf survived >should-not-exist",
+            format!(
+                "printf ready; sleep 2; printf survived >'{}'",
+                harness.root.path().join("should-not-exist").display()
+            ),
         )
         .await
         .unwrap();
@@ -508,7 +511,7 @@ async fn system_openssh_exec_over_authenticated_iroh() {
         .arg(harness.root.path().join("key"))
         .arg("-p")
         .arg(port.to_string())
-        .arg("attached-test@127.0.0.1")
+        .arg(format!("{}@127.0.0.1", response.username))
         .arg("cat; printf tail; printf error >&2; exit 7")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

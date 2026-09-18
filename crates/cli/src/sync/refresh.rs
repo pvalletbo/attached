@@ -45,7 +45,7 @@ pub(crate) async fn ssh_host(
     let host = state_catalog::host(state_dir, account, target, super::utc_now_seconds())?;
     ensure!(
         host.ssh_enabled,
-        "SSH access is disabled on this publisher; run `attached ssh-access enable` there"
+        "SSH access is unavailable on this publisher; update Attached and run `attached serve` there"
     );
     Ok(host)
 }

@@ -22,11 +22,10 @@ use tokio_util::sync::CancellationToken;
 pub(crate) use attached_tunnel_protocol::SSH_ALPN as ALPN;
 pub(crate) use client::{connect, local_proxy};
 pub(crate) use export::export;
-pub(crate) use state::set_access;
 const SETUP_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Discovery advertises only explicit consent for the configured consumer and OS account.
-/// Invalid, missing, or inaccessible policy files fail closed, just as connection admission does.
+/// Serving a publish bundle enables SSH for its consumer as the effective OS account.
+/// Invalid, missing, or inaccessible account credentials fail closed at admission too.
 pub(crate) fn access_enabled(path: &Path, consumer: &[u8; 32]) -> bool {
     state::policy(path, consumer).is_ok()
 }
@@ -80,7 +79,7 @@ async fn serve_inner(
     cancellation: CancellationToken,
     master_key: &[u8; 32],
 ) -> Result<()> {
-    // Endpoint hooks have already checked this identity; consent is checked again here,
+    // Endpoint hooks have already checked this identity; authorization is checked again here,
     // and every second for the entire lifetime. No capability can register a key alone.
     let peer = connection.remote_id();
     let permission = state::policy(path, peer.as_bytes())?;
@@ -124,7 +123,10 @@ async fn serve_inner(
             result = &mut service => return result,
             _ = cancellation.cancelled() => { session_cancel.cancel(); return service.await; }
             _ = tick.tick() => {
-                if state::policy(path, peer.as_bytes()).ok().as_ref() != Some(&permission) {
+                // Recheck credentials without spawning an OS directory lookup on every tick.
+                if state::authorize(path, peer.as_bytes()).is_err()
+                    || permission.uid != rustix::process::geteuid().as_raw()
+                {
                     session_cancel.cancel();
                     return service.await;
                 }

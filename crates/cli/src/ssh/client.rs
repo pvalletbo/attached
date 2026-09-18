@@ -98,10 +98,10 @@ async fn open(
     );
     tokio::time::timeout(SETUP_TIMEOUT, async {
         let connection = endpoint.connect(ticket.endpoint_addr().clone(), ALPN).await
-            .context("publisher does not support SSH or is unavailable; update Attached and enable `attached ssh-access enable` on the publisher")?;
+            .context("publisher does not support SSH or is unavailable; update Attached and run `attached serve` on the publisher")?;
         let (mut send, mut receive) = connection.open_bi().await?;
         write_frame(&mut send, &Request { capability: attachment.attach_capability, public_key: public_key.to_owned() }).await?;
-        let response: Response = read_frame(&mut receive).await.context("publisher rejected SSH access; enable `attached ssh-access enable` there, or retry with `--no-cache` after a publisher restart")?;
+        let response: Response = read_frame(&mut receive).await.context("publisher rejected SSH access; verify its publish bundle, or retry with `--no-cache` after a publisher restart")?;
         // Parsing prevents setup metadata from injecting arbitrary known_hosts entries.
         canonical_host_key(&response.host_key)?;
         ensure!(!response.username.is_empty() && response.username.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)), "publisher supplied an unsupported OS username");
