@@ -20,8 +20,7 @@ cargo install --git https://github.com/pvalletbo/attached.git --locked attached
 ```
 
 Run `attached --version` to verify the installation. The client needs OpenSSH (`ssh` and
-`ssh-keygen`). [fzf](https://junegunn.github.io/fzf/) is optional, for choosing a host during remote
-Attached updates. Linux and macOS are supported.
+`ssh-keygen`). Linux and macOS are supported.
 
 ## Connect to your first machine
 
@@ -35,7 +34,7 @@ attached account create
 attached account export --type publish
 ```
 
-On the **publisher**:
+On the **remote machine**:
 
 ```bash
 # Paste the publish bundle when prompted. Keep this process running.
@@ -45,43 +44,26 @@ attached serve --host-label office
 Back on the client:
 
 ```bash
-# Lists SSH-enabled machines, not application sessions.
-attached sessions list
+# One one terminal expose the remote attached clients to the local SSH client
+attached export-ssh-config
 
-# Execute a command. Its exit status is returned by Attached. This confirms that SSH works on the remote host through the P2P tunnel
-attached ssh office uname -a
+# On another terminal add the new host to Herdr
+herdr machine add attached-office --label Office
+
+# Now you are ready to open Herdr and connect to the remote machine
+herdr
 ```
 
-## Discovery and application integration
+## How it works
 
-`attached sessions list` always refreshes discovery and displays:
+You must have two available hosts:
 
-- **HOST**: the publisher's human-readable label;
-- **ENDPOINT ID**: its stable Iroh identity, also usable as an SSH or update target;
-- **ATTACHED**: the running Attached version;
-- **LAST PUBLISH**: the age of the latest authenticated advertisement.
-
-
-```bash
-# Prints a configuration path, then stays in the foreground until Ctrl-C.
-attached ssh --expose-config
-
-# In another terminal, using the printed path and the host's endpoint ID:
-ssh attached-ENDPOINT-ID 'your-remote-command'
-```
-
-Since the machine is accessible as any other SSH remote host, this means that the new machine 
-can be added to Herdr in order to make it appear in the machines list. Run this: 
-
-```bash
-herdr machine add attached-ENDPOINT-ID --label NewMachine
-```
-
-You should see the new machine in the machines list within your running Herdr client.
-
-## How it works and security
+* **Client**: the local host from which you will control the remote session
+* **Publisher**: the remote host serving a Herdr session to the client. This may be any kind of machine,
+as long as it can run Herdr (a Docker container works as well)
 
 ### Establishing the tunnel
+
 
 To connect to a remote machine, the client first establishes a secure peer-to-peer (P2P) channel.
 Attached uses [Iroh](https://www.iroh.computer/) to create an end-to-end encrypted QUIC connection
@@ -104,15 +86,19 @@ synchronization service. The client retrieves and decrypts the descriptor using 
 credentials shared out of band by `attached account export`. The service stores the encrypted
 record but cannot read or modify its contents without detection.
 
-The descriptor contains the publisher's human-readable host label, Iroh endpoint ticket and tunnel
-capability, Attached version, SSH permission advertisement, and publication/expiration times. The
-record is a discovery aid, not a reachability guarantee: advertisements expire, and the client still
-checks the publisher when it connects.
+Apart from sharing the Iroh connection details, the publisher and client need to share information 
+about the active Herdr sessions, such as the hostname and active session names.
+To share this information securely, we rely on a backend service that stores the information in 
+an encrypted form so that it can never read or write the data. The publisher encrypts the information
+and pushes it to the server. The client can then retrieve and decrypt it and start an attachment if 
+active sessions are available. Among other technical details, the following information is shared:
 
-The existing hosted service URL remains `https://herdr.attached.sh`; that domain name does not imply
-a Herdr dependency. Use `attached account create --service https://your-service.example` to choose a
-self-hosted service. The Cloudflare Worker and its credential/storage machinery remain in
-`crates/session-sync-worker`.
+* **Host label**: a descriptive name for the host
+* **Iroh endpoint ticket**: used by the consumer to establish the P2P tunnel
+* **Attach capability**: a shared secret that the consumer must present to authorize the tunnel
+* **Attached version**: the running version of the Attached binary
+* **Herdr version**: the running version of Herdr
+* **Sessions**: a list of the Herdr session names running on the remote machine
 
 ### Security model and limitations
 
@@ -133,8 +119,7 @@ If private keys and encryption keys are not leaked, the design provides these pr
 
 Before application traffic is admitted, Attached checks the account's authorized consumer Iroh
 identity. SSH additionally checks the tunnel capability, explicit publisher consent, a
-connection-scoped client key, and the publisher's pinned SSH host key. A changed host key or OS
-account fails closed; use `--trust-new-host-key` only after independently verifying the change.
+connection-scoped client key, and the publisher's pinned SSH host key. 
 
 Important limitations:
 
