@@ -81,20 +81,60 @@ You should see the new machine in the machines list within your running Herdr cl
 
 ## How it works and security
 
-Iroh uses public-key endpoint identities, address lookup, NAT traversal, and relay fallback to
-establish end-to-end encrypted QUIC connections. See the [Iroh endpoint documentation](https://docs.iroh.computer/concepts/endpoints).
+### Establishing the tunnel
 
-The passive synchronization backend stores authenticated, encrypted host descriptors containing
-the host label, endpoint ticket, tunnel capability, Attached version, SSH permission advertisement,
-and publication/expiration times. It cannot decrypt those descriptors. The existing hosted service
-URL remains `https://herdr.attached.sh`; that domain name does not imply a Herdr dependency.
-Use `attached account create --service https://your-service.example` to choose a self-hosted service.
-The Cloudflare Worker and its credential/storage machinery remain in `crates/session-sync-worker`.
+To connect to a remote machine, the client first establishes a secure peer-to-peer (P2P) channel.
+Attached uses [Iroh](https://www.iroh.computer/) to create an end-to-end encrypted QUIC connection
+rather than implementing its own networking layer. The tunnel protects the bytes exchanged between
+the client and publisher from the synchronization service, relays, and other network observers.
+See the [Iroh endpoint documentation](https://docs.iroh.computer/concepts/endpoints) for more detail.
 
-Connection admission checks the account's authorized consumer Iroh identity before application
-traffic. SSH additionally checks the tunnel capability, explicit publisher consent, a connection-scoped
-client key, and the publisher's pinned SSH host key. A changed host key or OS account fails closed;
-use `--trust-new-host-key` only after independently verifying the change.
+The client needs enough information to identify the publisher and request a connection. In a
+traditional HTTP exchange this would be an IP address, but IP addresses can change. Iroh instead
+uses public-key endpoint identities. Both sides have public/private key pairs, and the publisher's
+identity is used for address lookup. Iroh attempts NAT traversal to establish a direct connection
+and falls back to a relay when the peers cannot reach one another directly. The connection remains
+end-to-end encrypted in either case.
+
+### Sharing discovery information
+
+The publisher and client must also share the information needed to establish the tunnel. The
+publisher encrypts and authenticates a host descriptor, then uploads it to the passive
+synchronization service. The client retrieves and decrypts the descriptor using the account
+credentials shared out of band by `attached account export`. The service stores the encrypted
+record but cannot read or modify its contents without detection.
+
+The descriptor contains the publisher's human-readable host label, Iroh endpoint ticket and tunnel
+capability, Attached version, SSH permission advertisement, and publication/expiration times. The
+record is a discovery aid, not a reachability guarantee: advertisements expire, and the client still
+checks the publisher when it connects.
+
+The existing hosted service URL remains `https://herdr.attached.sh`; that domain name does not imply
+a Herdr dependency. Use `attached account create --service https://your-service.example` to choose a
+self-hosted service. The Cloudflare Worker and its credential/storage machinery remain in
+`crates/session-sync-worker`.
+
+### Security model and limitations
+
+If private keys and encryption keys are not leaked, the design provides these protections:
+
+- **A third party cannot read the connection.** Iroh's end-to-end encryption protects traffic
+  between the client and publisher, including when a relay is used.
+- **The synchronization service cannot connect to a publisher.** It can store and return
+  advertisements, but it does not possess the consumer's private Iroh identity or the credentials
+  required to pass connection admission.
+- **The synchronization service cannot make the client connect to an arbitrary publisher.** Host
+  descriptors are authenticated and encrypted with a key shared by the account, and SSH also pins
+  the publisher's SSH host identity.
+- **A publish-only bundle does not grant consumer access.** Account publishers share the descriptor
+  encryption key, but that key alone does not grant the consumer Iroh identity or SSH permission.
+- **Sensitive local data is encrypted at rest.** Private keys, account bundles, discovery data, and
+  other credentials are protected by the local encryption password or configured password provider.
+
+Before application traffic is admitted, Attached checks the account's authorized consumer Iroh
+identity. SSH additionally checks the tunnel capability, explicit publisher consent, a
+connection-scoped client key, and the publisher's pinned SSH host key. A changed host key or OS
+account fails closed; use `--trust-new-host-key` only after independently verifying the change.
 
 Important limitations:
 
@@ -102,8 +142,6 @@ Important limitations:
   download/owner bundles and their decryption credentials as remote-shell-equivalent secrets.
 - A compromised synchronization service can hide records, deny service, or replay valid
   advertisements until expiration. Authenticated encryption is not an availability guarantee.
-- Account publishers share the descriptor encryption key. That key alone does not grant consumer
-  Iroh identity or SSH permission; do not treat a publish-only bundle as harmless.
 - SSH revocation is local to each publisher. General account-token revocation and per-client
   identities are not yet implemented.
 
