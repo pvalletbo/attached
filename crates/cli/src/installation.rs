@@ -421,8 +421,14 @@ fn ensure_install_directory_is_writable(executable: &Path) -> Result<()> {
 // a custom state directory can safely contain an unrelated `config.toml`.
 const OWNED_STATE_FILES: &[&str] = &[
     "admin-identity.key",
+    "admin-identity.key.lock",
     "sync-account.bundle",
+    "sync-account.publish.bundle",
+    "sync-account.download.bundle",
     "sync-account.lock",
+    "sync-account-mutation.lock",
+    "workspace-index.json",
+    "workspace-index.lock",
     "sync-catalog.json",
     "sync-catalog.lock",
     "host-catalog.json",
@@ -471,22 +477,30 @@ fn unlink_cleanup_file(directory: &fs::File, name: &std::ffi::OsStr) -> Result<(
 }
 
 fn remove_owned_state(path: &Path) -> Result<()> {
-    use rustix::fs::{AtFlags, FileType};
     let parent = path.parent().context("cleanup path has no parent")?;
     let name = path.file_name().context("cleanup path has no file name")?;
     let Some(parent) = open_cleanup_directory(parent)? else {
         return Ok(());
     };
-    match rustix::fs::statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+    remove_owned_state_at(&parent, name, true)
+}
+
+fn remove_owned_state_at(
+    parent: &fs::File,
+    name: &std::ffi::OsStr,
+    workspaces: bool,
+) -> Result<()> {
+    use rustix::fs::{AtFlags, FileType};
+    match rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::Symlink => {
-            return unlink_cleanup_file(&parent, name);
+            return unlink_cleanup_file(parent, name);
         }
         Ok(_) => {}
         Err(rustix::io::Errno::NOENT) => return Ok(()),
         Err(error) => return Err(error.into()),
     }
     let directory = rustix::fs::openat(
-        &parent,
+        parent,
         name,
         rustix::fs::OFlags::RDONLY
             | rustix::fs::OFlags::DIRECTORY
@@ -495,8 +509,61 @@ fn remove_owned_state(path: &Path) -> Result<()> {
         rustix::fs::Mode::empty(),
     )
     .map(fs::File::from)?;
+    if workspaces {
+        remove_registered_workspaces(&directory)?;
+    }
     for name in OWNED_STATE_FILES {
         unlink_cleanup_file(&directory, std::ffi::OsStr::new(name))?;
+    }
+    Ok(())
+}
+
+fn remove_registered_workspaces(directory: &fs::File) -> Result<()> {
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+    use std::io::Read;
+    let index = match rustix::fs::openat(
+        directory,
+        crate::workspace::INDEX,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    ) {
+        Ok(file) => fs::File::from(file),
+        Err(rustix::io::Errno::NOENT) => return Ok(()),
+        Err(error) => {
+            return Err(error).context("refusing unsafe workspace index during uninstall");
+        }
+    };
+    ensure!(
+        index.metadata()?.is_file(),
+        "workspace index is not a regular file"
+    );
+    let mut bytes = Vec::new();
+    index
+        .take(crate::workspace::MAX_INDEX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    let names = crate::workspace::registered_names(Some(&bytes))?;
+    if names.is_empty() {
+        return Ok(());
+    }
+    let name = std::ffi::OsStr::new("workspaces");
+    match rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::Symlink => {
+            return unlink_cleanup_file(directory, name);
+        }
+        Ok(_) => {}
+        Err(rustix::io::Errno::NOENT) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    let workspaces = fs::File::from(rustix::fs::openat(
+        directory,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?);
+    for name in names {
+        // Exactly one level: do not interpret nested indexes or recurse through
+        // unknown directories, even if they happen to be called workspaces.
+        remove_owned_state_at(&workspaces, std::ffi::OsStr::new(&name), false)?;
     }
     Ok(())
 }
@@ -787,6 +854,11 @@ mod tests {
         for name in OWNED_STATE_FILES {
             fs::write(state.join(name), b"synthetic state").unwrap();
         }
+        fs::write(
+            state.join(crate::workspace::INDEX),
+            br#"{"version":1,"selected":"default","names":["default"]}"#,
+        )
+        .unwrap();
         fs::write(&configuration_file, b"synthetic config").unwrap();
         fs::write(xdg_state.join("attached-receipt.json"), b"receipt").unwrap();
         fs::write(&fish_configuration, b"installer path setup").unwrap();
@@ -896,6 +968,91 @@ mod tests {
         assert!(!state.join("sync-account.bundle").exists());
         assert!(!executable.exists());
         assert_eq!(*store.remove_calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn uninstall_removes_only_registered_workspace_state_and_retains_unknown_files() {
+        let root = crate::test_support::canonical_tempdir();
+        let store = crate::workspace::Workspaces::new(root.path()).unwrap();
+        for name in ["work", "personal"] {
+            let workspace = store.resolve(Some(name), true).unwrap();
+            store.register(&workspace).unwrap();
+            for file in [
+                "sync-account.bundle",
+                "sync-account.download.bundle",
+                "sync-account.publish.bundle",
+                "admin-identity.key",
+                "ssh-pins.json",
+            ] {
+                fs::write(workspace.path.join(file), b"managed secret").unwrap();
+            }
+            fs::write(workspace.path.join("notes.txt"), b"keep").unwrap();
+        }
+        fs::create_dir(root.path().join("workspaces/unregistered")).unwrap();
+        fs::write(
+            root.path()
+                .join("workspaces/unregistered/sync-account.bundle"),
+            b"unregistered",
+        )
+        .unwrap();
+        remove_owned_state(root.path()).unwrap();
+        for name in ["work", "personal"] {
+            let path = root.path().join("workspaces").join(name);
+            assert_eq!(fs::read_dir(&path).unwrap().count(), 1);
+            assert_eq!(fs::read(path.join("notes.txt")).unwrap(), b"keep");
+        }
+        assert_eq!(
+            fs::read(
+                root.path()
+                    .join("workspaces/unregistered/sync-account.bundle")
+            )
+            .unwrap(),
+            b"unregistered"
+        );
+        assert!(!root.path().join(crate::workspace::INDEX).exists());
+    }
+
+    #[test]
+    fn uninstall_never_follows_workspace_symlinks_or_unvalidated_names() {
+        for substitute_parent in [false, true] {
+            let root = crate::test_support::canonical_tempdir();
+            let external = crate::test_support::canonical_tempdir();
+            fs::write(external.path().join("sync-account.bundle"), b"external").unwrap();
+            let store = crate::workspace::Workspaces::new(root.path()).unwrap();
+            let workspace = store.resolve(Some("work"), true).unwrap();
+            store.register(&workspace).unwrap();
+            fs::remove_dir(&workspace.path).unwrap();
+            let target = if substitute_parent {
+                let parent = root.path().join("workspaces");
+                fs::remove_dir(&parent).unwrap();
+                parent
+            } else {
+                workspace.path
+            };
+            std::os::unix::fs::symlink(external.path(), &target).unwrap();
+            remove_owned_state(root.path()).unwrap();
+            assert_eq!(
+                fs::read(external.path().join("sync-account.bundle")).unwrap(),
+                b"external"
+            );
+            assert!(!target.is_symlink());
+        }
+        let root = crate::test_support::canonical_tempdir();
+        fs::write(
+            root.path().join("sync-account.bundle"),
+            b"retain until index repaired",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join(crate::workspace::INDEX),
+            br#"{"version":1,"selected":"default","names":["default","../outside"]}"#,
+        )
+        .unwrap();
+        assert!(remove_owned_state(root.path()).is_err());
+        assert_eq!(
+            fs::read(root.path().join("sync-account.bundle")).unwrap(),
+            b"retain until index repaired"
+        );
     }
 
     #[test]

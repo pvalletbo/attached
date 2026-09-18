@@ -10,9 +10,46 @@ use crate::process;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub(crate) struct Host {
+    #[serde(default = "default_workspace")]
+    pub workspace: String,
     pub host: String,
     pub endpoint_id: String,
     pub ssh_target: String,
+}
+
+fn default_workspace() -> String {
+    "default".into()
+}
+
+impl Host {
+    pub(crate) fn key(&self) -> String {
+        // Preserve the pre-workspace seen/pending state for default machines.
+        if self.workspace == "default" {
+            self.endpoint_id.clone()
+        } else {
+            format!("{}/{}", self.workspace, self.endpoint_id)
+        }
+    }
+
+    pub(crate) fn label_target(&self) -> String {
+        self.target(&self.host.to_ascii_lowercase())
+    }
+
+    fn target(&self, host: &str) -> String {
+        if self.workspace == "default" {
+            format!("attached-{host}")
+        } else {
+            format!("attached-{}--{host}", self.workspace)
+        }
+    }
+
+    pub(crate) fn display(&self) -> String {
+        if self.workspace == "default" {
+            self.host.clone()
+        } else {
+            format!("{} / {}", self.workspace, self.host)
+        }
+    }
 }
 
 pub(crate) trait DiscoverySource {
@@ -69,10 +106,21 @@ pub(crate) fn parse_hosts(output: &str) -> Result<Vec<Host>> {
             "invalid Attached host label"
         );
         ensure!(
-            host.ssh_target == format!("attached-{}", host.endpoint_id),
+            !host.workspace.is_empty()
+                && host.workspace.len() <= 32
+                && host.workspace.as_bytes()[0].is_ascii_alphanumeric()
+                && host
+                    .workspace
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-".contains(&b))
+                && !host.workspace.contains("--"),
+            "invalid Attached workspace"
+        );
+        ensure!(
+            host.ssh_target == host.target(&host.endpoint_id),
             "SSH alias does not match stable identity"
         );
-        if let Some(previous) = unique.insert(host.endpoint_id.clone(), host.clone()) {
+        if let Some(previous) = unique.insert(host.key(), host.clone()) {
             ensure!(previous == host, "conflicting Attached identities");
         }
     }
@@ -130,6 +178,27 @@ mod tests {
         let mut conflict = host.clone();
         conflict["host"] = "other".into();
         assert!(parse_hosts(&serde_json::json!([host, conflict]).to_string()).is_err());
+    }
+
+    #[test]
+    fn workspace_metadata_must_match_the_ssh_namespace_and_identity() {
+        let id = "a".repeat(64);
+        let host = serde_json::json!({"workspace": "client-acme", "host": "office", "endpoint_id": id, "ssh_target": format!("attached-client-acme--{id}")});
+        let parsed = parse_hosts(&serde_json::json!([host]).to_string()).unwrap();
+        assert_eq!(parsed[0].key(), format!("client-acme/{id}"));
+        assert_eq!(parsed[0].display(), "client-acme / office");
+        assert_eq!(parsed[0].label_target(), "attached-client-acme--office");
+        for workspace in ["other", "Client", "../escape", "work--office", ""] {
+            let mut invalid = host.clone();
+            invalid["workspace"] = workspace.into();
+            assert!(parse_hosts(&serde_json::json!([invalid]).to_string()).is_err());
+        }
+        let mut default = host.clone();
+        default["workspace"] = "default".into();
+        default["ssh_target"] = format!("attached-{id}").into();
+        let parsed = parse_hosts(&serde_json::json!([host, default]).to_string()).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_ne!(parsed[0].key(), parsed[1].key());
     }
 
     #[test]

@@ -43,47 +43,43 @@ impl Reconciler {
             .collect::<std::collections::BTreeSet<_>>();
         let mut counts = BTreeMap::<String, usize>::new();
         for host in hosts {
-            *counts.entry(host.host.to_ascii_lowercase()).or_default() += 1;
+            *counts.entry(host.label_target()).or_default() += 1;
         }
         self.retry
-            .retain(|id, _| hosts.iter().any(|host| &host.endpoint_id == id));
+            .retain(|id, _| hosts.iter().any(|host| &host.key() == id));
         let mut candidates = hosts.iter().collect::<Vec<_>>();
         // Untried hosts before cooled-down retries. A slow publisher cannot starve
         // later publishers, even if its alias never becomes ready.
-        candidates.sort_by_key(|host| self.retry.get(&host.endpoint_id).copied());
+        candidates.sort_by_key(|host| self.retry.get(&host.key()).copied());
         let mut attempts = 0;
         for host in candidates {
-            if state.seen.contains(&host.endpoint_id) {
+            let key = host.key();
+            if state.seen.contains(&key) {
                 continue;
             }
-            let label = host.host.to_ascii_lowercase();
+            let label = host.label_target();
             let equivalent_label = counts[&label] == 1
-                && !is_endpoint(&label)
-                && targets.contains(&format!("attached-{label}"));
+                && !is_endpoint(&host.host.to_ascii_lowercase())
+                && (host.workspace != "default" || !host.host.contains("--"))
+                && targets.contains(&label);
             if targets.contains(&host.ssh_target) || equivalent_label {
                 // Remember manual/disabled entries too, so a subsequent manual
                 // removal stays removed instead of fighting the user's choice.
-                state.seen.insert(host.endpoint_id.clone());
+                state.seen.insert(key.clone());
             } else {
-                let previous = self.retry.get(&host.endpoint_id).copied();
+                let previous = self.retry.get(&key).copied();
                 if attempts >= 4 || previous.is_some_and(|(deadline, _)| deadline > Instant::now())
                 {
                     continue;
                 }
                 attempts += 1;
                 let failures = previous.map_or(0, |(_, failures)| failures);
-                self.retry.insert(
-                    host.endpoint_id.clone(),
-                    (Instant::now() + INTERVAL, failures),
-                );
+                self.retry
+                    .insert(key.clone(), (Instant::now() + INTERVAL, failures));
                 let display = if counts[&label] == 1 {
-                    host.host.clone()
+                    host.display()
                 } else {
-                    format!(
-                        "{} ({})",
-                        &host.host[..host.host.len().min(60)],
-                        &host.endpoint_id[..8]
-                    )
+                    format!("{} ({})", host.display(), &host.endpoint_id[..8])
                 };
                 let result = async {
                     if !source.ready(host).await? {
@@ -100,7 +96,7 @@ impl Reconciler {
                             (INTERVAL.as_secs() * 2_u64.pow(failures.min(4))).min(300),
                         );
                         self.retry.insert(
-                            host.endpoint_id.clone(),
+                            key.clone(),
                             (Instant::now() + delay, failures.saturating_add(1)),
                         );
                         self.log
@@ -109,10 +105,8 @@ impl Reconciler {
                     }
                     Ok(true) => {}
                 }
-                state.seen.insert(host.endpoint_id.clone());
-                state
-                    .pending
-                    .insert(host.endpoint_id.clone(), display.clone());
+                state.seen.insert(key.clone());
+                state.pending.insert(key, display.clone());
                 self.log
                     .record(format!("Added {display} ({})", host.ssh_target));
             }
@@ -185,6 +179,7 @@ mod tests {
     fn host(byte: u8, label: &str) -> Host {
         let id = format!("{byte:02x}").repeat(32);
         Host {
+            workspace: "default".into(),
             host: label.into(),
             ssh_target: format!("attached-{id}"),
             endpoint_id: id,
@@ -214,6 +209,45 @@ mod tests {
         fake.machines.borrow_mut().clear();
         restarted.poll(&[], &fake, &fake).await.unwrap();
         restarted.poll(&hosts, &fake, &fake).await.unwrap();
+        assert_eq!(fake.adds.borrow().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn workspace_machines_have_independent_labels_and_persistent_seen_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = Fake::default();
+        let hosts = ["default", "work", "personal"]
+            .into_iter()
+            .map(|workspace| {
+                let mut host = host(1, "Office");
+                host.workspace = workspace.into();
+                if workspace != "default" {
+                    host.ssh_target = format!("attached-{workspace}--{}", host.endpoint_id);
+                }
+                host
+            })
+            .collect::<Vec<_>>();
+        // A manual default alias must not suppress another workspace's host.
+        fake.machines.borrow_mut().push("attached-office".into());
+        reconciler(temp.path())
+            .poll(&hosts, &fake, &fake)
+            .await
+            .unwrap();
+        assert_eq!(
+            *fake.adds.borrow(),
+            [
+                (hosts[1].ssh_target.clone(), "work / Office".into()),
+                (hosts[2].ssh_target.clone(), "personal / Office".into()),
+            ]
+        );
+        let stored = State::load(&temp.path().join("discovery-state.json")).unwrap();
+        assert_eq!(stored.seen.len(), 3);
+        assert!(stored.seen.contains(&hosts[0].endpoint_id));
+        fake.machines.borrow_mut().clear();
+        reconciler(temp.path())
+            .poll(&hosts, &fake, &fake)
+            .await
+            .unwrap();
         assert_eq!(fake.adds.borrow().len(), 2);
     }
 

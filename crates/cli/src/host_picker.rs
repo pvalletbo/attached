@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Utc};
 use tokio::{io::AsyncWriteExt, process::Command};
 
-use crate::sync::state_catalog::SyncedHost;
+use crate::{sync::state_catalog::SyncedHost, workspace::Workspace};
 
 /// Returns the stable endpoint identity, never an ambiguous display label.
 pub async fn select(hosts: &[SyncedHost]) -> Result<Option<String>> {
@@ -66,29 +66,64 @@ pub async fn select(hosts: &[SyncedHost]) -> Result<Option<String>> {
 }
 
 /// Public discovery metadata only; never serialize connection descriptors or capabilities.
-pub fn render_json(hosts: &[SyncedHost]) -> Result<String> {
+pub fn render_workspace_json(groups: &[(Workspace, Vec<SyncedHost>)]) -> Result<String> {
     #[derive(serde::Serialize)]
     struct Host<'a> {
+        workspace: &'a str,
         host: &'a str,
         endpoint_id: &'a str,
         ssh_target: String,
         attached_version: String,
         published_at: Option<DateTime<Utc>>,
     }
-    let rows = hosts
+    let rows = groups
         .iter()
-        .map(|host| {
-            let [major, minor, patch] = host.attached_version;
-            Host {
-                host: &host.host,
-                endpoint_id: &host.target,
-                ssh_target: format!("attached-{}", host.target),
-                attached_version: format!("{major}.{minor}.{patch}"),
-                published_at: host.published_at,
-            }
+        .flat_map(|(workspace, hosts)| {
+            hosts.iter().map(move |host| {
+                let [major, minor, patch] = host.attached_version;
+                Host {
+                    workspace: &workspace.name,
+                    host: &host.host,
+                    endpoint_id: &host.target,
+                    ssh_target: workspace.ssh_target(&host.target),
+                    attached_version: format!("{major}.{minor}.{patch}"),
+                    published_at: host.published_at,
+                }
+            })
         })
         .collect::<Vec<_>>();
     Ok(format!("{}\n", serde_json::to_string(&rows)?))
+}
+
+pub fn render_workspace_list(groups: &[(Workspace, Vec<SyncedHost>)]) -> Result<String> {
+    let hosts = groups
+        .iter()
+        .flat_map(|(_, hosts)| hosts.iter().cloned())
+        .collect::<Vec<_>>();
+    let listing = render_list(&hosts)?;
+    let width = groups
+        .iter()
+        .map(|(workspace, _)| workspace.name.len())
+        .max()
+        .unwrap_or(0)
+        .max(9);
+    let mut lines = listing.lines();
+    let mut output = format!(
+        "{:<width$}  {}\n",
+        "WORKSPACE",
+        lines.next().unwrap_or_default()
+    );
+    for (workspace, hosts) in groups {
+        for _ in hosts {
+            writeln!(
+                output,
+                "{:<width$}  {}",
+                workspace.name,
+                lines.next().expect("one line per host")
+            )?;
+        }
+    }
+    Ok(output)
 }
 
 pub fn render_list(hosts: &[SyncedHost]) -> Result<String> {
@@ -180,6 +215,16 @@ fn parse_selection(selected: &str, hosts: &[SyncedHost]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn render_json(hosts: &[SyncedHost]) -> Result<String> {
+        render_workspace_json(&[(
+            Workspace {
+                name: crate::workspace::DEFAULT.into(),
+                path: "/unused".into(),
+            },
+            hosts.to_vec(),
+        )])
+    }
+
     fn hosts() -> Vec<SyncedHost> {
         [1, 2]
             .into_iter()
@@ -226,7 +271,8 @@ mod tests {
         let rows: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         assert_eq!(rows.as_array().unwrap().len(), 2);
         for (row, host) in rows.as_array().unwrap().iter().zip(&hosts) {
-            assert_eq!(row.as_object().unwrap().len(), 5);
+            assert_eq!(row.as_object().unwrap().len(), 6);
+            assert_eq!(row["workspace"], "default");
             assert_eq!(row["host"], "office");
             assert_eq!(row["endpoint_id"], host.target);
             assert_eq!(row["ssh_target"], format!("attached-{}", host.target));
@@ -235,6 +281,35 @@ mod tests {
         assert_eq!(rows[0]["published_at"], "2026-09-17T12:00:00Z");
         assert!(rows[1]["published_at"].is_null());
         assert_eq!(render_json(&[]).unwrap(), "[]\n");
+    }
+
+    #[test]
+    fn combined_listing_keeps_same_labels_and_identities_in_their_workspaces() {
+        let groups = ["work", "personal"]
+            .into_iter()
+            .map(|name| {
+                (
+                    Workspace {
+                        name: name.into(),
+                        path: "/unused".into(),
+                    },
+                    hosts(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let rows: serde_json::Value =
+            serde_json::from_str(&render_workspace_json(&groups).unwrap()).unwrap();
+        assert_eq!(rows[0]["workspace"], "work");
+        assert_eq!(rows[2]["workspace"], "personal");
+        assert_eq!(rows[0]["endpoint_id"], rows[2]["endpoint_id"]);
+        assert_ne!(rows[0]["ssh_target"], rows[2]["ssh_target"]);
+        assert_eq!(
+            rows[0]["ssh_target"],
+            format!("attached-work--{}", groups[0].1[0].target)
+        );
+        let text = render_workspace_list(&groups).unwrap();
+        assert!(text.starts_with("WORKSPACE"));
+        assert_eq!(text.lines().count(), 5);
     }
 
     #[test]

@@ -193,7 +193,9 @@ mod tests {
         assert_eq!(enabled, policy(&publisher, consumer.as_bytes()).unwrap());
         assert!(!publisher.join("ssh-access.json").exists());
         assert!(policy(&publisher, &[0; 32]).is_err());
-        assert!(policy(&creator, consumer.as_bytes()).is_err());
+        // Account creation grants both capabilities, but only an explicit
+        // `serve` process exposes the host. Its runtime policy is publish-scoped.
+        assert_eq!(enabled, policy(&creator, consumer.as_bytes()).unwrap());
 
         let downloader = root.path().join("downloader");
         let bundle = sync::account::export(&creator, ApiKeyScope::Download).unwrap();

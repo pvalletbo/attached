@@ -14,6 +14,7 @@ use crate::{
     config::{self, PasswordSource},
     download_account, host_picker, installation, local_encryption, publish_account, secure_state,
     server, sync,
+    workspace::{self, Workspace, Workspaces},
 };
 
 #[derive(Parser)]
@@ -37,12 +38,26 @@ pub struct Cli {
     #[arg(long, global = true)]
     use_1password: bool,
 
+    /// Select a workspace without changing the default (default: last `workspace use`).
+    #[arg(long, value_name = "NAME", global = true, value_parser = parse_workspace_name)]
+    workspace: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// List workspaces or select the default for subsequent commands.
+    ///
+    /// Create one with `account create --workspace NAME`, import consumer credentials
+    /// with `account import --workspace NAME`, or add a publisher with `serve --workspace NAME`.
+    /// A machine can publish and consume simultaneously. Workspace separation is not an OS sandbox.
+    Workspace {
+        #[command(subcommand)]
+        command: WorkspaceCommand,
+    },
+
     /// Create, export, or import synchronization credentials.
     Account {
         #[command(subcommand)]
@@ -106,14 +121,23 @@ enum Command {
 
     /// Automatically configure OpenSSH for every authorized host; keep running until Ctrl-C.
     ///
-    /// Run once in a terminal, then use `ssh attached-HOST [command]` without symlinks
-    /// or -F. Requires an imported download account and a running publisher.
-    /// Installs a reversible Include at the top of ~/.ssh/config, preserving existing
-    /// settings. New hosts appear automatically. Duplicate labels use only
-    /// attached-ENDPOINT-ID aliases. Ctrl-C, SIGTERM, or SIGHUP removes the Include
+    /// Select --workspace NAME or opt into --all-workspaces, then use
+    /// `ssh attached-WORKSPACE--HOST [command]` without symlinks or -F.
+    /// The default workspace preserves `attached-HOST` aliases. Requires consumer
+    /// credentials and a running publisher. Installs a reversible Include at the
+    /// top of ~/.ssh/config, preserving existing settings. New hosts appear
+    /// automatically within the selected workspaces. Duplicate labels within a
+    /// workspace use only its stable endpoint-ID aliases. Restart to change the
+    /// exported workspace selection. Ctrl-C, SIGTERM, or SIGHUP removes the Include
     /// and temporary keys. Supports Linux and macOS; no background service is installed.
     /// Uses the existing non-PTY command/shell service (not SFTP or port forwarding).
     ExportSshConfig {
+        /// Export all configured consumer workspaces in one broker.
+        /// Named aliases are attached-WORKSPACE--HOST; default keeps attached-HOST.
+        /// Membership is fixed until restart. Uses one Iroh endpoint per consumer identity.
+        #[arg(long, conflicts_with = "workspace")]
+        all_workspaces: bool,
+
         /// Seconds between host discovery refreshes; unavailable hosts are retried.
         #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
         refresh_interval: u64,
@@ -157,10 +181,28 @@ enum Command {
 const DEFAULT_SERVICE_ORIGIN: &str = "https://herdr.attached.sh";
 
 #[derive(Subcommand)]
+enum WorkspaceCommand {
+    /// List names, the selected default, and available publish/consume permissions.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Select the default; already-running publishers/exporters are not changed.
+    Use {
+        #[arg(value_parser = parse_workspace_name)]
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum SessionsCommand {
     /// Refresh and list SSH-enabled machines (not application sessions).
     List {
-        /// Print a JSON array with host labels, stable endpoint IDs, SSH aliases,
+        /// Include all configured consumer workspaces, with workspace labels.
+        #[arg(long, conflicts_with = "workspace")]
+        all_workspaces: bool,
+
+        /// Print a JSON array with workspace names, host labels, stable endpoint IDs, SSH aliases,
         /// Attached versions, and publication times. Never includes credentials.
         #[arg(long)]
         json: bool,
@@ -262,7 +304,57 @@ impl Cli {
         local_encryption::configure_use_one_password(
             self.use_1password || configuration.password_source() == PasswordSource::OnePassword,
         );
+        let workspace_name = self.workspace.as_deref();
         match self.command {
+            Command::Workspace { command } => {
+                ensure!(
+                    workspace_name.is_none(),
+                    "use `workspace use NAME` to change the default; --workspace selects account/connection commands"
+                );
+                let store = Workspaces::new(configuration.config_directory())?;
+                match command {
+                    WorkspaceCommand::Use { name } => {
+                        store.select(&name)?;
+                        eprintln!(
+                            "Default workspace: {name}. Running publishers and exporters are unchanged."
+                        );
+                    }
+                    WorkspaceCommand::List { json } => {
+                        use std::io::IsTerminal;
+                        local_encryption::configure_noninteractive(
+                            !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal(),
+                        );
+                        let (selected, workspaces) = store.list()?;
+                        let mut rows = Vec::new();
+                        let mut rendered =
+                            String::from("  WORKSPACE                         PUBLISH  CONSUME\n");
+                        for workspace in workspaces {
+                            secure_state::prepare_private_dir(&workspace.path)?;
+                            eprintln!("Inspecting workspace `{}`...", workspace.name);
+                            let (publish, consume) = sync::state::capabilities(&workspace.path)
+                                .with_context(|| {
+                                    format!("could not inspect workspace `{}`", workspace.name)
+                                })?;
+                            let active = workspace.name == selected;
+                            rows.push(serde_json::json!({"name": workspace.name, "selected": active, "publish": publish, "consume": consume}));
+                            use std::fmt::Write;
+                            writeln!(
+                                rendered,
+                                "{} {:<32}  {:<7}  {}",
+                                if active { "*" } else { " " },
+                                workspace.name,
+                                if publish { "yes" } else { "no" },
+                                if consume { "yes" } else { "no" }
+                            )?;
+                        }
+                        if json {
+                            rendered = format!("{}\n", serde_json::to_string(&rows)?);
+                        }
+                        write_session_list(&mut stdout().lock(), &rendered)?;
+                    }
+                }
+                Ok(0)
+            }
             Command::Ssh {
                 target,
                 command,
@@ -275,9 +367,10 @@ impl Cli {
                 local_encryption::configure_noninteractive(
                     !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal(),
                 );
-                let state_dir = resolved_state_dir(state_dir, &configuration)?;
+                let (_, workspace) =
+                    resolved_workspace(state_dir, &configuration, workspace_name, false)?;
                 crate::ssh::connect(
-                    &state_dir,
+                    &workspace.path,
                     &target,
                     command,
                     expose_config,
@@ -289,29 +382,41 @@ impl Cli {
             Command::ExportSshConfig {
                 refresh_interval,
                 state_dir,
+                all_workspaces,
             } => {
                 use std::io::IsTerminal;
                 local_encryption::configure_noninteractive(
                     !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal(),
                 );
                 let state_dir = resolved_state_dir(state_dir, &configuration)?;
-                crate::ssh::export(&state_dir, std::time::Duration::from_secs(refresh_interval))
-                    .await
+                let workspaces =
+                    Workspaces::new(&state_dir)?.selection(workspace_name, all_workspaces)?;
+                crate::ssh::export(
+                    workspaces,
+                    std::time::Duration::from_secs(refresh_interval),
+                    all_workspaces,
+                )
+                .await
             }
             Command::SshLocalProxy { .. } => unreachable!(),
             Command::Account { command } => {
                 match command {
                     AccountCommand::Create { service, state_dir } => {
-                        let state_dir = resolved_state_dir(state_dir, &configuration)?;
-                        sync::account::create(&state_dir, &service).await?;
+                        let (store, workspace) =
+                            resolved_workspace(state_dir, &configuration, workspace_name, true)?;
+                        eprintln!("Workspace: {}", workspace.name);
+                        sync::account::create(&workspace.path, &service).await?;
+                        store.register(&workspace)?;
                         eprintln!(
                             "Account created and saved in encrypted local state; no portable account bundle was written."
                         );
                         eprintln!(
-                            "Use `attached account export --type publish` to copy a publish-only bundle, then paste it into `attached serve` on the serving host."
+                            "Use `attached account export --workspace {} --type publish` to copy a publish-only bundle, then paste it into `attached serve --workspace {}` on the serving host.",
+                            workspace.name, workspace.name
                         );
                         eprintln!(
-                            "To add another downloader, export with `attached account export --type download --output account.bundle`, transfer the file securely, then run `attached account import --bundle-file account.bundle` there."
+                            "To add another downloader, export with `attached account export --workspace {} --type download --output account.bundle`, transfer the file securely, then run `attached account import --workspace {} --bundle-file account.bundle` there. Downloaders share one consumer identity; concurrent consumers on separate machines may displace each other on relays.",
+                            workspace.name, workspace.name
                         );
                     }
                     AccountCommand::Import {
@@ -319,21 +424,30 @@ impl Cli {
                         bundle_stdin,
                         state_dir,
                     } => {
-                        let state_dir = resolved_state_dir(state_dir, &configuration)?;
+                        let (store, workspace) =
+                            resolved_workspace(state_dir, &configuration, workspace_name, true)?;
+                        eprintln!("Workspace: {}", workspace.name);
                         download_account::install(
-                            &state_dir,
+                            &workspace.path,
                             bundle_file.as_deref(),
                             bundle_stdin,
                         )?;
+                        store.register(&workspace)?;
+                        eprintln!(
+                            "Use `attached workspace use {}` to select this workspace by default.",
+                            workspace.name
+                        );
                     }
                     AccountCommand::Export {
                         key_type,
                         output,
                         state_dir,
                     } => {
-                        let state_dir = resolved_state_dir(state_dir, &configuration)?;
+                        let (_, workspace) =
+                            resolved_workspace(state_dir, &configuration, workspace_name, false)?;
+                        eprintln!("Workspace: {}", workspace.name);
                         let scope = ApiKeyScope::from(key_type);
-                        let bundle = Zeroizing::new(sync::account::export(&state_dir, scope)?);
+                        let bundle = Zeroizing::new(sync::account::export(&workspace.path, scope)?);
                         if let Some(output) = output {
                             write_account_bundle(&bundle, &output)?;
                         } else {
@@ -362,44 +476,109 @@ impl Cli {
                 bundle_file,
                 state_dir,
             } => {
-                let state_dir = resolved_state_dir(state_dir, &configuration)?;
-                publish_account::ensure_configured(&state_dir, bundle_file.as_deref())?;
-                server::serve(state_dir, host_label).await?;
+                let (store, workspace) =
+                    resolved_workspace(state_dir, &configuration, workspace_name, true)?;
+                eprintln!("Workspace: {}", workspace.name);
+                publish_account::ensure_configured(&workspace.path, bundle_file.as_deref())?;
+                store.register(&workspace)?;
+                eprintln!(
+                    "Publishing into workspace `{}`. Changing the default workspace will not move this publisher.",
+                    workspace.name
+                );
+                eprintln!(
+                    "Authorized consumers receive shell access as this OS user, including potential access to other local workspace credentials. Use separate OS users for separate trust levels."
+                );
+                server::serve(workspace.path, host_label).await?;
                 Ok(0)
             }
             Command::Sessions { command } => match command {
-                SessionsCommand::List { json, state_dir } => {
+                SessionsCommand::List {
+                    json,
+                    state_dir,
+                    all_workspaces,
+                } => {
                     use std::io::IsTerminal;
                     local_encryption::configure_noninteractive(
                         !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal(),
                     );
                     let state_dir = resolved_state_dir(state_dir, &configuration)?;
-                    sync::state::load_account(&state_dir, ApiKeyScope::Download)
-                        .context("`sessions list` requires a download account bundle")?;
-                    let refreshed = sync::refresh::refresh_hosts(&state_dir)
-                        .await
-                        .context("could not refresh synchronized hosts")?;
-                    for warning in refresh_warnings_to_display(&refreshed.warnings, self.verbose) {
-                        eprintln!("Warning: {warning}");
+                    let workspaces =
+                        Workspaces::new(&state_dir)?.selection(workspace_name, all_workspaces)?;
+                    let mut consumers = Vec::new();
+                    for workspace in workspaces {
+                        secure_state::prepare_private_dir(&workspace.path)?;
+                        eprintln!("Discovering workspace `{}`...", workspace.name);
+                        let account = sync::state::load_account_optional(
+                            &workspace.path,
+                            ApiKeyScope::Download,
+                        )
+                        .with_context(|| {
+                            format!("could not unlock workspace `{}`", workspace.name)
+                        })?;
+                        if account.is_none() && all_workspaces {
+                            continue;
+                        }
+                        ensure!(
+                            account.is_some(),
+                            "workspace `{}` has no consumer credentials; import a download-only account bundle",
+                            workspace.name
+                        );
+                        consumers.push(workspace);
+                    }
+                    // Unlock sequentially for predictable password prompts, then
+                    // refresh independently so an offline workspace cannot stall
+                    // the first discovery request for every other workspace.
+                    use futures_util::{StreamExt, stream};
+                    let mut refreshes = stream::iter(consumers)
+                        .map(|workspace| async move {
+                            let result = sync::refresh::refresh_hosts(&workspace.path).await;
+                            (workspace, result)
+                        })
+                        .buffered(4);
+                    let mut groups = Vec::new();
+                    let mut failures = 0;
+                    while let Some((workspace, result)) = refreshes.next().await {
+                        match result {
+                            Ok(refreshed) => {
+                                for warning in
+                                    refresh_warnings_to_display(&refreshed.warnings, self.verbose)
+                                {
+                                    eprintln!("Warning [{}]: {warning}", workspace.name);
+                                }
+                                groups.push((workspace, refreshed.hosts));
+                            }
+                            Err(error) if all_workspaces => {
+                                failures += 1;
+                                eprintln!(
+                                    "Warning [{}]: discovery failed: {error:#}",
+                                    workspace.name
+                                );
+                            }
+                            Err(error) => {
+                                return Err(error).context("could not refresh synchronized hosts");
+                            }
+                        }
                     }
                     let rendered = if json {
-                        host_picker::render_json(&refreshed.hosts)?
+                        host_picker::render_workspace_json(&groups)?
                     } else {
-                        host_picker::render_list(&refreshed.hosts)?
+                        host_picker::render_workspace_list(&groups)?
                     };
                     write_session_list(&mut stdout().lock(), &rendered)?;
-                    Ok(0)
+                    // A partial JSON array remains usable, but scripts can detect an outage.
+                    Ok(if failures == 0 { 0 } else { 1 })
                 }
             },
             Command::Update { remote, state_dir } => {
                 if let Some(target) = remote {
-                    let state_dir = resolved_state_dir(state_dir, &configuration)?;
-                    sync::attached_update::update(&state_dir, target.as_deref(), self.verbose)
+                    let (_, workspace) =
+                        resolved_workspace(state_dir, &configuration, workspace_name, false)?;
+                    sync::attached_update::update(&workspace.path, target.as_deref(), self.verbose)
                         .await?;
                 } else {
                     ensure!(
-                        state_dir.is_none(),
-                        "--state-dir can only be used with --remote"
+                        state_dir.is_none() && workspace_name.is_none(),
+                        "--state-dir and --workspace can only be used with --remote"
                     );
                     installation::update()?;
                 }
@@ -411,6 +590,10 @@ impl Cli {
             }
             Command::Completions { .. } => unreachable!("handled before configuration loading"),
             Command::Uninstall { yes } => {
+                ensure!(
+                    workspace_name.is_none(),
+                    "uninstall removes all local workspaces; --workspace is not supported"
+                );
                 installation::uninstall(yes, configuration.config_directory())?;
                 Ok(0)
             }
@@ -425,6 +608,23 @@ fn refresh_warnings_to_display(
     warnings
         .iter()
         .filter(move |warning| verbosity > 0 || !warning.is_verbose_only())
+}
+
+fn parse_workspace_name(name: &str) -> std::result::Result<String, String> {
+    workspace::validate_name(name).map_err(|error| error.to_string())?;
+    Ok(name.into())
+}
+
+fn resolved_workspace(
+    state_dir: Option<PathBuf>,
+    configuration: &config::Config,
+    name: Option<&str>,
+    allow_new: bool,
+) -> Result<(Workspaces, Workspace)> {
+    let root = resolved_state_dir(state_dir, configuration)?;
+    let store = Workspaces::new(&root)?;
+    let workspace = store.resolve(name, allow_new)?;
+    Ok((store, workspace))
 }
 
 fn resolved_state_dir(
@@ -803,6 +1003,43 @@ mod tests {
             assert!(generated.contains("sessions"), "{shell}: {generated}");
             assert!(generated.contains("completions"), "{shell}: {generated}");
             assert!(!generated.contains("ssh-access"), "{shell}: {generated}");
+        }
+    }
+
+    #[test]
+    fn workspace_selection_is_global_and_aggregate_operations_are_explicit() {
+        for args in [
+            vec!["attached", "workspace", "list", "--json"],
+            vec!["attached", "workspace", "use", "client-acme"],
+            vec!["attached", "--workspace", "work", "account", "create"],
+            vec!["attached", "serve", "--workspace", "personal"],
+            vec!["attached", "account", "import", "--workspace", "work"],
+            vec!["attached", "sessions", "list", "--all-workspaces", "--json"],
+            vec!["attached", "export-ssh-config", "--all-workspaces"],
+            vec![
+                "attached",
+                "update",
+                "--remote",
+                "office",
+                "--workspace",
+                "work",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok());
+        }
+        for args in [
+            vec![
+                "attached",
+                "export-ssh-config",
+                "--workspace",
+                "work",
+                "--all-workspaces",
+            ],
+            vec!["attached", "serve", "--all-workspaces"],
+            vec!["attached", "ssh", "--workspace", "../bad", "office"],
+            vec!["attached", "workspace", "use", "MixedCase"],
+        ] {
+            assert!(Cli::try_parse_from(&args).is_err(), "{args:?}");
         }
     }
 

@@ -89,7 +89,8 @@ async fn json_discovery_refreshes_and_only_reports_ssh_enabled_public_metadata()
                 let rows: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
                 assert_eq!(rows.as_array().unwrap().len(), usize::from(enabled));
                 if enabled {
-                    assert_eq!(rows[0].as_object().unwrap().len(), 5);
+                    assert_eq!(rows[0].as_object().unwrap().len(), 6);
+                    assert_eq!(rows[0]["workspace"], "default");
                     assert_eq!(rows[0]["host"], "remote");
                     assert_eq!(rows[0]["endpoint_id"], identity.to_string());
                     assert_eq!(rows[0]["ssh_target"], format!("attached-{identity}"));
