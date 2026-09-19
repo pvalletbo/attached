@@ -12,6 +12,7 @@ use crate::{identity, secure_state};
 
 const CONFIG_FILE: &str = "config.toml";
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
+const DEFAULT_ONE_PASSWORD_ITEM_TAG: &str = "attached/encryption-password-v1";
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -27,12 +28,14 @@ pub(crate) enum PasswordSource {
 struct FileConfig {
     password_source: PasswordSource,
     config_directory: Option<PathBuf>,
+    one_password_item_tag: Option<String>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct Config {
     password_source: PasswordSource,
     config_directory: PathBuf,
+    one_password_item_tag: String,
 }
 
 impl Config {
@@ -48,6 +51,7 @@ impl Config {
             return Ok(Self {
                 password_source: PasswordSource::default(),
                 config_directory: default_directory,
+                one_password_item_tag: DEFAULT_ONE_PASSWORD_ITEM_TAG.to_owned(),
             });
         };
 
@@ -76,10 +80,29 @@ impl Config {
             "`config_directory` in {} must be an absolute path",
             path.display()
         );
+        let one_password_item_tag = parsed
+            .one_password_item_tag
+            .unwrap_or_else(|| DEFAULT_ONE_PASSWORD_ITEM_TAG.to_owned());
+        ensure!(
+            !one_password_item_tag.trim().is_empty(),
+            "`one_password_item_tag` in {} cannot be empty",
+            path.display()
+        );
+        ensure!(
+            one_password_item_tag.trim() == one_password_item_tag,
+            "`one_password_item_tag` in {} cannot start or end with whitespace",
+            path.display()
+        );
+        ensure!(
+            !one_password_item_tag.chars().any(char::is_control),
+            "`one_password_item_tag` in {} cannot contain control characters",
+            path.display()
+        );
 
         Ok(Self {
             password_source: parsed.password_source,
             config_directory,
+            one_password_item_tag,
         })
     }
 
@@ -89,6 +112,10 @@ impl Config {
 
     pub(crate) fn config_directory(&self) -> &Path {
         &self.config_directory
+    }
+
+    pub(crate) fn one_password_item_tag(&self) -> &str {
+        &self.one_password_item_tag
     }
 }
 
@@ -142,12 +169,13 @@ mod tests {
             Config {
                 password_source: PasswordSource::Password,
                 config_directory: default_directory,
+                one_password_item_tag: DEFAULT_ONE_PASSWORD_ITEM_TAG.to_owned(),
             }
         );
     }
 
     #[test]
-    fn reads_password_source_and_config_directory_from_toml() {
+    fn reads_supported_settings_from_toml() {
         let root = crate::test_support::canonical_tempdir();
         let default_directory = root.path().join("attached");
         fs::create_dir(&default_directory).unwrap();
@@ -155,7 +183,7 @@ mod tests {
         fs::write(
             default_directory.join(CONFIG_FILE),
             format!(
-                "password_source = \"1password\"\nconfig_directory = {:?}\n",
+                "password_source = \"1password\"\nconfig_directory = {:?}\none_password_item_tag = \"org.example.attached/encryption-password-v1\"\n",
                 configured_directory
             ),
         )
@@ -170,6 +198,7 @@ mod tests {
             Config {
                 password_source: PasswordSource::OnePassword,
                 config_directory: configured_directory,
+                one_password_item_tag: "org.example.attached/encryption-password-v1".to_owned(),
             }
         );
     }
@@ -192,6 +221,7 @@ mod tests {
         .unwrap();
         assert_eq!(loaded.password_source, PasswordSource::OnePassword);
         assert_eq!(loaded.config_directory, default_directory);
+        assert_eq!(loaded.one_password_item_tag, DEFAULT_ONE_PASSWORD_ITEM_TAG);
     }
 
     #[test]
@@ -205,6 +235,9 @@ mod tests {
             "password_source = \"keychain\"\n",
             "unknown = true\n",
             "config_directory = \"relative\"\n",
+            "one_password_item_tag = \"\"\n",
+            "one_password_item_tag = \" surrounding-whitespace \"\n",
+            "one_password_item_tag = \"contains\\nnewline\"\n",
         ] {
             fs::write(&path, contents).unwrap();
             assert!(
@@ -244,6 +277,7 @@ mod tests {
             Config {
                 password_source: PasswordSource::OnePassword,
                 config_directory: default_directory,
+                one_password_item_tag: DEFAULT_ONE_PASSWORD_ITEM_TAG.to_owned(),
             }
         );
         assert_eq!(
