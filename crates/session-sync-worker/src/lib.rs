@@ -3,6 +3,7 @@
 mod api;
 mod issuance;
 mod model;
+mod rate_limit;
 mod storage;
 
 use worker::{

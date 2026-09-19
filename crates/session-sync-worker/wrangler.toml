@@ -8,6 +8,14 @@ routes = [
   { pattern = "herdr.attached.sh", zone_name = "attached.sh", custom_domain = true },
 ]
 
+# Anonymous account creation: 5 attempts/minute per IPv4 address or IPv6 /64.
+# These are approximate, per-Cloudflare-location counters, not a global quota.
+# Reserve distinct namespace IDs for production and development in this account.
+[[ratelimits]]
+name = "ACCOUNT_CREATION_RATE_LIMITER"
+namespace_id = "2026091901"
+simple = { limit = 5, period = 60 }
+
 [build]
 command = "worker-build --release"
 
@@ -33,8 +41,13 @@ routes = [
   { pattern = "herdr.dev.attached.sh", zone_name = "attached.sh", custom_domain = true },
 ]
 
-# Bindings are not inherited by named Wrangler environments. The top-level
-# migration list is inherited and applies independently to this Worker.
+[[env.dev.ratelimits]]
+name = "ACCOUNT_CREATION_RATE_LIMITER"
+namespace_id = "2026091902"
+simple = { limit = 5, period = 60 }
+
+# Bindings (including ratelimits) are not inherited by named environments.
+# The top-level migration list is inherited and applies independently to this Worker.
 [env.dev.durable_objects]
 bindings = [
   { name = "ACCOUNTS", class_name = "AccountObject" },

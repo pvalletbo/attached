@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Result, anyhow, bail, ensure};
@@ -16,9 +16,9 @@ use attached_session_sync_protocol::{
     api::{
         AUTHENTICATE_VALUE, CACHE_CONTROL_VALUE, CONTENT_TYPE_JSON, CreateAccountResponse,
         Envelope, HEADER_ETAG, HEADER_RETRY_AFTER, LiveRecordIndex, LiveRecordIndexEntry,
-        STATUS_CREATED, STATUS_METHOD_NOT_ALLOWED, STATUS_NO_CONTENT, STATUS_NOT_FOUND, STATUS_OK,
-        STATUS_PAYLOAD_TOO_LARGE, STATUS_TOO_MANY_REQUESTS, STATUS_UNAUTHORIZED,
-        parse_live_record_index,
+        STATUS_BAD_REQUEST, STATUS_CREATED, STATUS_METHOD_NOT_ALLOWED, STATUS_NO_CONTENT,
+        STATUS_NOT_FOUND, STATUS_OK, STATUS_PAYLOAD_TOO_LARGE, STATUS_TOO_MANY_REQUESTS,
+        STATUS_UNAUTHORIZED, STATUS_UNAVAILABLE, parse_live_record_index,
     },
     limits::{MAX_API_BODY_BYTES, MAX_LIVE_RECORDS},
 };
@@ -60,6 +60,7 @@ struct TestAccount {
 struct LocalWorker {
     client: Client,
     port: u16,
+    environment: &'static str,
     worker_dir: PathBuf,
     state_dir: PathBuf,
     output_path: PathBuf,
@@ -74,10 +75,12 @@ impl LocalWorker {
         temporary: &TempDir,
         state_dir: &Path,
         output_name: &str,
+        environment: &'static str,
     ) -> Result<Self> {
         Ok(Self {
             client,
             port: available_port()?,
+            environment,
             worker_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
             state_dir: state_dir.to_owned(),
             output_path: temporary.path().join(output_name),
@@ -116,7 +119,7 @@ impl LocalWorker {
                 "--port",
             ])
             .arg(self.port.to_string())
-            .args(["--persist-to"])
+            .args(["--env", self.environment, "--persist-to"])
             .arg(&self.state_dir)
             .current_dir(&self.worker_dir)
             .env("WRANGLER_SEND_METRICS", "false")
@@ -434,6 +437,193 @@ async fn create_account(worker: &LocalWorker) -> Result<TestAccount> {
         publish_token,
         download_token,
     })
+}
+
+// Only local workerd accepts a caller-supplied CF-Connecting-IP. Production
+// Cloudflare ingress supplies it; these fixtures simulate distinct clients.
+fn client_ip(ip: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert("cf-connecting-ip", HeaderValue::from_str(ip).unwrap());
+    headers
+}
+
+async fn verify_account_creation_rate_limit(worker: &LocalWorker) -> Result<()> {
+    // Miniflare uses wall-clock-aligned windows. Start at a window boundary,
+    // leaving ample time for the exact threshold assertions even on slow CI.
+    let elapsed = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() % 60;
+    time::sleep(Duration::from_secs(61 - elapsed)).await;
+
+    let ip = "192.0.2.10";
+    for _ in 0..6 {
+        let response = worker
+            .request(Method::GET, "/v1/accounts", client_ip(ip), None)
+            .await?;
+        expect_status(
+            &response,
+            STATUS_METHOD_NOT_ALLOWED,
+            "unmetered wrong method",
+        )?;
+    }
+    let mut created = None;
+    for attempt in 0..5 {
+        // Malformed requests also spend the attempt budget, before body validation.
+        let body: &[u8] = if attempt == 0 { b"" } else { b"not-empty" };
+        let response = worker
+            .request(Method::POST, "/v1/accounts", client_ip(ip), Some(body))
+            .await?;
+        if attempt == 0 {
+            expect_status(&response, STATUS_CREATED, "account within rate limit")?;
+            created = Some(
+                CreateAccountResponse::parse_json(&response.body)
+                    .map_err(|_| anyhow!("rate limit fixture: invalid account response"))?,
+            );
+        } else {
+            expect_status(&response, STATUS_BAD_REQUEST, "malformed creation attempt")?;
+        }
+    }
+
+    for address in [ip, "::ffff:192.0.2.10"] {
+        let mut headers = client_ip(address);
+        headers.insert("x-forwarded-for", HeaderValue::from_static("192.0.2.99"));
+        headers.insert("x-real-ip", HeaderValue::from_static("192.0.2.98"));
+        headers.insert("forwarded", HeaderValue::from_static("for=192.0.2.97"));
+        // Throttling takes precedence even over body-size validation.
+        let response = worker
+            .request(
+                Method::POST,
+                "/v1/accounts",
+                headers,
+                Some(&vec![b'x'; MAX_API_BODY_BYTES + 1]),
+            )
+            .await?;
+        expect_rate_limited(&response)?;
+    }
+
+    let response = worker
+        .request(Method::POST, "/v1/accounts", client_ip("192.0.2.11"), None)
+        .await?;
+    expect_status(&response, STATUS_CREATED, "independent IPv4 budget")?;
+
+    for suffix in 1..=6 {
+        let response = worker
+            .request(
+                Method::POST,
+                "/v1/accounts",
+                client_ip(&format!("2001:db8:1234:5678::{suffix}")),
+                Some(b"not-empty"),
+            )
+            .await?;
+        if suffix <= 5 {
+            expect_status(&response, STATUS_BAD_REQUEST, "IPv6 prefix within budget")?;
+        } else {
+            expect_rate_limited(&response)?;
+        }
+    }
+    let response = worker
+        .request(
+            Method::POST,
+            "/v1/accounts",
+            client_ip("2001:db8:1234:5679::1"),
+            None,
+        )
+        .await?;
+    expect_status(&response, STATUS_CREATED, "independent IPv6 prefix budget")?;
+
+    for address in ["invalid", "192.0.2.1, 192.0.2.2"] {
+        let mut headers = client_ip(address);
+        headers.insert("x-forwarded-for", HeaderValue::from_static("192.0.2.99"));
+        let response = worker
+            .request(Method::POST, "/v1/accounts", headers, Some(b"not-empty"))
+            .await?;
+        expect_status(
+            &response,
+            STATUS_UNAVAILABLE,
+            "invalid edge address fails closed",
+        )?;
+        expect_header(&response, HEADER_RETRY_AFTER, "1", "unavailable retry")?;
+        ensure!(
+            response.body == br#"{"code":"unavailable"}"#,
+            "invalid edge address: unexpected error body"
+        );
+    }
+
+    let (id, publish_token, download_token) = created.unwrap().into_parts();
+    let mut headers = bearer(&publish_token);
+    headers.extend(client_ip(ip));
+    let record_path = format!(
+        "/v1/accounts/{id}/records/{}",
+        RecordId::from_bytes([0x77; 16])
+    );
+    let response = worker
+        .request(
+            Method::PUT,
+            &record_path,
+            headers,
+            Some(&envelope(8, b"unthrottled record")?),
+        )
+        .await?;
+    expect_status(
+        &response,
+        STATUS_CREATED,
+        "publishing from throttled address",
+    )?;
+    let mut headers = bearer(&download_token);
+    headers.extend(client_ip(ip));
+    for path in [
+        "/healthz".to_owned(),
+        format!("/v1/accounts/{id}/records"),
+        record_path,
+    ] {
+        let response = worker
+            .request(Method::GET, &path, headers.clone(), None)
+            .await?;
+        let status = if path == "/healthz" {
+            STATUS_NO_CONTENT
+        } else {
+            STATUS_OK
+        };
+        expect_status(
+            &response,
+            status,
+            "existing account and health remain available",
+        )?;
+    }
+
+    let elapsed = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() % 60;
+    time::sleep(Duration::from_secs(61 - elapsed)).await;
+    let response = worker
+        .request(Method::POST, "/v1/accounts", client_ip(ip), None)
+        .await?;
+    expect_status(
+        &response,
+        STATUS_CREATED,
+        "creation resumes after rate limit window",
+    )
+}
+
+fn expect_rate_limited(response: &ApiResponse) -> Result<()> {
+    expect_status(
+        response,
+        STATUS_TOO_MANY_REQUESTS,
+        "account creation rate limit",
+    )?;
+    expect_header(
+        response,
+        HEADER_RETRY_AFTER,
+        "60",
+        "account creation rate limit",
+    )?;
+    expect_header(
+        response,
+        "content-type",
+        CONTENT_TYPE_JSON,
+        "account creation rate limit",
+    )?;
+    ensure!(
+        response.body == br#"{"code":"rate_limited"}"#,
+        "account creation rate limit: unexpected error body"
+    );
+    Ok(())
 }
 
 async fn verify_authentication(
@@ -991,7 +1181,7 @@ async fn diagnostics(first: &mut LocalWorker, second: &mut LocalWorker) -> Strin
     .join("\n")
 }
 
-async fn run_local_worker_api() -> Result<()> {
+async fn run_local_worker_api(environment: &'static str) -> Result<()> {
     let temporary = Builder::new()
         .prefix("attached-worker-test-")
         .tempdir()
@@ -1003,9 +1193,15 @@ async fn run_local_worker_api() -> Result<()> {
         &temporary,
         &state_dir,
         "first-wrangler-output.log",
+        environment,
     )?;
-    let mut second =
-        LocalWorker::new(client, &temporary, &state_dir, "second-wrangler-output.log")?;
+    let mut second = LocalWorker::new(
+        client,
+        &temporary,
+        &state_dir,
+        "second-wrangler-output.log",
+        environment,
+    )?;
 
     let result = match time::timeout(INTEGRATION_TIMEOUT, async {
         first.start().await?;
@@ -1013,6 +1209,7 @@ async fn run_local_worker_api() -> Result<()> {
         verify_concurrent_last_write_wins(&first).await?;
         verify_index_is_derived_in_record_id_order(&first).await?;
         verify_live_quota(&first).await?;
+        verify_account_creation_rate_limit(&first).await?;
         first.stop().await?;
 
         second.start().await?;
@@ -1048,5 +1245,8 @@ async fn run_local_worker_api() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires worker-build, corepack, pnpm, and local workerd"]
 async fn local_workerd_exercises_api() -> Result<()> {
-    run_local_worker_api().await
+    for environment in ["", "dev"] {
+        run_local_worker_api(environment).await?;
+    }
+    Ok(())
 }
