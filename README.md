@@ -7,6 +7,10 @@ SSH keys and peer to peer tunnels using [Iroh](https://www.iroh.computer/).
 
 ![Attached setup and remote machine access in Herdr](demo/attached-demo.gif)
 
+> [!WARNING]
+> **Disclaimer:** This project has been heavily vibe coded while verifying if the idea worked. 
+> Use at your own risk!
+
 ## Install
 
 ```bash
