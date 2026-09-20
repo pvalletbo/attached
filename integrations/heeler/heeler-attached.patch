@@ -1,0 +1,1624 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 8c8b1cf..fa8195a 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -76,7 +76,7 @@ jobs:
+     # macos-26 ships Xcode 26.x and the iOS 26 simulator runtimes. Pinned
+     # rather than macos-latest for reproducibility.
+     runs-on: macos-26
+-    timeout-minutes: 35
++    timeout-minutes: 65
+     steps:
+       - uses: actions/checkout@v5
+       - uses: actions/setup-node@v5
+@@ -97,6 +97,13 @@ jobs:
+           restore-keys: |
+             spm-${{ runner.os }}-
+ 
++      - name: Install pinned Rust toolchain
++        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
++        with:
++          toolchain: 1.97.1
++      - name: Build Attached transport package
++        run: make attached-client
++
+       - name: Test VPS SSH access scripts
+         run: scripts/test-vps-ssh-access-scripts.sh
+ 
+diff --git a/.gitignore b/.gitignore
+index e17dee1..835fcb8 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -38,3 +38,8 @@ __pycache__/
+ 
+ # Agent workspace (research reports, scratch)
+ .claude/
++
++# Generated from the pinned Attached source by make attached-client
++Packages/AttachedMobile/Artifacts/
++Packages/AttachedMobile/Sources/
++Packages/AttachedMobile/.attached-revision
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 7facdea..6cc000d 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,10 @@ Entries reference the issue that motivated them.
+ 
+ ### Added
+ 
++- Add Hosts through Attached download bundles, retaining the native Console and
++  terminals over Iroh. File uploads and SFTP features are unavailable for these
++  Hosts. ([Attached #107](https://github.com/pvalletbo/attached/pull/107))
++
+ - The Agent terminal shows the session's model, prompt size (as a share of
+   the model's context window, `11.0%`, once omp on the Host has named it),
+   and spend in a strip above the terminal. These are the figures the Agent's own status line
+diff --git a/Heeler.xcodeproj/project.pbxproj b/Heeler.xcodeproj/project.pbxproj
+index 41553bb..5c3f43c 100644
+--- a/Heeler.xcodeproj/project.pbxproj
++++ b/Heeler.xcodeproj/project.pbxproj
+@@ -43,7 +43,7 @@
+ 		1565FE6BD35E1BF904B19595 /* SidebarLayoutVectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F868101495226A8BE768AC9 /* SidebarLayoutVectorTests.swift */; };
+ 		1566E45603CB8F83337BD9C3 /* TerminalAppearanceSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4273AC6F39EB1E015820E614 /* TerminalAppearanceSettingsView.swift */; };
+ 		15F48A8DDF0D76F41D8562A6 /* AgentInputModeSettingsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D588CA22544907E638437FEA /* AgentInputModeSettingsTests.swift */; };
+-		1706E607DD6100E20479457C /* GhosttyTerminal in Frameworks */ = {isa = PBXBuildFile; productRef = 19D717C20DA226346335AFF6 /* GhosttyTerminal */; };
++		1706E607DD6100E20479457C /* AttachedMobile in Frameworks */ = {isa = PBXBuildFile; productRef = 871F0C83DE1F06B72ECC6B1C /* AttachedMobile */; };
+ 		170F2BD0EB0840B197A6475E /* InputShortcutStripPresentation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A001C1028C859D6281E1642 /* InputShortcutStripPresentation.swift */; };
+ 		172661D829E18F72C75B4F13 /* NotificationKeyMirror.swift in Sources */ = {isa = PBXBuildFile; fileRef = C91F0473741A92D7EFA40CBA /* NotificationKeyMirror.swift */; };
+ 		179292D9C3E605BC46282FE0 /* ComposerAttachmentTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4616CECA2722086A6B8B490 /* ComposerAttachmentTests.swift */; };
+@@ -96,7 +96,7 @@
+ 		3541FB43C2803B681D7C619F /* AgentRowRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = EAAD80C58EF11BE6B6F1D7F6 /* AgentRowRenderer.swift */; };
+ 		359A3FA92C332BEC1DA1982C /* NotificationConfigFile.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0E38A3F2A443D311C8FCC218 /* NotificationConfigFile.swift */; };
+ 		3662BE3559CB08401960176C /* AgentNotificationRoutingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B02412C186BA855DFD9379A /* AgentNotificationRoutingTests.swift */; };
+-		3684BDED2C234F399A6758C9 /* GhosttyTheme in Frameworks */ = {isa = PBXBuildFile; productRef = E086C559FC229264CF662993 /* GhosttyTheme */; };
++		3684BDED2C234F399A6758C9 /* GhosttyTerminal in Frameworks */ = {isa = PBXBuildFile; productRef = 19D717C20DA226346335AFF6 /* GhosttyTerminal */; };
+ 		36FB81E449F98DC68A366C2E /* HerdrAPITypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F7065C3BE109D2F52AE3BC2 /* HerdrAPITypes.swift */; };
+ 		3776558F9FD16419AC405116 /* AttachRestorationTraceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D6BD5F61844F525B628AB358 /* AttachRestorationTraceTests.swift */; };
+ 		37C68934DECD9C68B45FDA0F /* DetailCrossfade.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A0E438CAFD221387D974C00 /* DetailCrossfade.swift */; };
+@@ -110,6 +110,7 @@
+ 		3D9E40D07D129463A5580CDD /* NotificationRelaySettingsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5D958EC1516F09B78E346C6 /* NotificationRelaySettingsTests.swift */; };
+ 		3DE1CE95436158C0938EF501 /* AgentSurfaceReplacementTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E9B93EC423746B334EF06419 /* AgentSurfaceReplacementTests.swift */; };
+ 		3ECC4677BDBD122A9ABF9CAF /* StartAgentStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84DA8573DB6A7EBC95A57F2F /* StartAgentStoreTests.swift */; };
++		3F16079E304E138A65E300FA /* AttachedBlockingWork.swift in Sources */ = {isa = PBXBuildFile; fileRef = E2D58D0D2928F5FEB0B8A7EF /* AttachedBlockingWork.swift */; };
+ 		3FF9CAFABBAF0AC741941C26 /* AgentListFieldsAddFieldSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = E24C0B60FDE0AD3D3ABD13E4 /* AgentListFieldsAddFieldSheet.swift */; };
+ 		4027E44B8C29A7A41175CBE6 /* InputShortcutStripPresentationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D8C7ED93EA20FF003EB8ACE /* InputShortcutStripPresentationTests.swift */; };
+ 		405A7A8AE730C7ABD606DAD7 /* LiveActivityControlling.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4B83DAB243F0D4C697FA3B8 /* LiveActivityControlling.swift */; };
+@@ -178,6 +179,7 @@
+ 		61F58007C6B81F14D2F6B58B /* ClosePaneStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 414B652A16576BEDEE9AE000 /* ClosePaneStoreTests.swift */; };
+ 		629B85E9314A5CBA36B66DBD /* NotificationVectorFile.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2DAE3FAB8786392318939A6 /* NotificationVectorFile.swift */; };
+ 		630CF9C336B79F04A9477C58 /* PushRegistrationStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BEE35062339F9D6B0A9E684B /* PushRegistrationStoreTests.swift */; };
++		632EB308037206A9108E93BE /* AttachedTransportTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 230C3D66D9CBA28C95440910 /* AttachedTransportTests.swift */; };
+ 		6372378951B3680EE77D667E /* AgentActivityContentBuilderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A8CFADE255E1F943BC2DCED5 /* AgentActivityContentBuilderTests.swift */; };
+ 		637B8BBB6F06AD8290874101 /* SnippetStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C17F006C341136811D0496E6 /* SnippetStore.swift */; };
+ 		63ADBED637BEA84B045BE9FC /* DeviceKeyStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = D24E7FB55E1DF14C8353ABDE /* DeviceKeyStore.swift */; };
+@@ -298,6 +300,7 @@
+ 		A65D5B9E1A885A8287AD762C /* SolvingOrbRendererTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F979754410821940D0C4DEC /* SolvingOrbRendererTests.swift */; };
+ 		A6747734905576A8861C945A /* AgentFocusCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 370A6461E16FB281B88126B4 /* AgentFocusCoordinator.swift */; };
+ 		AA6498ABD1E1782C0B5D8F5B /* ConsoleStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00807A3942817BEE9800534F /* ConsoleStoreTests.swift */; };
++		AB4C1A3E5D4844661575102D /* AttachedHostImportView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E8844FE9E8F80D479CD1FFD4 /* AttachedHostImportView.swift */; };
+ 		AC0A24DC308EEBBAC1A04A7A /* AgentRouteTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 08B2655F8FDE37EAC2615457 /* AgentRouteTests.swift */; };
+ 		AE7E2063C7A908DFECE9FB98 /* NotificationRelaySettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 90A97F1827BC65B4A271F28C /* NotificationRelaySettings.swift */; };
+ 		AEE3EAD6534D2D9774BBDB1E /* SkillContentSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = BFB68C31A4C8A5EE1BAE32EC /* SkillContentSheet.swift */; };
+@@ -356,6 +359,7 @@
+ 		CAEA10BC9AF3498E5FD73478 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 915C9462A4A8AA91C0B91498 /* PrivacyInfo.xcprivacy */; };
+ 		CBAEF7D1E91053F0B15E2F31 /* PairingCeremonyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1F0763484EE05424146492C1 /* PairingCeremonyTests.swift */; };
+ 		CCEBF66BA9AFE64EDD371A78 /* AttachUserMessageIndex.swift in Sources */ = {isa = PBXBuildFile; fileRef = 85BEE99E7BEFA0D0D985162C /* AttachUserMessageIndex.swift */; };
++		CFAA6CEE9088E0F35A100FFB /* GhosttyTerminal in Frameworks */ = {isa = PBXBuildFile; productRef = BE53F92F352D5CEE9A715FA9 /* GhosttyTerminal */; };
+ 		D08663BD250210835FE7ED49 /* PhotosPickerImageSelection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A3BD235B5209892137FCAF9 /* PhotosPickerImageSelection.swift */; };
+ 		D20C025851965986547FAAB5 /* ClosePaneStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1D46328CE795C513FE11AD04 /* ClosePaneStore.swift */; };
+ 		D2405D8443F085D4E3CD1810 /* NotificationKeyStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = DC6D0361E0EB15681156D5C7 /* NotificationKeyStore.swift */; };
+@@ -365,6 +369,7 @@
+ 		D5750879A465E0B27C9B4431 /* TerminalAttachTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 07528112F1EC851708049E85 /* TerminalAttachTests.swift */; };
+ 		D618F80B03AABC27797586A1 /* HeelerSSH in Frameworks */ = {isa = PBXBuildFile; productRef = 6B0C40F1407743FF92CC9242 /* HeelerSSH */; };
+ 		D6620368048468EFA09B4142 /* HostOnboardingStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D961656A6D8B4F3964740BD /* HostOnboardingStoreTests.swift */; };
++		D6B61CDF8C3B0EFE3E269415 /* GhosttyTheme in Frameworks */ = {isa = PBXBuildFile; productRef = E086C559FC229264CF662993 /* GhosttyTheme */; };
+ 		D6FBEC56A26E35A32CF2417A /* TerminalKeyModifiersTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B99CB61015DC220A2D9306A /* TerminalKeyModifiersTests.swift */; };
+ 		D7DD62B232DBA9CE8C89AFDD /* NotificationKeyMirrorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D55C5296892657D59171DFE /* NotificationKeyMirrorTests.swift */; };
+ 		D7E0DBBBC8229F24218C8958 /* TerminalRetentionBudget.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8ED55B6D7C29BC534BC116FE /* TerminalRetentionBudget.swift */; };
+@@ -394,6 +399,7 @@
+ 		E2F51D71F8D6E3AF5FD1B9E8 /* SealedEnvelopeCodec.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7BE9C95E2AC313465A7B38FD /* SealedEnvelopeCodec.swift */; };
+ 		E379C1AD65B445D4E08614CF /* AgentNameTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 64D3B8E2EB97A8376B333914 /* AgentNameTests.swift */; };
+ 		E40D1C6F825ABCD68AA5F196 /* AttachTerminalStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8C5A562F5A01AE08691B8479 /* AttachTerminalStoreTests.swift */; };
++		E42FDDF1893954179E36501C /* AttachedTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 49EC495316E0CA4703B13300 /* AttachedTransport.swift */; };
+ 		E521D6779F4C453B6E098F14 /* TerminalFontSettingsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 427512344847A84699F819A0 /* TerminalFontSettingsTests.swift */; };
+ 		E563373DB446DBEF8B1701E3 /* DeviceKeyStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7FCA00B5F2A05A599D74FCCE /* DeviceKeyStoreTests.swift */; };
+ 		E68A1DDFA6C5F618BBB79AB7 /* AgentLayoutErrorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 66B70100FB78F319E7136652 /* AgentLayoutErrorView.swift */; };
+@@ -437,7 +443,7 @@
+ 		FE387FB6FB6CC68E066B23AE /* HostCredentialsProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0DBBD602AA4969937A9306C3 /* HostCredentialsProvider.swift */; };
+ 		FE66019721BB44E8BAD287DB /* AgentActivityEnvelopeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7E3DCBFDF3ED4A63CBC1B3C /* AgentActivityEnvelopeTests.swift */; };
+ 		FEC497C4A95E5F4D945EF3BA /* EventsSessionSubscriptionsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 39AD641EA732307D72698216 /* EventsSessionSubscriptionsTests.swift */; };
+-		FF4620613A476ADEB25FBA96 /* GhosttyTerminal in Frameworks */ = {isa = PBXBuildFile; productRef = BE53F92F352D5CEE9A715FA9 /* GhosttyTerminal */; };
++		FF4620613A476ADEB25FBA96 /* AttachedMobile in Frameworks */ = {isa = PBXBuildFile; productRef = ED9E7A1EE8B6F1DD04A3F430 /* AttachedMobile */; };
+ 		FF96BFEF61D9D20912230256 /* LiveActivityVectorFile.swift in Sources */ = {isa = PBXBuildFile; fileRef = C5469F0188E985276A49871C /* LiveActivityVectorFile.swift */; };
+ 		FFFDB4A4BE267D1C933B0CB7 /* TerminalSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A3319D35C3BBCD2CB151843 /* TerminalSettings.swift */; };
+ /* End PBXBuildFile section */
+@@ -542,6 +548,7 @@
+ 		1F0763484EE05424146492C1 /* PairingCeremonyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairingCeremonyTests.swift; sourceTree = "<group>"; };
+ 		20F8AC685DA90F638BF187DA /* SkillSuggestionTrigger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SkillSuggestionTrigger.swift; sourceTree = "<group>"; };
+ 		21B19CA0EB3B37BB6C50BA4B /* HeelerWidgets.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = HeelerWidgets.entitlements; sourceTree = "<group>"; };
++		230C3D66D9CBA28C95440910 /* AttachedTransportTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AttachedTransportTests.swift; sourceTree = "<group>"; };
+ 		233075006FC2C8907BBFF40F /* GitBranchNameTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitBranchNameTests.swift; sourceTree = "<group>"; };
+ 		239FD696B72E804AE3D85D72 /* ComposerStagingStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ComposerStagingStoreTests.swift; sourceTree = "<group>"; };
+ 		247FF74AD248F26A072EA263 /* TerminalKeyboard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalKeyboard.swift; sourceTree = "<group>"; };
+@@ -597,6 +604,7 @@
+ 		48EF1E70193168E3794D6266 /* SkeletonTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SkeletonTests.swift; sourceTree = "<group>"; };
+ 		48F025CF6E2C3068BF911290 /* IBMPlexMono-Regular.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "IBMPlexMono-Regular.ttf"; sourceTree = "<group>"; };
+ 		4997A79DA8D98F7BA97E60F6 /* TerminalMouseReporting.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalMouseReporting.swift; sourceTree = "<group>"; };
++		49EC495316E0CA4703B13300 /* AttachedTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AttachedTransport.swift; sourceTree = "<group>"; };
+ 		4A6481A3DABC8178E3FA8EF7 /* AgentSessionUsageTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentSessionUsageTests.swift; sourceTree = "<group>"; };
+ 		4AB8C5EA497D1094E86F69C4 /* WeakNetworkE2ETests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WeakNetworkE2ETests.swift; sourceTree = "<group>"; };
+ 		4C07BE449E30F431C247AF01 /* TerminalFullKeyboardLayoutTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalFullKeyboardLayoutTests.swift; sourceTree = "<group>"; };
+@@ -781,6 +789,7 @@
+ 		B64F59C086BFF5B062ADCE8C /* ScriptedTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScriptedTransport.swift; sourceTree = "<group>"; };
+ 		B6A9489C21BDCFA7616782BF /* AgentLiveActivityWidget.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentLiveActivityWidget.swift; sourceTree = "<group>"; };
+ 		B6C5732C32E96A6C433D82B7 /* LicenseNotices.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LicenseNotices.swift; sourceTree = "<group>"; };
++		BB2BB2E1A166D45EC5C5DD9A /* AttachedMobile */ = {isa = PBXFileReference; lastKnownFileType = folder; name = AttachedMobile; path = Packages/AttachedMobile; sourceTree = SOURCE_ROOT; };
+ 		BB47B059A9FC5B8A63C834F2 /* AttachmentStaging.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AttachmentStaging.swift; sourceTree = "<group>"; };
+ 		BBD76A6D34E9A458C7E07ED0 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+ 		BC019B4A164A7B01F1D46344 /* TerminalKeysKeyboard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalKeysKeyboard.swift; sourceTree = "<group>"; };
+@@ -849,11 +858,13 @@
+ 		E088B83BDB55BAFA2D41450F /* HostLatencyFormatting.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HostLatencyFormatting.swift; sourceTree = "<group>"; };
+ 		E0B72AE2059C59D8A59C9B2A /* AppActivityCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppActivityCoordinator.swift; sourceTree = "<group>"; };
+ 		E24C0B60FDE0AD3D3ABD13E4 /* AgentListFieldsAddFieldSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentListFieldsAddFieldSheet.swift; sourceTree = "<group>"; };
++		E2D58D0D2928F5FEB0B8A7EF /* AttachedBlockingWork.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AttachedBlockingWork.swift; sourceTree = "<group>"; };
+ 		E48CA996470393ED037D0364 /* AgentRoute.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentRoute.swift; sourceTree = "<group>"; };
+ 		E4F4EF125BAB77F0DE121AAB /* DeviceKey.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceKey.swift; sourceTree = "<group>"; };
+ 		E70C49925D454207F859F897 /* HeelerSSHHostKeyPolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HeelerSSHHostKeyPolicyTests.swift; sourceTree = "<group>"; };
+ 		E75D3D1E1411C63AE7360D30 /* SidebarConsoleIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SidebarConsoleIntegrationTests.swift; sourceTree = "<group>"; };
+ 		E7F93F9925E94FF2C2B0254B /* AgentDirectInputChrome.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentDirectInputChrome.swift; sourceTree = "<group>"; };
++		E8844FE9E8F80D479CD1FFD4 /* AttachedHostImportView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AttachedHostImportView.swift; sourceTree = "<group>"; };
+ 		E9B93EC423746B334EF06419 /* AgentSurfaceReplacementTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentSurfaceReplacementTests.swift; sourceTree = "<group>"; };
+ 		E9F961651EBA7FE1BEE00647 /* AppModelActivityDriverTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModelActivityDriverTests.swift; sourceTree = "<group>"; };
+ 		E9FD6FF5FE83C022600169BE /* AgentSkill.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentSkill.swift; sourceTree = "<group>"; };
+@@ -900,8 +911,9 @@
+ 			buildActionMask = 2147483647;
+ 			files = (
+ 				D618F80B03AABC27797586A1 /* HeelerSSH in Frameworks */,
+-				1706E607DD6100E20479457C /* GhosttyTerminal in Frameworks */,
+-				3684BDED2C234F399A6758C9 /* GhosttyTheme in Frameworks */,
++				1706E607DD6100E20479457C /* AttachedMobile in Frameworks */,
++				3684BDED2C234F399A6758C9 /* GhosttyTerminal in Frameworks */,
++				D6B61CDF8C3B0EFE3E269415 /* GhosttyTheme in Frameworks */,
+ 			);
+ 			runOnlyForDeploymentPostprocessing = 0;
+ 		};
+@@ -910,7 +922,8 @@
+ 			buildActionMask = 2147483647;
+ 			files = (
+ 				8DF7095F918DBDA5B76F24F1 /* HeelerSSH in Frameworks */,
+-				FF4620613A476ADEB25FBA96 /* GhosttyTerminal in Frameworks */,
++				FF4620613A476ADEB25FBA96 /* AttachedMobile in Frameworks */,
++				CFAA6CEE9088E0F35A100FFB /* GhosttyTerminal in Frameworks */,
+ 			);
+ 			runOnlyForDeploymentPostprocessing = 0;
+ 		};
+@@ -964,6 +977,7 @@
+ 				0B248F9372687FDBE3AD24A1 /* AppForegroundRecoveryTests.swift */,
+ 				E9F961651EBA7FE1BEE00647 /* AppModelActivityDriverTests.swift */,
+ 				93417EFE29FA2DC3DD3FAF9F /* AsyncDeadlineTests.swift */,
++				230C3D66D9CBA28C95440910 /* AttachedTransportTests.swift */,
+ 				D6BD5F61844F525B628AB358 /* AttachRestorationTraceTests.swift */,
+ 				8C5A562F5A01AE08691B8479 /* AttachTerminalStoreTests.swift */,
+ 				AE9AF5C6F7066900959E7E10 /* AttachUserMessageIndexTests.swift */,
+@@ -1183,6 +1197,7 @@
+ 		4892D7AF177E633F713692C3 /* Hosts */ = {
+ 			isa = PBXGroup;
+ 			children = (
++				E8844FE9E8F80D479CD1FFD4 /* AttachedHostImportView.swift */,
+ 				32AE04F29C794799B45E5C68 /* Host.swift */,
+ 				0DBBD602AA4969937A9306C3 /* HostCredentialsProvider.swift */,
+ 				F3A63EFEB7D00E59949CF331 /* HostDraft.swift */,
+@@ -1363,6 +1378,7 @@
+ 		80BAAF0BFB8E96E9532F0F06 /* Packages */ = {
+ 			isa = PBXGroup;
+ 			children = (
++				BB2BB2E1A166D45EC5C5DD9A /* AttachedMobile */,
+ 				4582B5EA42CFA9C8878E6207 /* HeelerSSH */,
+ 			);
+ 			path = Packages;
+@@ -1416,6 +1432,8 @@
+ 			children = (
+ 				3A383F050585E92B29A100E2 /* AgentModelProbe.swift */,
+ 				C25E1DC34365B2E2FA6C5AA8 /* AsyncDeadline.swift */,
++				E2D58D0D2928F5FEB0B8A7EF /* AttachedBlockingWork.swift */,
++				49EC495316E0CA4703B13300 /* AttachedTransport.swift */,
+ 				E4F4EF125BAB77F0DE121AAB /* DeviceKey.swift */,
+ 				D24E7FB55E1DF14C8353ABDE /* DeviceKeyStore.swift */,
+ 				7625958E48639DCE4F5A8391 /* EventsSession.swift */,
+@@ -1602,6 +1620,7 @@
+ 			name = Heeler;
+ 			packageProductDependencies = (
+ 				6B0C40F1407743FF92CC9242 /* HeelerSSH */,
++				871F0C83DE1F06B72ECC6B1C /* AttachedMobile */,
+ 				19D717C20DA226346335AFF6 /* GhosttyTerminal */,
+ 				E086C559FC229264CF662993 /* GhosttyTheme */,
+ 			);
+@@ -1642,6 +1661,7 @@
+ 			name = HeelerTests;
+ 			packageProductDependencies = (
+ 				13CFA5F5C15E83F411CC03BA /* HeelerSSH */,
++				ED9E7A1EE8B6F1DD04A3F430 /* AttachedMobile */,
+ 				BE53F92F352D5CEE9A715FA9 /* GhosttyTerminal */,
+ 			);
+ 			productName = HeelerTests;
+@@ -1703,6 +1723,7 @@
+ 			minimizedProjectReferenceProxies = 1;
+ 			packageReferences = (
+ 				C24992F3A9C17BAA1883EEBB /* XCRemoteSwiftPackageReference "libghostty-spm" */,
++				0DDD20F8C84D6B9E51F90EC3 /* XCLocalSwiftPackageReference "Packages/AttachedMobile" */,
+ 				056B9BE67ABA0AE15160C8D8 /* XCLocalSwiftPackageReference "Packages/HeelerSSH" */,
+ 			);
+ 			preferredProjectObjectVersion = 77;
+@@ -1712,8 +1733,8 @@
+ 			targets = (
+ 				081A3B29EFF2C7B2FCAA3248 /* Heeler */,
+ 				DFFB82C74B73FA5CBCE6D5D2 /* HeelerNotificationService */,
+-				9806EA6C63028F1217417282 /* HeelerTests */,
+ 				134E6CD1AC1396155DAB93E2 /* HeelerWidgets */,
++				9806EA6C63028F1217417282 /* HeelerTests */,
+ 			);
+ 		};
+ /* End PBXProject section */
+@@ -1833,6 +1854,9 @@
+ 				A25418700A3D7FCCC08026BF /* AttachRestorationTrace.swift in Sources */,
+ 				052916002C06699B9F2F1A4B /* AttachTerminalStore.swift in Sources */,
+ 				CCEBF66BA9AFE64EDD371A78 /* AttachUserMessageIndex.swift in Sources */,
++				3F16079E304E138A65E300FA /* AttachedBlockingWork.swift in Sources */,
++				AB4C1A3E5D4844661575102D /* AttachedHostImportView.swift in Sources */,
++				E42FDDF1893954179E36501C /* AttachedTransport.swift in Sources */,
+ 				B787DA8CB25A81E3914F8638 /* AttachmentStaging.swift in Sources */,
+ 				35205050C9CB8E473D8A28C0 /* Base64URL.swift in Sources */,
+ 				D20C025851965986547FAAB5 /* ClosePaneStore.swift in Sources */,
+@@ -2048,6 +2072,7 @@
+ 				3776558F9FD16419AC405116 /* AttachRestorationTraceTests.swift in Sources */,
+ 				E40D1C6F825ABCD68AA5F196 /* AttachTerminalStoreTests.swift in Sources */,
+ 				DED05CBB7CDC71B3D92B7B36 /* AttachUserMessageIndexTests.swift in Sources */,
++				632EB308037206A9108E93BE /* AttachedTransportTests.swift in Sources */,
+ 				5150B659FACE9AFD9ECF9F6D /* AuthorizedKeysTestLock.swift in Sources */,
+ 				C3D2936548DD57036A1FB254 /* CancellablePhaseGate.swift in Sources */,
+ 				61F58007C6B81F14D2F6B58B /* ClosePaneStoreTests.swift in Sources */,
+@@ -2553,6 +2578,10 @@
+ 			isa = XCLocalSwiftPackageReference;
+ 			relativePath = Packages/HeelerSSH;
+ 		};
++		0DDD20F8C84D6B9E51F90EC3 /* XCLocalSwiftPackageReference "Packages/AttachedMobile" */ = {
++			isa = XCLocalSwiftPackageReference;
++			relativePath = Packages/AttachedMobile;
++		};
+ /* End XCLocalSwiftPackageReference section */
+ 
+ /* Begin XCRemoteSwiftPackageReference section */
+@@ -2580,6 +2609,10 @@
+ 			isa = XCSwiftPackageProductDependency;
+ 			productName = HeelerSSH;
+ 		};
++		871F0C83DE1F06B72ECC6B1C /* AttachedMobile */ = {
++			isa = XCSwiftPackageProductDependency;
++			productName = AttachedMobile;
++		};
+ 		BE53F92F352D5CEE9A715FA9 /* GhosttyTerminal */ = {
+ 			isa = XCSwiftPackageProductDependency;
+ 			package = C24992F3A9C17BAA1883EEBB /* XCRemoteSwiftPackageReference "libghostty-spm" */;
+@@ -2590,6 +2623,10 @@
+ 			package = C24992F3A9C17BAA1883EEBB /* XCRemoteSwiftPackageReference "libghostty-spm" */;
+ 			productName = GhosttyTheme;
+ 		};
++		ED9E7A1EE8B6F1DD04A3F430 /* AttachedMobile */ = {
++			isa = XCSwiftPackageProductDependency;
++			productName = AttachedMobile;
++		};
+ /* End XCSwiftPackageProductDependency section */
+ 	};
+ 	rootObject = 7FF105579DBE63944F1D14F9 /* Project object */;
+diff --git a/Makefile b/Makefile
+index 732b757..294f792 100644
+--- a/Makefile
++++ b/Makefile
+@@ -22,7 +22,7 @@ IOS_WATCH_DEBOUNCE ?= 1s
+ DEVICE ?= $(shell python3 scripts/find-ios-device.py iPhone)
+ DEVICE_IPAD ?= $(shell python3 scripts/find-ios-device.py iPad)
+ 
+-.PHONY: help generate resolve build test test-app test-ipad test-ci-app build-device install install-ipad watch-ios-device sim sim-ipad build-sim sim-id archive upload testflight bump publish clean check-device check-device-ipad ssh-artifacts verify-ssh-artifacts
++.PHONY: attached-client help generate resolve build test test-app test-ipad test-ci-app build-device install install-ipad watch-ios-device sim sim-ipad build-sim sim-id archive upload testflight bump publish clean check-device check-device-ipad ssh-artifacts verify-ssh-artifacts
+ 
+ help: ## Show available targets
+ 	@awk -F':.*## ' '/^[a-z-]+:.*## / { printf "  make %-20s %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+@@ -33,7 +33,10 @@ ssh-artifacts: ## Rebuild the pinned HeelerSSH XCFrameworks
+ verify-ssh-artifacts: ## Verify HeelerSSH artifact hashes, slices, and policy
+ 	Packages/HeelerSSH/Scripts/verify-native.sh
+ 
+-generate: ## Regenerate the Xcode project from project.yml (XcodeGen)
++attached-client: ## Build the pinned Attached Rust/Swift transport package
++	scripts/build-attached.sh
++
++generate: attached-client ## Regenerate the Xcode project from project.yml (XcodeGen)
+ 	xcodegen generate
+ 
+ resolve: generate ## Resolve pinned Swift packages into .ci/source-packages
+diff --git a/Packages/AttachedMobile/Package.swift b/Packages/AttachedMobile/Package.swift
+new file mode 100644
+index 0000000..8a6030a
+--- /dev/null
++++ b/Packages/AttachedMobile/Package.swift
+@@ -0,0 +1,17 @@
++// swift-tools-version: 6.0
++import PackageDescription
++
++let package = Package(
++    name: "AttachedMobile",
++    platforms: [.iOS(.v18), .macOS(.v14)],
++    products: [.library(name: "AttachedMobile", targets: ["AttachedMobile"])],
++    targets: [
++        .binaryTarget(name: "AttachedMobileFFI", path: "Artifacts/AttachedMobileFFI.xcframework"),
++        .target(
++            name: "AttachedMobile", dependencies: ["AttachedMobileFFI"],
++            linkerSettings: [
++                .linkedFramework("Security"), .linkedFramework("SystemConfiguration"),
++                .linkedFramework("CoreFoundation"), .linkedFramework("Network"),
++                .linkedLibrary("resolv"), .linkedLibrary("c++"), .linkedLibrary("iconv"),
++            ]),
++    ])
+diff --git a/Packages/HeelerSSH/Sources/HeelerSSH/SSHByteTransport.swift b/Packages/HeelerSSH/Sources/HeelerSSH/SSHByteTransport.swift
+index b30254e..e9733ce 100644
+--- a/Packages/HeelerSSH/Sources/HeelerSSH/SSHByteTransport.swift
++++ b/Packages/HeelerSSH/Sources/HeelerSSH/SSHByteTransport.swift
+@@ -1,10 +1,12 @@
+ import Darwin
+ import Foundation
+ 
+-/// The package-private transport seam used by nested SSH sessions. The inner
++/// The owned transport seam used by nested and embedded SSH sessions. The inner
+ /// driver receives only a non-blocking byte descriptor; the outer libssh2
+ /// session and direct-tcpip channel never cross this boundary.
+-protocol SSHByteTransport: AnyObject, Sendable {
++public protocol SSHByteTransport: AnyObject, Sendable {
++    /// Transfer a non-blocking socket exactly once. The SSH driver owns and closes
++    /// it thereafter. abort/close release the backing transport, never this socket.
+     func takeDescriptor() throws -> Int32
+     func close(timeout: Duration) async throws
+     func abort()
+diff --git a/Packages/HeelerSSH/Sources/HeelerSSH/SSHConnection.swift b/Packages/HeelerSSH/Sources/HeelerSSH/SSHConnection.swift
+index 0651874..0414b43 100644
+--- a/Packages/HeelerSSH/Sources/HeelerSSH/SSHConnection.swift
++++ b/Packages/HeelerSSH/Sources/HeelerSSH/SSHConnection.swift
+@@ -90,6 +90,27 @@ public final class SSHConnection: Sendable {
+         }
+     }
+ 
++    /// Connect over an already authenticated byte transport. A failed handshake
++    /// releases the transport; a successful connection retains it until close.
++    /// The endpoint identifies trust/diagnostics only and is never dialled here.
++    public static func connect(
++        over transport: any SSHByteTransport,
++        endpoint: SSHEndpoint,
++        timeout: Duration
++    ) async throws -> SSHConnection {
++        let driver = SessionDriver()
++        do {
++            let hostKey = try await driver.handshake(
++                transport: transport, endpoint: endpoint, timeout: timeout)
++            return SSHConnection(driver: driver, hostKey: hostKey, byteTransport: transport)
++        } catch {
++            await driver.invalidate()
++            transport.abort()
++            try? await transport.close(timeout: .seconds(2))
++            throw error
++        }
++    }
++
+     /// Opens an SSH connection to `endpoint` through this authenticated Jump
+     /// Host. The returned connection owns both hops and closes them in target,
+     /// forwarding-channel, Jump Host order.
+diff --git a/Packages/HeelerSSH/Tests/HeelerSSHTests/EmbeddedTransportTests.swift b/Packages/HeelerSSH/Tests/HeelerSSHTests/EmbeddedTransportTests.swift
+new file mode 100644
+index 0000000..dbdf95d
+--- /dev/null
++++ b/Packages/HeelerSSH/Tests/HeelerSSHTests/EmbeddedTransportTests.swift
+@@ -0,0 +1,65 @@
++import Darwin
++import Foundation
++import Synchronization
++import Testing
++
++@testable import HeelerSSH
++
++private final class FailedEmbeddedTransport: SSHByteTransport, Sendable {
++    private struct State {
++        var descriptor: Int32
++        var aborted = false
++        var closed = false
++    }
++    private let state: Mutex<State>
++    let transferredDescriptor: Int32
++
++    init() throws {
++        var pair: [Int32] = [-1, -1]
++        guard socketpair(AF_UNIX, SOCK_STREAM, 0, &pair) == 0 else {
++            throw SSHError.connectionFailed
++        }
++        var enabled: Int32 = 1
++        guard fcntl(pair[0], F_SETFL, O_NONBLOCK) == 0,
++            setsockopt(
++                pair[0], SOL_SOCKET, SO_NOSIGPIPE, &enabled,
++                socklen_t(MemoryLayout<Int32>.size)) == 0
++        else {
++            Darwin.close(pair[0])
++            Darwin.close(pair[1])
++            throw SSHError.connectionFailed
++        }
++        Darwin.close(pair[1])
++        transferredDescriptor = pair[0]
++        state = Mutex(State(descriptor: pair[0]))
++    }
++
++    func takeDescriptor() throws -> Int32 {
++        try state.withLock {
++            guard $0.descriptor >= 0 else { throw SSHError.connectionInvalidated }
++            let descriptor = $0.descriptor
++            $0.descriptor = -1
++            return descriptor
++        }
++    }
++    func abort() { state.withLock { $0.aborted = true } }
++    func close(timeout: Duration) async throws { state.withLock { $0.closed = true } }
++    var wasReleased: Bool { state.withLock { $0.aborted && $0.closed } }
++    deinit { state.withLock { if $0.descriptor >= 0 { Darwin.close($0.descriptor) } } }
++}
++
++@Suite("Embedded byte transport")
++struct EmbeddedTransportTests {
++    @Test func failedHandshakeClosesTransferredSocketAndAbortsTransport() async throws {
++        let transport = try FailedEmbeddedTransport()
++        do {
++            _ = try await SSHConnection.connect(
++                over: transport, endpoint: SSHEndpoint(host: "embedded"), timeout: .seconds(2))
++            Issue.record("Handshake on a closed transport unexpectedly succeeded")
++        } catch {
++            #expect(transport.wasReleased)
++            #expect(fcntl(transport.transferredDescriptor, F_GETFD) == -1)
++            #expect(errno == EBADF)
++        }
++    }
++}
+diff --git a/Sources/Heeler/Console/AgentActionMenuContent.swift b/Sources/Heeler/Console/AgentActionMenuContent.swift
+index f6aa597..455db50 100644
+--- a/Sources/Heeler/Console/AgentActionMenuContent.swift
++++ b/Sources/Heeler/Console/AgentActionMenuContent.swift
+@@ -102,6 +102,8 @@ enum AgentActionMenuPolicy {
+         actions: AgentComposerActions
+     ) -> Bool {
+         switch item {
++        case .addImage, .addFile:
++            actions.supportsFileTransfers
+         case .skills:
+             actions.showSkills != nil
+         case .worktreeDetails:
+diff --git a/Sources/Heeler/Console/AgentComposerView.swift b/Sources/Heeler/Console/AgentComposerView.swift
+index 1a451e2..b216715 100644
+--- a/Sources/Heeler/Console/AgentComposerView.swift
++++ b/Sources/Heeler/Console/AgentComposerView.swift
+@@ -56,6 +56,7 @@ struct AgentComposerKeyboardLayout: Equatable {
+ }
+ 
+ struct AgentComposerActions {
++    var supportsFileTransfers: Bool = true
+     let canBegin: Bool
+     let attachLinkCount: Int
+     let addImage: () -> Void
+diff --git a/Sources/Heeler/Console/AgentTerminalView.swift b/Sources/Heeler/Console/AgentTerminalView.swift
+index f04661d..a174bac 100644
+--- a/Sources/Heeler/Console/AgentTerminalView.swift
++++ b/Sources/Heeler/Console/AgentTerminalView.swift
+@@ -367,7 +367,8 @@ struct AgentTerminalView: View {
+     /// trip. An Agent with no session file on the Host clears the strip and
+     /// stops, so nothing polls for a figure that cannot arrive.
+     private func followSessionUsage() async {
+-        guard let path = agent.sessionFilePath else {
++        guard hosts.first(where: { $0.id == agent.hostID })?.attachedAccountID == nil,
++              let path = agent.sessionFilePath else {
+             sessionUsage.clear()
+             return
+         }
+@@ -895,6 +896,7 @@ struct AgentTerminalView: View {
+ 
+     private var composerActions: AgentComposerActions {
+         AgentComposerActions(
++            supportsFileTransfers: hosts.first(where: { $0.id == agent.hostID })?.attachedAccountID == nil,
+             canBegin: attach.staging.canBegin,
+             attachLinkCount: attach.attachLinks.count,
+             addImage: { isSelectingPhoto = true },
+diff --git a/Sources/Heeler/Hosts/AttachedHostImportView.swift b/Sources/Heeler/Hosts/AttachedHostImportView.swift
+new file mode 100644
+index 0000000..268dc7f
+--- /dev/null
++++ b/Sources/Heeler/Hosts/AttachedHostImportView.swift
+@@ -0,0 +1,143 @@
++import AttachedMobile
++import SwiftUI
++
++/// Discover first, then explicitly choose a Host. No account secret is stored
++/// in the Host catalog, copied to the pasteboard, or sent to an SSH command.
++struct AttachedHostImportView: View {
++    let store: HostStore
++    var onSaved: (Host) -> Void
++    @Environment(\.dismiss) private var dismiss
++    @State private var bundle = ""
++    @State private var accountID: String?
++    @State private var hosts: [AttachedHost] = []
++    @State private var isWorking = false
++    @State private var failure: String?
++    @State private var operation: Task<Void, Never>?
++
++    var body: some View {
++        NavigationStack {
++            Form {
++                if accountID == nil {
++                    Section {
++                        SecureField("Attached download bundle", text: $bundle)
++                            .textInputAutocapitalization(.never)
++                            .autocorrectionDisabled()
++                        Button("Find Hosts") { discover() }
++                            .disabled(
++                                bundle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
++                                    || isWorking)
++                    } footer: {
++                        Text(
++                            "On your computer, run attached account export --type download and paste the bundle here. It is stored in this device's Keychain when you add a Host."
++                        )
++                    }
++                } else {
++                    Section("Available Hosts") {
++                        ForEach(hosts, id: \.endpointId) { host in
++                            Button {
++                                add(host)
++                            } label: {
++                                VStack(alignment: .leading) {
++                                    Text(host.label)
++                                    Text(host.endpointId).font(.caption.monospaced()).lineLimit(1)
++                                }
++                            }.disabled(isWorking)
++                        }
++                        if hosts.isEmpty {
++                            Text(
++                                "No active Hosts found. Start attached serve on a Host, then try again."
++                            )
++                        }
++                        Button("Use another bundle") {
++                            accountID = nil
++                            hosts = []
++                        }
++                        .disabled(isWorking)
++                    }
++                }
++                if isWorking { ProgressView("Connecting to Attached…") }
++                if let failure { Section { Text(failure).foregroundStyle(.red) } }
++                Section {
++                    Text(
++                        "Run the updated Attached server from this integration on each Host. Terminal access and Herdr controls are supported. File transfers and push registration are not available through Attached yet."
++                    )
++                }
++            }
++            .navigationTitle("Add Attached Host")
++            .toolbar {
++                ToolbarItem(placement: .cancellationAction) {
++                    Button("Cancel") {
++                        operation?.cancel()
++                        dismiss()
++                    }
++                }
++            }
++            .onDisappear {
++                operation?.cancel()
++                bundle = ""
++            }
++        }
++    }
++
++    private func discover() {
++        failure = nil
++        isWorking = true
++        let encoded = bundle.trimmingCharacters(in: .whitespacesAndNewlines)
++        operation = Task {
++            defer { isWorking = false }
++            let cancellation = AttachedCancellation()
++            do {
++                let result = try await withTaskCancellationHandler {
++                    try await AttachedBlockingWork.run {
++                        let client = try AttachedClient(downloadBundle: encoded)
++                        defer { client.close() }
++                        return (client.accountId(), try client.hosts(cancellation: cancellation))
++                    }
++                } onCancel: {
++                    cancellation.cancel()
++                }
++                try Task.checkCancellation()
++                accountID = result.0
++                hosts = result.1
++                bundle = encoded
++            } catch {
++                if !Task.isCancelled {
++                    failure =
++                        "Could not discover Hosts. Check the download bundle, network connection, and Attached service."
++                }
++            }
++        }
++    }
++
++    private func add(_ discovered: AttachedHost) {
++        guard let accountID else { return }
++        isWorking = true
++        failure = nil
++        let encoded = bundle
++        operation = Task {
++            defer { isWorking = false }
++            do {
++                try await AttachedAccounts.shared.save(bundle: encoded, accountID: accountID)
++                try Task.checkCancellation()
++                if let existing = store.hosts.first(where: {
++                    $0.attachedAccountID == accountID && $0.address == discovered.endpointId
++                }) {
++                    onSaved(existing)
++                    dismiss()
++                    return
++                }
++                let host = Host(
++                    name: discovered.label, address: discovered.endpointId,
++                    username: "attached", attachedAccountID: accountID)
++                try store.add(host)
++                bundle = ""
++                onSaved(host)
++                dismiss()
++            } catch {
++                if !Task.isCancelled {
++                    failure = "Could not save the Attached Host to this device."
++                }
++            }
++        }
++    }
++}
+diff --git a/Sources/Heeler/Hosts/Host.swift b/Sources/Heeler/Hosts/Host.swift
+index 970adf4..e4ea73f 100644
+--- a/Sources/Heeler/Hosts/Host.swift
++++ b/Sources/Heeler/Hosts/Host.swift
+@@ -32,13 +32,15 @@ struct Host: Identifiable, Codable, Hashable, Sendable {
+     /// Account on the Jump Host. Blank reuses `username`, which is the common
+     /// case only when both machines share an account name.
+     var jumpUsername: String
++    /// Non-secret Keychain account reference. Address is the stable Attached endpoint ID.
++    var attachedAccountID: String? = nil
+ 
+     /// `socatPath` is deliberately absent: Hosts serialized before ADR 0011
+     /// still carry it on disk, and leaving it out of the keys both ignores it
+     /// on decode and drops it on the Host's next save.
+     private enum CodingKeys: String, CodingKey {
+         case id, name, address, port, username, authMethod, sessionName
+-        case jumpAddress, jumpPort, jumpUsername
++        case jumpAddress, jumpPort, jumpUsername, attachedAccountID
+     }
+ 
+     /// Whether this Host is reached through a Jump Host.
+@@ -62,7 +64,8 @@ struct Host: Identifiable, Codable, Hashable, Sendable {
+         sessionName: String = "",
+         jumpAddress: String = "",
+         jumpPort: Int = 22,
+-        jumpUsername: String = ""
++        jumpUsername: String = "",
++        attachedAccountID: String? = nil
+     ) {
+         self.id = id
+         self.name = name
+@@ -74,6 +77,7 @@ struct Host: Identifiable, Codable, Hashable, Sendable {
+         self.jumpAddress = jumpAddress
+         self.jumpPort = jumpPort
+         self.jumpUsername = jumpUsername
++        self.attachedAccountID = attachedAccountID
+     }
+ 
+     init(from decoder: any Decoder) throws {
+@@ -98,6 +102,8 @@ struct Host: Identifiable, Codable, Hashable, Sendable {
+         jumpPort = try container.decodeIfPresent(Int.self, forKey: .jumpPort) ?? 22
+         jumpUsername = try container.decodeIfPresent(String.self, forKey: .jumpUsername) ?? ""
+ 
++        attachedAccountID = try container.decodeIfPresent(String.self, forKey: .attachedAccountID)
++
+         let trimmedSessionName = sessionName.trimmingCharacters(in: .whitespaces)
+         guard trimmedSessionName.isEmpty || HerdrSessionName.isValid(trimmedSessionName) else {
+             throw DecodingError.dataCorruptedError(
+diff --git a/Sources/Heeler/Hosts/HostDraft.swift b/Sources/Heeler/Hosts/HostDraft.swift
+index d7eae43..59533f5 100644
+--- a/Sources/Heeler/Hosts/HostDraft.swift
++++ b/Sources/Heeler/Hosts/HostDraft.swift
+@@ -4,6 +4,7 @@ import Foundation
+ /// catalog Host. Text-field friendly (port is a string) so the view stays
+ /// dumb and the rules stay testable.
+ struct HostDraft: Equatable, Sendable {
++    var attachedAccountID: String?
+     var name = ""
+     var address = ""
+     var port = "22"
+@@ -23,6 +24,7 @@ struct HostDraft: Equatable, Sendable {
+ 
+     /// Prefill for editing an existing Host.
+     init(host: Host) {
++        attachedAccountID = host.attachedAccountID
+         name = host.name
+         address = host.address
+         port = String(host.port)
+@@ -84,7 +86,8 @@ struct HostDraft: Equatable, Sendable {
+             sessionName: sessionName.trimmingCharacters(in: .whitespaces),
+             jumpAddress: jumpAddress.trimmingCharacters(in: .whitespaces),
+             jumpPort: jumpPortNumber ?? 22,
+-            jumpUsername: jumpUsername.trimmingCharacters(in: .whitespaces))
++            jumpUsername: jumpUsername.trimmingCharacters(in: .whitespaces),
++            attachedAccountID: attachedAccountID)
+     }
+ 
+     /// What to hand `HostStore.add/update` as the password argument: a new
+diff --git a/Sources/Heeler/Hosts/HostFormView.swift b/Sources/Heeler/Hosts/HostFormView.swift
+index 2f1a604..60ac108 100644
+--- a/Sources/Heeler/Hosts/HostFormView.swift
++++ b/Sources/Heeler/Hosts/HostFormView.swift
+@@ -35,60 +35,67 @@ struct HostFormView: View {
+             Form {
+                 Section("Host") {
+                     TextField("Name (optional)", text: $draft.name)
+-                    TextField("Address", text: $draft.address)
+-                        .textContentType(.URL)
+-                        .autocorrectionDisabled()
+-                        .textInputAutocapitalization(.never)
+-                    TextField("Port", text: $draft.port)
+-                        .keyboardType(.numberPad)
+-                    TextField("User", text: $draft.username)
+-                        .textContentType(.username)
+-                        .autocorrectionDisabled()
+-                        .textInputAutocapitalization(.never)
++                    if draft.attachedAccountID == nil {
++                        TextField("Address", text: $draft.address)
++                            .textContentType(.URL)
++                            .autocorrectionDisabled()
++                            .textInputAutocapitalization(.never)
++                        TextField("Port", text: $draft.port)
++                            .keyboardType(.numberPad)
++                        TextField("User", text: $draft.username)
++                            .textContentType(.username)
++                            .autocorrectionDisabled()
++                            .textInputAutocapitalization(.never)
++                    } else {
++                        LabeledContent("Connection", value: "Attached")
++                        Text(draft.address).font(.caption.monospaced()).textSelection(.enabled)
++                    }
+                 }
+ 
+-                Section {
+-                    Picker("Method", selection: $draft.authMethod) {
+-                        Text("Device Key").tag(Host.AuthMethod.deviceKey)
+-                        Text("RSA Key").tag(Host.AuthMethod.rsaKey)
+-                        Text("Password").tag(Host.AuthMethod.password)
+-                    }
+-                    .onChange(of: draft.authMethod) {
+-                        didCopyKeyLine = false
+-                        if draft.authMethod == .rsaKey,
+-                           rsaPublicKeyLine == nil,
+-                           !rsaKeyIsCorrupt
+-                        {
+-                            loadRSAKey()
++                if draft.attachedAccountID == nil {
++                    Section {
++                        Picker("Method", selection: $draft.authMethod) {
++                            Text("Device Key").tag(Host.AuthMethod.deviceKey)
++                            Text("RSA Key").tag(Host.AuthMethod.rsaKey)
++                            Text("Password").tag(Host.AuthMethod.password)
++                        }
++                        .onChange(of: draft.authMethod) {
++                            didCopyKeyLine = false
++                            if draft.authMethod == .rsaKey,
++                                rsaPublicKeyLine == nil,
++                                !rsaKeyIsCorrupt
++                            {
++                                loadRSAKey()
++                            }
++                        }
++                        switch draft.authMethod {
++                        case .deviceKey:
++                            deviceKeySection
++                        case .rsaKey:
++                            rsaKeySection
++                        case .password:
++                            SecureField(
++                                editing == nil ? "Password" : "Password (blank keeps current)",
++                                text: $draft.password)
++                        }
++                    } header: {
++                        Text("Authentication")
++                    } footer: {
++                        switch draft.authMethod {
++                        case .deviceKey:
++                            Text(
++                                "Add this line to ~/.ssh/authorized_keys on the Host. "
++                                    + "The private key never leaves this device.")
++                        case .rsaKey:
++                            Text(
++                                "Register this public key wherever the Host accepts SSH identities. "
++                                    + "The private key never leaves this device.")
++                        case .password:
++                            EmptyView()
+                         }
+                     }
+-                    switch draft.authMethod {
+-                    case .deviceKey:
+-                        deviceKeySection
+-                    case .rsaKey:
+-                        rsaKeySection
+-                    case .password:
+-                        SecureField(
+-                            editing == nil ? "Password" : "Password (blank keeps current)",
+-                            text: $draft.password)
+-                    }
+-                } header: {
+-                    Text("Authentication")
+-                } footer: {
+-                    switch draft.authMethod {
+-                    case .deviceKey:
+-                        Text(
+-                            "Add this line to ~/.ssh/authorized_keys on the Host. "
+-                                + "The private key never leaves this device.")
+-                    case .rsaKey:
+-                        Text(
+-                            "Register this public key wherever the Host accepts SSH identities. "
+-                                + "The private key never leaves this device.")
+-                    case .password:
+-                        EmptyView()
+-                    }
+-                }
+ 
++                }
+                 Section {
+                     TextField("Session name", text: $draft.sessionName)
+                         .autocorrectionDisabled()
+@@ -99,26 +106,30 @@ struct HostFormView: View {
+                     Text("Leave blank for the default herdr session.")
+                 }
+ 
+-                Section {
+-                    TextField("Jump Host address (optional)", text: $draft.jumpAddress)
+-                        .textContentType(.URL)
+-                        .autocorrectionDisabled()
+-                        .textInputAutocapitalization(.never)
+-                    if draft.usesJumpHost {
+-                        TextField("Jump Host port", text: $draft.jumpPort)
+-                            .keyboardType(.numberPad)
+-                        TextField("Jump Host user (blank = same as Host)", text: $draft.jumpUsername)
++                if draft.attachedAccountID == nil {
++                    Section {
++                        TextField("Jump Host address (optional)", text: $draft.jumpAddress)
++                            .textContentType(.URL)
++                            .autocorrectionDisabled()
++                            .textInputAutocapitalization(.never)
++                        if draft.usesJumpHost {
++                            TextField("Jump Host port", text: $draft.jumpPort)
++                                .keyboardType(.numberPad)
++                            TextField(
++                                "Jump Host user (blank = same as Host)", text: $draft.jumpUsername
++                            )
+                             .textContentType(.username)
+                             .autocorrectionDisabled()
+                             .textInputAutocapitalization(.never)
+-                    }
+-                } header: {
+-                    Text("Jump Host")
+-                } footer: {
+-                    if draft.usesJumpHost {
+-                        Text(jumpHostFooter)
+-                    } else {
+-                        Text("Leave blank to connect to the Host directly.")
++                        }
++                    } header: {
++                        Text("Jump Host")
++                    } footer: {
++                        if draft.usesJumpHost {
++                            Text(jumpHostFooter)
++                        } else {
++                            Text("Leave blank to connect to the Host directly.")
++                        }
+                     }
+                 }
+             }
+@@ -223,8 +234,9 @@ struct HostFormView: View {
+         } else {
+             Label(
+                 deviceKeyIsCorrupt ? "Device key is corrupted" : "Device key unavailable",
+-                systemImage: "exclamationmark.triangle")
+-                .foregroundStyle(.red)
++                systemImage: "exclamationmark.triangle"
++            )
++            .foregroundStyle(.red)
+             if deviceKeyIsCorrupt {
+                 Button("Replace Device Key", role: .destructive) {
+                     isConfirmingDeviceKeyReplacement = true
+@@ -254,8 +266,9 @@ struct HostFormView: View {
+         } else {
+             Label(
+                 rsaKeyIsCorrupt ? "RSA Key is corrupted" : "RSA Key unavailable",
+-                systemImage: "exclamationmark.triangle")
+-                .foregroundStyle(.red)
++                systemImage: "exclamationmark.triangle"
++            )
++            .foregroundStyle(.red)
+             if !rsaKeyIsCorrupt {
+                 Button("Try Again") { loadRSAKey() }
+             } else {
+diff --git a/Sources/Heeler/Hosts/HostListView.swift b/Sources/Heeler/Hosts/HostListView.swift
+index c4c45bd..177fc12 100644
+--- a/Sources/Heeler/Hosts/HostListView.swift
++++ b/Sources/Heeler/Hosts/HostListView.swift
+@@ -75,6 +75,7 @@ struct HostListView: View {
+     private let retryConnection: (@MainActor @Sendable (Host.ID) async -> Void)?
+     @State private var removal: HostRemovalStore
+     @State private var isAddingHost = false
++    @State private var isAddingAttachedHost = false
+     @State private var isScanningToPair = false
+     @State private var manualFallbackRequested = false
+     @State private var path: [Host.ID] = []
+@@ -147,8 +148,10 @@ struct HostListView: View {
+                     .disabled(store.catalogLoadError != nil)
+                 }
+                 ToolbarItem(placement: .primaryAction) {
+-                    Button("Add Host", systemImage: "plus") { isAddingHost = true }
+-                        .disabled(store.catalogLoadError != nil)
++                    Menu("Add Host", systemImage: "plus") {
++                        Button("SSH Host") { isAddingHost = true }
++                        Button("Attached Host") { isAddingAttachedHost = true }
++                    }.disabled(store.catalogLoadError != nil)
+                 }
+             }
+             .navigationDestination(for: Host.ID.self) { id in
+@@ -167,6 +170,9 @@ struct HostListView: View {
+                     ContentUnavailableView("Host removed", systemImage: "server.rack")
+                 }
+             }
++            .sheet(isPresented: $isAddingAttachedHost) {
++                AttachedHostImportView(store: store) { saved in path.append(saved.id) }
++            }
+             .sheet(isPresented: $isAddingHost) {
+                 HostFormView(store: store) { saved in
+                     path.append(saved.id)
+diff --git a/Sources/Heeler/Hosts/HostStore.swift b/Sources/Heeler/Hosts/HostStore.swift
+index 550cb62..e3d0592 100644
+--- a/Sources/Heeler/Hosts/HostStore.swift
++++ b/Sources/Heeler/Hosts/HostStore.swift
+@@ -83,14 +83,17 @@ final class HostStore {
+     // UserDefaults is documented thread-safe; Sendable modulo that promise.
+     @ObservationIgnored private nonisolated(unsafe) let defaults: UserDefaults?
+     @ObservationIgnored private let secrets: any SecretStore
++    @ObservationIgnored private let attachedSecrets: any SecretStore
+     @ObservationIgnored private var catalogEntries: [PersistedHosts.Entry]
+ 
+     init(
+         defaults: UserDefaults = .standard,
+-        secrets: any SecretStore = KeychainSecretStore(service: "dev.bybee.heeler.ssh")
++        secrets: any SecretStore = KeychainSecretStore(service: "dev.bybee.heeler.ssh"),
++        attachedSecrets: any SecretStore = AttachedAccounts.keychain
+     ) {
+         self.defaults = defaults
+         self.secrets = secrets
++        self.attachedSecrets = attachedSecrets
+         catalogEntries = []
+         guard let data = defaults.data(forKey: Self.defaultsKey) else {
+             hosts = []
+@@ -128,6 +131,7 @@ final class HostStore {
+     init(volatileHosts: [Host]) {
+         defaults = nil
+         secrets = VolatileSecretStore()
++        attachedSecrets = VolatileSecretStore()
+         hosts = volatileHosts
+         catalogEntries = volatileHosts.map(PersistedHosts.Entry.known)
+         catalogLoadError = nil
+@@ -168,6 +172,11 @@ final class HostStore {
+             throw HostStoreError.unknownHost
+         }
+         try secrets.removeSecret(account: Self.passwordAccount(for: id))
++        if let accountID = hosts[index].attachedAccountID,
++           !hosts.contains(where: { $0.id != id && $0.attachedAccountID == accountID }) {
++            try attachedSecrets.removeSecret(account: accountID)
++            Task { await AttachedAccounts.shared.evict(accountID: accountID) }
++        }
+         hosts.remove(at: index)
+         catalogEntries.removeAll { $0.knownHostID == id }
+         try persist()
+diff --git a/Sources/Heeler/Hosts/TransportConnector.swift b/Sources/Heeler/Hosts/TransportConnector.swift
+index f7fb800..519de0d 100644
+--- a/Sources/Heeler/Hosts/TransportConnector.swift
++++ b/Sources/Heeler/Hosts/TransportConnector.swift
+@@ -36,6 +36,7 @@ extension SSHTransportSettings {
+                     port: host.jumpPort,
+                     username: host.resolvedJumpUsername,
+                     credentials: credentials)
+-                : nil)
++                : nil,
++            attachedAccountID: host.attachedAccountID)
+     }
+ }
+diff --git a/Sources/Heeler/Transport/AttachedBlockingWork.swift b/Sources/Heeler/Transport/AttachedBlockingWork.swift
+new file mode 100644
+index 0000000..0121af3
+--- /dev/null
++++ b/Sources/Heeler/Transport/AttachedBlockingWork.swift
+@@ -0,0 +1,22 @@
++import Dispatch
++
++/// UniFFI entry points synchronously wait for Rust network operations. Dispatch
++/// owns those blocking threads; Swift's cooperative executor stays available
++/// for terminal I/O, actor work, and cancellation. Callers cancel Rust explicitly
++/// with AttachedCancellation and check task cancellation after the result.
++enum AttachedBlockingWork {
++    private static let queue = DispatchQueue(
++        label: "dev.bybee.heeler.attached.ffi", qos: .userInitiated, attributes: .concurrent)
++
++    static func run<T: Sendable>(
++        _ operation: @escaping @Sendable () throws -> T
++    ) async throws -> T {
++        try await withCheckedThrowingContinuation { continuation in
++            queue.async {
++                do { continuation.resume(returning: try operation()) } catch {
++                    continuation.resume(throwing: error)
++                }
++            }
++        }
++    }
++}
+diff --git a/Sources/Heeler/Transport/AttachedTransport.swift b/Sources/Heeler/Transport/AttachedTransport.swift
+new file mode 100644
+index 0000000..18b1dd6
+--- /dev/null
++++ b/Sources/Heeler/Transport/AttachedTransport.swift
+@@ -0,0 +1,158 @@
++import AttachedMobile
++import Darwin
++import Foundation
++import HeelerSSH
++
++/// One Iroh endpoint per account across all Hosts and terminal connections.
++/// Account secrets live only in the device Keychain and Rust's zeroizing memory.
++actor AttachedAccounts {
++    static let shared = AttachedAccounts()
++    static let keychain = KeychainSecretStore(service: "dev.bybee.heeler.attached")
++    private var clients: [String: AttachedClient] = [:]
++
++    func client(for accountID: String) throws -> AttachedClient {
++        if let existing = clients[accountID] { return existing }
++        guard let data = try Self.keychain.read(account: accountID),
++            let bundle = String(data: data, encoding: .utf8)
++        else { throw AttachedConnectionError.missingAccount }
++        let client = try AttachedClient(downloadBundle: bundle)
++        guard client.accountId() == accountID else { throw AttachedConnectionError.invalidAccount }
++        clients[accountID] = client
++        return client
++    }
++
++    func save(bundle: String, accountID: String) throws {
++        let validated = try AttachedClient(downloadBundle: bundle)
++        guard validated.accountId() == accountID else {
++            throw AttachedConnectionError.invalidAccount
++        }
++        // Persist before retiring existing connections, so a Keychain failure
++        // leaves the working account untouched.
++        let data = Data(bundle.utf8)
++        if try Self.keychain.read(account: accountID) == data { return }
++        try Self.keychain.write(data, account: accountID)
++        clients.removeValue(forKey: accountID)?.close()
++        clients[accountID] = validated
++    }
++
++    func evict(accountID: String) {
++        clients.removeValue(forKey: accountID)?.close()
++    }
++}
++
++enum AttachedConnectionError: LocalizedError {
++    case missingAccount
++    case invalidAccount
++    case unsupportedAuthentication
++    case hostIdentityMismatch
++
++    var errorDescription: String? {
++        switch self {
++        case .missingAccount: "Import this Host's Attached download bundle again."
++        case .invalidAccount: "Use a download bundle exported by Attached."
++        case .unsupportedAuthentication: "Attached Hosts use this device's Ed25519 Device Key."
++        case .hostIdentityMismatch:
++            "The SSH key does not match the authenticated Attached publisher."
++        }
++    }
++}
++
++/// Owns only the Rust side after takeDescriptor. SessionDriver owns the
++/// transferred socket and closes it on every handshake/teardown path.
++final class AttachedByteTransport: SSHByteTransport, Sendable {
++    private let tunnel: AttachedTunnel
++    // Retain the shared endpoint until all SSH traffic is finished.
++    private let client: AttachedClient
++
++    init(tunnel: AttachedTunnel, client: AttachedClient) {
++        self.tunnel = tunnel
++        self.client = client
++    }
++
++    func takeDescriptor() throws -> Int32 {
++        let descriptor = try tunnel.takeSocket()
++        var enabled: Int32 = 1
++        guard
++            setsockopt(
++                descriptor, SOL_SOCKET, SO_NOSIGPIPE, &enabled,
++                socklen_t(MemoryLayout<Int32>.size)) == 0
++        else {
++            Darwin.close(descriptor)
++            throw SSHError.connectionFailed
++        }
++        return descriptor
++    }
++
++    func close(timeout: Duration) async throws { tunnel.close() }
++    func abort() { tunnel.close() }
++    deinit { tunnel.close() }
++}
++
++enum AttachedTransport {
++    static func connect(settings: SSHTransportSettings) async throws -> SSHConnection {
++        guard let accountID = settings.attachedAccountID,
++            case .ed25519(let privateKey) = settings.credentials,
++            settings.jump == nil
++        else { throw AttachedConnectionError.unsupportedAuthentication }
++        let client = try await AttachedAccounts.shared.client(for: accountID)
++        let key = DeviceKey(privateKey: privateKey)
++        let cancellation = AttachedCancellation()
++        let tunnel = try await withTaskCancellationHandler {
++            // The synchronous FFI waits on Rust's runtime. Do not block Swift's
++            // cooperative task pool when several Hosts connect simultaneously.
++            let tunnel: AttachedTunnel
++            do {
++                tunnel = try await AttachedBlockingWork.run {
++                    try client.connect(
++                        endpointId: settings.host, publicKey: key.openSSHPublicKey,
++                        cancellation: cancellation)
++                }
++            } catch {
++                if Task.isCancelled { throw TransportError.cancelled }
++                throw TransportError.sshUnreachable(
++                    detail:
++                        "Attached could not reach this Host. Check the download bundle and run the updated attached serve on the Host."
++                )
++            }
++            if Task.isCancelled {
++                tunnel.close()
++                throw TransportError.cancelled
++            }
++            return tunnel
++        } onCancel: {
++            cancellation.cancel()
++        }
++        let transport = AttachedByteTransport(tunnel: tunnel, client: client)
++        let connection: SSHConnection
++        do {
++            connection = try await SSHConnection.connect(
++                over: transport,
++                endpoint: SSHEndpoint(host: settings.host), timeout: settings.requestTimeout)
++        } catch {
++            transport.abort()
++            throw error
++        }
++        do {
++            try validateHostKey(connection.hostKey, admissionKey: tunnel.hostKey())
++            try await HeelerSSHHostKeyVerifier(
++                host: settings.host, port: settings.port, policy: settings.hostKeyPolicy
++            )
++            .verify(connection.hostKey)
++            try await connection.authenticate(
++                username: tunnel.username(), publicKey: key.publicKeyBlob,
++                signer: { data in try privateKey.signature(for: data) },
++                timeout: settings.requestTimeout)
++            return connection
++        } catch {
++            try? await connection.close(timeout: .seconds(2))
++            throw error
++        }
++    }
++
++    static func validateHostKey(_ key: SSHHostKey, admissionKey: String) throws {
++        let parts = admissionKey.split(separator: " ", omittingEmptySubsequences: true)
++        guard parts.count == 2, parts[0] == "ssh-ed25519", key.algorithm == "ssh-ed25519",
++            let data = Data(base64Encoded: String(parts[1])), data == key.key
++        else { throw AttachedConnectionError.hostIdentityMismatch }
++    }
++}
+diff --git a/Sources/Heeler/Transport/HeelerSSHTransport.swift b/Sources/Heeler/Transport/HeelerSSHTransport.swift
+index a15f796..228d2c7 100644
+--- a/Sources/Heeler/Transport/HeelerSSHTransport.swift
++++ b/Sources/Heeler/Transport/HeelerSSHTransport.swift
+@@ -293,6 +293,7 @@ actor HeelerSSHTransport: Transport {
+     static let maxConnectionChannels = SSHChannelAdmission.Limits.production.connection
+ 
+     private let connection: SSHConnection
++    private let supportsSFTP: Bool
+     private let socketLocation: HerdrSocketLocation
+     private let requestTimeout: Duration
+     private let wakeCommand: String
+@@ -354,6 +355,12 @@ actor HeelerSSHTransport: Transport {
+     /// Establishes the libssh2 Transport through the same app-owned
+     /// credentials and TOFU policy as the production connection path.
+     static func connect(settings: SSHTransportSettings) async throws -> HeelerSSHTransport {
++        if settings.attachedAccountID != nil {
++            do {
++                let connection = try await AttachedTransport.connect(settings: settings)
++                return HeelerSSHTransport(connection: connection, settings: settings)
++            } catch { throw mapConnect(error) }
++        }
+         let targetEndpoint = try endpoint(host: settings.host, port: settings.port)
+         guard let jump = settings.jump else {
+             let connection: SSHConnection
+@@ -430,6 +437,7 @@ actor HeelerSSHTransport: Transport {
+         requestTimeout: Duration = SSHTransportSettings.defaultRequestTimeout
+     ) {
+         self.connection = connection
++        supportsSFTP = true
+         socketLocation = .absolutePath(socketPath)
+         self.requestTimeout = requestTimeout
+         wakeCommand = SSHTransportSettings.defaultWakeCommand
+@@ -447,6 +455,7 @@ actor HeelerSSHTransport: Transport {
+ 
+     private init(connection: SSHConnection, settings: SSHTransportSettings) {
+         self.connection = connection
++        supportsSFTP = settings.attachedAccountID == nil
+         socketLocation = settings.socket
+         requestTimeout = settings.requestTimeout
+         wakeCommand = settings.wakeCommand
+@@ -686,6 +695,11 @@ actor HeelerSSHTransport: Transport {
+         }
+     }
+ 
++    private func openFileTransfer() async throws -> SSHSFTPClient {
++        guard supportsSFTP else { throw SSHError.sftpUnavailable }
++        return try await connection.openSFTP(timeout: requestTimeout)
++    }
++
+     private func sessionFileClientForReading() async throws -> SSHSFTPClient {
+         if let sessionFileClient { return sessionFileClient }
+         if let opening = sessionFileClientOpening {
+@@ -698,7 +712,7 @@ actor HeelerSSHTransport: Transport {
+             let lease = try await channelAdmission.acquire(.ordinarySession)
+             let client: SSHSFTPClient
+             do {
+-                client = try await connection.openSFTP(timeout: requestTimeout)
++                client = try await openFileTransfer()
+             } catch {
+                 await lease.release()
+                 throw error
+@@ -975,7 +989,8 @@ actor HeelerSSHTransport: Transport {
+     }
+ 
+     private func readPluginConfigFile(named name: String) async throws -> Data? {
+-        try await withNotificationFileRequestDeadline {
++        guard supportsSFTP else { return nil }
++        return try await withNotificationFileRequestDeadline {
+             guard await self.notificationConnectionIsAvailable() else {
+                 throw NotificationRegistrationError.readFailed(
+                     detail: "The SSH connection is unavailable.")
+@@ -993,6 +1008,9 @@ actor HeelerSSHTransport: Transport {
+     }
+ 
+     private func replacePluginConfigFile(named name: String, contents: Data) async throws {
++        guard supportsSFTP else {
++            throw NotificationRegistrationError.writeFailed(detail: "Push registration requires SFTP and is unavailable through Attached.")
++        }
+         try await withNotificationFileRequestDeadline {
+             guard await self.notificationConnectionIsAvailable() else {
+                 throw NotificationRegistrationError.writeFailed(
+@@ -1023,7 +1041,7 @@ actor HeelerSSHTransport: Transport {
+     ) async throws -> Data? {
+         let sftp: SSHSFTPClient
+         do {
+-            sftp = try await connection.openSFTP(timeout: requestTimeout)
++            sftp = try await openFileTransfer()
+         } catch {
+             try Self.notificationReadError(error)
+         }
+@@ -1059,7 +1077,7 @@ actor HeelerSSHTransport: Transport {
+     ) async throws {
+         let sftp: SSHSFTPClient
+         do {
+-            sftp = try await connection.openSFTP(timeout: requestTimeout)
++            sftp = try await openFileTransfer()
+         } catch {
+             try Self.notificationWriteError(error)
+         }
+@@ -1210,7 +1228,7 @@ actor HeelerSSHTransport: Transport {
+ 
+     func readRemoteFileForTesting(at path: String) async throws -> Data? {
+         try await channelAdmission.withChannel(.ordinarySession) {
+-            let sftp = try await self.connection.openSFTP(timeout: self.requestTimeout)
++            let sftp = try await self.openFileTransfer()
+             do {
+                 let contents = try await sftp.readFileIfPresent(
+                     at: path,
+@@ -1238,7 +1256,7 @@ actor HeelerSSHTransport: Transport {
+             throw TransportError.invalidDirectoryPath(path: path)
+         }
+         return try await channelAdmission.withChannel(.ordinarySession) {
+-            let sftp = try await self.connection.openSFTP(timeout: self.requestTimeout)
++            let sftp = try await self.openFileTransfer()
+             do {
+                 let listing = try await sftp.listDirectories(
+                     at: path,
+@@ -1455,6 +1473,7 @@ actor HeelerSSHTransport: Transport {
+         _ source: StagingSource,
+         progress: @escaping @Sendable (AttachmentStageProgress) async -> Void
+     ) async throws -> String {
++        guard supportsSFTP else { throw AttachmentStagingError.sftpUnavailable }
+         guard connected, await connection.isConnected else {
+             throw AttachmentStagingError.transferFailed
+         }
+@@ -1528,7 +1547,7 @@ actor HeelerSSHTransport: Transport {
+     ) async throws -> String {
+         let sftp: SSHSFTPClient
+         do {
+-            sftp = try await connection.openSFTP(timeout: requestTimeout)
++            sftp = try await openFileTransfer()
+         } catch SSHError.sftpUnavailable {
+             throw AttachmentStagingError.sftpUnavailable
+         } catch {
+diff --git a/Sources/Heeler/Transport/SSHTransportSettings.swift b/Sources/Heeler/Transport/SSHTransportSettings.swift
+index 819e8f6..4b46e91 100644
+--- a/Sources/Heeler/Transport/SSHTransportSettings.swift
++++ b/Sources/Heeler/Transport/SSHTransportSettings.swift
+@@ -77,6 +77,7 @@ struct SSHTransportSettings: Sendable {
+     /// jump host first and opens the Host connection through it, so the Host
+     /// needs no inbound reachability of its own. nil is a direct connection.
+     var jump: SSHJumpSettings? = nil
++    var attachedAccountID: String? = nil
+     /// Command that wakes a stopped herdr server, run over a no-PTY exec
+     /// channel when a request hits connection-refused (#6). The default is
+     /// the strategy from spec #16: `herdr remote-client-bridge` ensures the
+diff --git a/Tests/HeelerTests/AttachedTransportTests.swift b/Tests/HeelerTests/AttachedTransportTests.swift
+new file mode 100644
+index 0000000..40d6454
+--- /dev/null
++++ b/Tests/HeelerTests/AttachedTransportTests.swift
+@@ -0,0 +1,79 @@
++import AttachedMobile
++import CryptoKit
++import Foundation
++import HeelerSSH
++import Testing
++
++@testable import Heeler
++
++@Suite("Attached transport")
++struct AttachedTransportTests {
++    @MainActor @Test func blockingFFIRunsOffMainThreadAndPropagatesRustErrors() async throws {
++        let onMainThread = try await AttachedBlockingWork.run { Thread.isMainThread }
++        #expect(!onMainThread)
++        await #expect(throws: MobileError.self) {
++            _ = try await AttachedBlockingWork.run {
++                try AttachedClient(downloadBundle: "invalid-download-bundle")
++            }
++        }
++    }
++
++    @Test func admissionKeyMustMatchTheSSHHandshakeBeforeAuthentication() throws {
++        let device = DeviceKey(privateKey: Curve25519.Signing.PrivateKey())
++        let key = SSHHostKey(algorithm: "ssh-ed25519", key: device.publicKeyBlob)
++        try AttachedTransport.validateHostKey(key, admissionKey: device.openSSHPublicKey)
++        let other = DeviceKey(privateKey: Curve25519.Signing.PrivateKey())
++        #expect(throws: (any Error).self) {
++            try AttachedTransport.validateHostKey(key, admissionKey: other.openSSHPublicKey)
++        }
++        for invalid in ["", "ssh-ed25519 !", device.openSSHPublicKey + "\nother-host key"] {
++            #expect(throws: (any Error).self) {
++                try AttachedTransport.validateHostKey(key, admissionKey: invalid)
++            }
++        }
++    }
++
++    @Test func oldHostsRemainSSHAndAttachedEditsRetainTheAccountReference() throws {
++        let legacy = Host(address: "host.example", username: "user")
++        var json = try #require(
++            JSONSerialization.jsonObject(with: JSONEncoder().encode(legacy)) as? [String: Any])
++        json.removeValue(forKey: "attachedAccountID")
++        let restored = try JSONDecoder().decode(
++            Host.self, from: JSONSerialization.data(withJSONObject: json))
++        #expect(restored.attachedAccountID == nil)
++        let attached = Host(
++            name: "Office", address: String(repeating: "a", count: 64),
++            username: "attached", attachedAccountID: UUID().uuidString)
++        var draft = HostDraft(host: attached)
++        draft.name = "My office"
++        let edited = try #require(draft.makeHost(id: attached.id))
++        #expect(edited.attachedAccountID == attached.attachedAccountID)
++        #expect(edited.address == attached.address)
++        #expect(edited.authMethod == .deviceKey)
++        #expect(try JSONDecoder().decode(Host.self, from: JSONEncoder().encode(edited)) == edited)
++    }
++
++    @MainActor @Test func removingLastHostRemovesOnlyItsAccountSecret() throws {
++        let defaultsName = "attached-tests-\(UUID().uuidString)"
++        let defaults = try #require(UserDefaults(suiteName: defaultsName))
++        defer { defaults.removePersistentDomain(forName: defaultsName) }
++        let secrets = VolatileSecretStore()
++        try secrets.write(Data("download-secret".utf8), account: "shared")
++        try secrets.write(Data("other-secret".utf8), account: "other")
++        let store = HostStore(
++            defaults: defaults, secrets: VolatileSecretStore(), attachedSecrets: secrets)
++        let one = Host(address: "one", username: "attached", attachedAccountID: "shared")
++        let two = Host(address: "two", username: "attached", attachedAccountID: "shared")
++        try store.add(one)
++        try store.add(two)
++        #expect(
++            !(defaults.data(forKey: "hosts").map { String(decoding: $0, as: UTF8.self) } ?? "")
++                .contains(
++                    "download-secret"))
++        try store.remove(one.id)
++        #expect(try secrets.read(account: "shared") != nil)
++        try store.remove(two.id)
++        #expect(try secrets.read(account: "shared") == nil)
++        #expect(try secrets.read(account: "other") != nil)
++    }
++}
+diff --git a/docs/guides/attached.md b/docs/guides/attached.md
+new file mode 100644
+index 0000000..57f1f6c
+--- /dev/null
++++ b/docs/guides/attached.md
+@@ -0,0 +1,79 @@
++# Testing Heeler with Attached
++
++This integration was developed with AI assistance. It is intended for source
++builds and device testing; the complete iPhone/iPad path still needs validation.
++
++## Build on a Mac
++
++Install full Xcode 26 or later, XcodeGen 2.46 or later, and Rust through rustup.
++Select Xcode with `xcode-select` and complete its first-launch setup. Then, from
++this Heeler checkout:
++
++```sh
++rustup toolchain install 1.97.1 --profile minimal
++make attached-client
++make generate
++make build-sim
++```
++
++`make attached-client` fetches exactly `scripts/attached-revision` from
++`pvalletbo/attached` and builds a local Swift package. It compiles the host Mac,
++arm64 iOS device, and arm64/x86_64 simulator libraries. The first build takes
++longer; subsequent builds reuse Cargo artifacts and the package revision stamp.
++Set `FORCE_ATTACHED_BUILD=1` to rebuild it. No native binary from this integration
++is downloaded from an unpinned release.
++
++Open `Heeler.xcodeproj`, configure your own signing team and unique bundle IDs
++for the app and its extensions, and select your iPhone or iPad to build and run.
++The upstream app has push and App Group entitlements: device provisioning must
++support those capabilities. The simulator does not need your signing team.
++Do not commit signing credentials. `make generate` regenerates project settings,
++so keep permanent signing changes in your local `project.yml` when needed.
++
++## Prepare each Host
++
++Build/install Attached from the same pinned commit and restart `attached serve`
++under the OS account that owns the Herdr sessions. The normal publish bundle
++setup remains unchanged. The publisher must include the new PTY and Unix-socket
++forwarding support from [Attached PR 107](https://github.com/pvalletbo/attached/pull/107).
++Use a current Herdr version supported by Heeler (the schema baseline is 0.9.0).
++
++On the account-owning computer, export a download bundle:
++
++```sh
++attached account export --type download
++```
++
++In Heeler, choose **Hosts → Add Host → Attached Host**, paste that bundle, and
++choose an active Host. Repeat for other Hosts. Confirm its SSH host fingerprint
++on first connection. Choose the Herdr session in the existing Host setup screen.
++The bundle is a credential: Heeler stores it in the device Keychain, not in its
++Host catalog. Removing the last Host for an account removes that account secret.
++The SSH Device Key stays on the device and does not need an `authorized_keys`
++entry: Attached admits its public half inside each authorized Iroh connection.
++
++## Scope and checks
++
++The existing Console, Agent controls, Agent Attach and ordinary Shell Terminal
++use SSH over Iroh. Hosts are selected by stable endpoint ID. No VPN extension,
++public SSH listener, copied TUI implementation, or local TCP proxy is needed.
++
++File/image uploads are hidden for Attached Hosts. SFTP-dependent operations
++(including push registration, remote directory browsing and session-file usage
++figures) are unavailable. Standard SSH Hosts keep their existing behavior.
++Foreground reconnect reuses Heeler's existing lifecycle; this does not promise
++background terminal connectivity while iOS suspends the app. Attached still has
++one shared consumer identity per account, so concurrent desktop/mobile use needs
++testing; this change does not introduce per-device enrollment or revocation.
++
++Focused tests on the Mac:
++
++```sh
++make test-app TEST_FLAGS='-only-testing:HeelerTests/AttachedTransportTests -only-testing:HeelerTests/HostDraftTests -only-testing:HeelerTests/HostStoreTests'
++scripts/run-heelerssh-package-tests.sh
++```
++
++On a device, verify Agent Attach, shell typing and resizing, leaving and reopening
++a terminal, switching Hosts/sessions, Wi-Fi-to-cellular reconnect, and a publisher
++restart. Leaving a terminal should detach without logging out its persistent
++shell. Compare a known-good standard SSH Host if diagnosing a Herdr/API issue.
+diff --git a/project.yml b/project.yml
+index 06063e2..da85492 100644
+--- a/project.yml
++++ b/project.yml
+@@ -4,7 +4,7 @@ options:
+   deploymentTarget:
+     iOS: "18.0"
+   createIntermediateGroups: true
+-  minimumXcodeGenVersion: "2.42.0"
++  minimumXcodeGenVersion: "2.46.0"
+ 
+ settings:
+   base:
+@@ -15,6 +15,8 @@ settings:
+     CODE_SIGN_STYLE: Automatic
+ 
+ packages:
++  AttachedMobile:
++    path: Packages/AttachedMobile
+   # Repository-local package owning the libssh2/OpenSSL implementation and
+   # checked-in native artifacts. The one SSH backend (ADR 0011).
+   HeelerSSH:
+@@ -99,6 +101,7 @@ targets:
+         INFOPLIST_KEY_NSSupportsLiveActivities: YES
+     dependencies:
+       - package: HeelerSSH
++      - package: AttachedMobile
+       - package: GhosttyTerminal
+       - package: GhosttyTerminal
+         product: GhosttyTheme
+@@ -222,6 +225,7 @@ targets:
+     dependencies:
+       - target: Heeler
+       - package: HeelerSSH
++      - package: AttachedMobile
+       - package: GhosttyTerminal
+ 
+ schemes:
+diff --git a/scripts/attached-revision b/scripts/attached-revision
+new file mode 100644
+index 0000000..c1ec371
+--- /dev/null
++++ b/scripts/attached-revision
+@@ -0,0 +1 @@
++7480fd0572aa00e3b4a8e8000124dbc737e14ab0
+diff --git a/scripts/build-attached.sh b/scripts/build-attached.sh
+new file mode 100755
+index 0000000..f13e922
+--- /dev/null
++++ b/scripts/build-attached.sh
+@@ -0,0 +1,24 @@
++#!/usr/bin/env bash
++set -euo pipefail
++ROOT="$(cd "$(dirname "$0")/.." && pwd)"
++REVISION="$(tr -d '\n' < "$ROOT/scripts/attached-revision")"
++[[ "$REVISION" =~ ^[0-9a-f]{40}$ ]] || { echo 'Invalid Attached revision pin.' >&2; exit 1; }
++OUTPUT="$ROOT/Packages/AttachedMobile"
++STAMP="$OUTPUT/.attached-revision"
++if [[ "${FORCE_ATTACHED_BUILD:-0}" != 1 && -f "$STAMP" && "$(cat "$STAMP")" == "$REVISION" \
++      && -f "$OUTPUT/Artifacts/AttachedMobileFFI.xcframework/Info.plist" \
++      && -f "$OUTPUT/Sources/AttachedMobile/AttachedMobile.swift" ]]; then
++  exit 0
++fi
++[[ "$(uname -s)" == Darwin ]] || { echo 'Building AttachedMobile requires macOS with Xcode.' >&2; exit 1; }
++CACHE="$ROOT/.ci/attached-source"
++if [[ ! -d "$CACHE/.git" ]]; then
++  mkdir -p "$CACHE"
++  git -C "$CACHE" init
++  git -C "$CACHE" remote add origin https://github.com/pvalletbo/attached.git
++fi
++[[ -z "$(git -C "$CACHE" status --porcelain)" ]] || { echo 'Attached build checkout has local changes; preserve them before rebuilding.' >&2; exit 1; }
++git -C "$CACHE" fetch --depth 1 origin "$REVISION"
++git -C "$CACHE" checkout --detach "$REVISION"
++"$CACHE/scripts/build-apple-client.sh" "$OUTPUT"
++printf '%s\n' "$REVISION" > "$STAMP"

@@ -1,0 +1,45 @@
+name: Heeler Attached integration
+on:
+  pull_request:
+    paths:
+      - integrations/heeler/**
+      - .github/workflows/heeler-ios.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: heeler-ios-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  prepare-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Check preparation and overwrite protection
+        run: bash integrations/heeler/test-prepare.sh
+  simulator:
+    runs-on: macos-26
+    timeout-minutes: 80
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: 1.97.1
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Prepare the complete Heeler source
+        run: bash integrations/heeler/prepare.sh "$RUNNER_TEMP/Heeler"
+      - name: Build the pinned Attached Apple package
+        working-directory: ${{ runner.temp }}/Heeler
+        run: make attached-client
+      - name: Build app and run focused Host and Attached tests
+        working-directory: ${{ runner.temp }}/Heeler
+        run: make test-app TEST_FLAGS='-only-testing:HeelerTests/AttachedTransportTests -only-testing:HeelerTests/HostDraftTests -only-testing:HeelerTests/HostStoreTests'
+      - name: Test embedded SSH transport ownership
+        working-directory: ${{ runner.temp }}/Heeler
+        run: scripts/run-heelerssh-package-tests.sh
