@@ -35,6 +35,10 @@ targets = [
 pr-run-mode = "plan"
 # Reject anything except stable vX.Y.Z tags before release builds start.
 plan-jobs = ["./release-tag-check"]
+# Test the candidate Linux archive against a disposable local Worker before
+# uploading/publishing. Global artifact hooks are direct dependencies of host,
+# so a failed E2E cannot be mistaken for a skipped downstream build.
+global-artifacts-jobs = ["./release-e2e"]
 # Generate checksums and attest every artifact before creating the GitHub Release.
 checksum = "sha256"
 github-attestations = true

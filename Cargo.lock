@@ -286,9 +286,11 @@ dependencies = [
  "clap",
  "getrandom 0.4.3",
  "reqwest",
+ "serde_json",
  "sha2",
  "tempfile",
  "tokio",
+ "toml",
 ]
 
 [[package]]

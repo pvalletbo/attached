@@ -3,6 +3,8 @@ FROM rust:1.97.1-bookworm AS harness-build
 WORKDIR /build
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
+COPY .github/workflows ./.github/workflows
+COPY dist-workspace.toml ./
 ENV CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0
 RUN cargo build --locked --jobs 1 --package attached-e2e
 # Exercise the Linux PTY adapter offline before any real account is created.
@@ -10,7 +12,7 @@ RUN cargo test --locked --offline --jobs 1 --package attached-e2e
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates openssh-client util-linux tar xz-utils \
+        ca-certificates openssh-client util-linux tar xz-utils socat \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 1000 --shell /bin/sh attached
 COPY --from=harness-build /build/target/debug/attached-e2e /usr/local/bin/attached-e2e

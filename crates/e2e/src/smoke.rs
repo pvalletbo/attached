@@ -7,20 +7,24 @@ use tokio::time::Instant;
 use crate::{
     docker::{Executor, Spec, checked},
     random_secret,
-    release::validate_version,
+    release::{candidate_context, validate_version},
 };
 
 pub(crate) const LABEL: &str = "io.attached.e2e-run";
+#[cfg(test)]
 pub(crate) const PRODUCTION: &str = "https://herdr.attached.sh";
 
 #[derive(Args)]
 pub(crate) struct Options {
-    /// Backend origin. Defaults to PRODUCTION; each run leaves a new backend account.
-    #[arg(long, default_value = PRODUCTION)]
+    /// External backend origin; omitted = deploy a disposable local Worker.
+    #[arg(long, default_value = "")]
     pub service: String,
     /// Official stable version (e.g. 0.3.5); omitted = build the current checkout.
     #[arg(long, value_parser = validate_version)]
     pub release: Option<String>,
+    /// Candidate Linux .tar.xz with adjacent .sha256; do not rebuild/download the CLI.
+    #[arg(long, conflicts_with = "release")]
+    pub archive: Option<PathBuf>,
 }
 
 pub(crate) struct Smoke<E> {
@@ -54,6 +58,12 @@ impl<E: Executor> Smoke<E> {
     }
 
     pub async fn build(&mut self) -> Result<()> {
+        // Reject bad candidates before creating any Docker resources.
+        let candidate = if let Some(archive) = &self.options.archive {
+            Some(candidate_context(archive, &self.image).await?)
+        } else {
+            None
+        };
         self.images.push(self.image.clone());
         let dockerfile = self.root.join("e2e/Dockerfile");
         let mut spec = Spec::new(&[
@@ -66,7 +76,9 @@ impl<E: Executor> Smoke<E> {
             "--label",
             &self.label,
             "--target",
-            if self.options.release.is_some() {
+            if self.options.archive.is_some() {
+                "runtime"
+            } else if self.options.release.is_some() {
                 "release"
             } else {
                 "source"
@@ -80,6 +92,24 @@ impl<E: Executor> Smoke<E> {
         }
         spec.args.push(self.root.to_string_lossy().into_owned());
         checked(&self.executor, spec).await?;
+        if let Some(context) = candidate {
+            checked(
+                &self.executor,
+                Spec::new(&[
+                    "build",
+                    "--force-rm",
+                    "--tag",
+                    &self.image,
+                    "--label",
+                    &self.label,
+                    "-",
+                ])
+                .input(context)
+                .stream()
+                .seconds(120),
+            )
+            .await?;
+        }
         let version_container = format!("{}-version", self.prefix);
         self.containers.push(version_container.clone());
         let output = checked(
@@ -113,7 +143,10 @@ impl<E: Executor> Smoke<E> {
                     .is_none_or(|expected| version == format!("attached {expected}")),
             "unexpected binary version: {version:?}"
         );
-        println!("Testing {version} against {}", self.options.service);
+        println!("Testing {version} against {}", self.service());
+        if self.local_backend() {
+            self.build_backend().await?;
+        }
         Ok(())
     }
 
@@ -246,7 +279,10 @@ impl<E: Executor> Smoke<E> {
     pub async fn exercise(&mut self) -> Result<()> {
         let client = self.create_machine("client").await?;
         let publisher = self.create_machine("publisher").await?;
-        self.machine(&client, &["create", "--service", &self.options.service])
+        if self.local_backend() {
+            self.start_backend(&client, &publisher).await?;
+        }
+        self.machine(&client, &["create", "--service", self.service()])
             .await?;
         self.machine(&client, &["export"]).await?;
         self.transfer_bundle(&client, &publisher).await?;
@@ -278,6 +314,11 @@ impl<E: Executor> Smoke<E> {
                         ])
                         .stream(),
                     )
+                    .await;
+            } else if container.ends_with("-backend") {
+                let _ = self
+                    .executor
+                    .execute(Spec::new(&["logs", "--tail", "50", container]).stream())
                     .await;
             }
         }
@@ -334,7 +375,11 @@ impl<E: Executor> Smoke<E> {
 
     pub async fn run_until(&mut self, cancellation: impl Future<Output = ()>) -> Result<()> {
         println!("Run label: {}", self.label);
-        println!("Creates one backend account; the backend has no account-deletion API.");
+        if self.local_backend() {
+            println!("Local backend: all account/record state will be destroyed at exit.");
+        } else {
+            println!("External backend: creates one account which cannot be deleted by this test.");
+        }
         let result = tokio::select! {
             result = async {
                 checked(&self.executor, Spec::new(&["info"])).await?;
@@ -364,13 +409,14 @@ mod tests {
             Options {
                 service: PRODUCTION.into(),
                 release: None,
+                archive: None,
             },
         )
         .unwrap()
     }
 
     #[test]
-    fn defaults_are_production_and_resources_are_unique() {
+    fn external_fixture_and_resources_are_unique() {
         let first = smoke();
         let second = smoke();
         assert_eq!(first.options.service, PRODUCTION);
