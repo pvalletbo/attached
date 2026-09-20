@@ -1,0 +1,92 @@
+name: Docker account and SSH E2E
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/e2e.yml
+      - .dockerignore
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - crates/e2e/**
+      - e2e/**
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/e2e.yml
+      - .dockerignore
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - crates/e2e/**
+      - e2e/**
+  # Production runs are deliberate. PRs only exercise the offline Rust harness.
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Stable release (e.g. 0.3.5); leave empty to build this ref'
+        type: string
+        default: ''
+      service:
+        description: 'Backend origin (default is production)'
+        type: string
+        default: 'https://herdr.attached.sh'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-e2e-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+
+jobs:
+  harness:
+    name: Offline Rust E2E harness tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Check harness formatting
+        run: cargo fmt --package attached-e2e -- --check
+      - name: Test subprocesses, PTYs, isolation, cleanup, and release checksums
+        run: cargo test --locked --package attached-e2e
+      - name: Lint the Rust harness
+        run: cargo clippy --locked --package attached-e2e --all-targets -- -D warnings
+      - name: Check whitespace
+        run: git diff --check
+
+  live:
+    name: Live account, publish bundle, and remote SSH
+    if: github.event_name == 'workflow_dispatch'
+    needs: harness
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      E2E_RELEASE: ${{ inputs.release }}
+      E2E_SERVICE: ${{ inputs.service }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Test in disposable client and publisher containers
+        run: |
+          args=(--service "$E2E_SERVICE")
+          if [[ -n "$E2E_RELEASE" ]]; then
+            args+=(--release "$E2E_RELEASE")
+          fi
+          cargo run --locked --package attached-e2e -- "${args[@]}"
