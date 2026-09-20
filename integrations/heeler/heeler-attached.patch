@@ -54,7 +54,7 @@ index 7facdea..6cc000d 100644
    the model's context window, `11.0%`, once omp on the Host has named it),
    and spend in a strip above the terminal. These are the figures the Agent's own status line
 diff --git a/Heeler.xcodeproj/project.pbxproj b/Heeler.xcodeproj/project.pbxproj
-index 41553bb..c2d689b 100644
+index 41553bb..5c3f43c 100644
 --- a/Heeler.xcodeproj/project.pbxproj
 +++ b/Heeler.xcodeproj/project.pbxproj
 @@ -43,7 +43,7 @@
@@ -75,7 +75,15 @@ index 41553bb..c2d689b 100644
  		36FB81E449F98DC68A366C2E /* HerdrAPITypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F7065C3BE109D2F52AE3BC2 /* HerdrAPITypes.swift */; };
  		3776558F9FD16419AC405116 /* AttachRestorationTraceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D6BD5F61844F525B628AB358 /* AttachRestorationTraceTests.swift */; };
  		37C68934DECD9C68B45FDA0F /* DetailCrossfade.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A0E438CAFD221387D974C00 /* DetailCrossfade.swift */; };
-@@ -178,6 +178,7 @@
+@@ -110,6 +110,7 @@
+ 		3D9E40D07D129463A5580CDD /* NotificationRelaySettingsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5D958EC1516F09B78E346C6 /* NotificationRelaySettingsTests.swift */; };
+ 		3DE1CE95436158C0938EF501 /* AgentSurfaceReplacementTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E9B93EC423746B334EF06419 /* AgentSurfaceReplacementTests.swift */; };
+ 		3ECC4677BDBD122A9ABF9CAF /* StartAgentStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84DA8573DB6A7EBC95A57F2F /* StartAgentStoreTests.swift */; };
++		3F16079E304E138A65E300FA /* AttachedBlockingWork.swift in Sources */ = {isa = PBXBuildFile; fileRef = E2D58D0D2928F5FEB0B8A7EF /* AttachedBlockingWork.swift */; };
+ 		3FF9CAFABBAF0AC741941C26 /* AgentListFieldsAddFieldSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = E24C0B60FDE0AD3D3ABD13E4 /* AgentListFieldsAddFieldSheet.swift */; };
+ 		4027E44B8C29A7A41175CBE6 /* InputShortcutStripPresentationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D8C7ED93EA20FF003EB8ACE /* InputShortcutStripPresentationTests.swift */; };
+ 		405A7A8AE730C7ABD606DAD7 /* LiveActivityControlling.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4B83DAB243F0D4C697FA3B8 /* LiveActivityControlling.swift */; };
+@@ -178,6 +179,7 @@
  		61F58007C6B81F14D2F6B58B /* ClosePaneStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 414B652A16576BEDEE9AE000 /* ClosePaneStoreTests.swift */; };
  		629B85E9314A5CBA36B66DBD /* NotificationVectorFile.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2DAE3FAB8786392318939A6 /* NotificationVectorFile.swift */; };
  		630CF9C336B79F04A9477C58 /* PushRegistrationStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BEE35062339F9D6B0A9E684B /* PushRegistrationStoreTests.swift */; };
@@ -83,7 +91,7 @@ index 41553bb..c2d689b 100644
  		6372378951B3680EE77D667E /* AgentActivityContentBuilderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A8CFADE255E1F943BC2DCED5 /* AgentActivityContentBuilderTests.swift */; };
  		637B8BBB6F06AD8290874101 /* SnippetStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C17F006C341136811D0496E6 /* SnippetStore.swift */; };
  		63ADBED637BEA84B045BE9FC /* DeviceKeyStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = D24E7FB55E1DF14C8353ABDE /* DeviceKeyStore.swift */; };
-@@ -298,6 +299,7 @@
+@@ -298,6 +300,7 @@
  		A65D5B9E1A885A8287AD762C /* SolvingOrbRendererTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F979754410821940D0C4DEC /* SolvingOrbRendererTests.swift */; };
  		A6747734905576A8861C945A /* AgentFocusCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 370A6461E16FB281B88126B4 /* AgentFocusCoordinator.swift */; };
  		AA6498ABD1E1782C0B5D8F5B /* ConsoleStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00807A3942817BEE9800534F /* ConsoleStoreTests.swift */; };
@@ -91,7 +99,7 @@ index 41553bb..c2d689b 100644
  		AC0A24DC308EEBBAC1A04A7A /* AgentRouteTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 08B2655F8FDE37EAC2615457 /* AgentRouteTests.swift */; };
  		AE7E2063C7A908DFECE9FB98 /* NotificationRelaySettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 90A97F1827BC65B4A271F28C /* NotificationRelaySettings.swift */; };
  		AEE3EAD6534D2D9774BBDB1E /* SkillContentSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = BFB68C31A4C8A5EE1BAE32EC /* SkillContentSheet.swift */; };
-@@ -356,6 +358,7 @@
+@@ -356,6 +359,7 @@
  		CAEA10BC9AF3498E5FD73478 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 915C9462A4A8AA91C0B91498 /* PrivacyInfo.xcprivacy */; };
  		CBAEF7D1E91053F0B15E2F31 /* PairingCeremonyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1F0763484EE05424146492C1 /* PairingCeremonyTests.swift */; };
  		CCEBF66BA9AFE64EDD371A78 /* AttachUserMessageIndex.swift in Sources */ = {isa = PBXBuildFile; fileRef = 85BEE99E7BEFA0D0D985162C /* AttachUserMessageIndex.swift */; };
@@ -99,7 +107,7 @@ index 41553bb..c2d689b 100644
  		D08663BD250210835FE7ED49 /* PhotosPickerImageSelection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A3BD235B5209892137FCAF9 /* PhotosPickerImageSelection.swift */; };
  		D20C025851965986547FAAB5 /* ClosePaneStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1D46328CE795C513FE11AD04 /* ClosePaneStore.swift */; };
  		D2405D8443F085D4E3CD1810 /* NotificationKeyStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = DC6D0361E0EB15681156D5C7 /* NotificationKeyStore.swift */; };
-@@ -365,6 +368,7 @@
+@@ -365,6 +369,7 @@
  		D5750879A465E0B27C9B4431 /* TerminalAttachTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 07528112F1EC851708049E85 /* TerminalAttachTests.swift */; };
  		D618F80B03AABC27797586A1 /* HeelerSSH in Frameworks */ = {isa = PBXBuildFile; productRef = 6B0C40F1407743FF92CC9242 /* HeelerSSH */; };
  		D6620368048468EFA09B4142 /* HostOnboardingStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D961656A6D8B4F3964740BD /* HostOnboardingStoreTests.swift */; };
@@ -107,7 +115,7 @@ index 41553bb..c2d689b 100644
  		D6FBEC56A26E35A32CF2417A /* TerminalKeyModifiersTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B99CB61015DC220A2D9306A /* TerminalKeyModifiersTests.swift */; };
  		D7DD62B232DBA9CE8C89AFDD /* NotificationKeyMirrorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D55C5296892657D59171DFE /* NotificationKeyMirrorTests.swift */; };
  		D7E0DBBBC8229F24218C8958 /* TerminalRetentionBudget.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8ED55B6D7C29BC534BC116FE /* TerminalRetentionBudget.swift */; };
-@@ -394,6 +398,7 @@
+@@ -394,6 +399,7 @@
  		E2F51D71F8D6E3AF5FD1B9E8 /* SealedEnvelopeCodec.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7BE9C95E2AC313465A7B38FD /* SealedEnvelopeCodec.swift */; };
  		E379C1AD65B445D4E08614CF /* AgentNameTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 64D3B8E2EB97A8376B333914 /* AgentNameTests.swift */; };
  		E40D1C6F825ABCD68AA5F196 /* AttachTerminalStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8C5A562F5A01AE08691B8479 /* AttachTerminalStoreTests.swift */; };
@@ -115,7 +123,7 @@ index 41553bb..c2d689b 100644
  		E521D6779F4C453B6E098F14 /* TerminalFontSettingsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 427512344847A84699F819A0 /* TerminalFontSettingsTests.swift */; };
  		E563373DB446DBEF8B1701E3 /* DeviceKeyStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7FCA00B5F2A05A599D74FCCE /* DeviceKeyStoreTests.swift */; };
  		E68A1DDFA6C5F618BBB79AB7 /* AgentLayoutErrorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 66B70100FB78F319E7136652 /* AgentLayoutErrorView.swift */; };
-@@ -437,7 +442,7 @@
+@@ -437,7 +443,7 @@
  		FE387FB6FB6CC68E066B23AE /* HostCredentialsProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0DBBD602AA4969937A9306C3 /* HostCredentialsProvider.swift */; };
  		FE66019721BB44E8BAD287DB /* AgentActivityEnvelopeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7E3DCBFDF3ED4A63CBC1B3C /* AgentActivityEnvelopeTests.swift */; };
  		FEC497C4A95E5F4D945EF3BA /* EventsSessionSubscriptionsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 39AD641EA732307D72698216 /* EventsSessionSubscriptionsTests.swift */; };
@@ -124,7 +132,7 @@ index 41553bb..c2d689b 100644
  		FF96BFEF61D9D20912230256 /* LiveActivityVectorFile.swift in Sources */ = {isa = PBXBuildFile; fileRef = C5469F0188E985276A49871C /* LiveActivityVectorFile.swift */; };
  		FFFDB4A4BE267D1C933B0CB7 /* TerminalSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A3319D35C3BBCD2CB151843 /* TerminalSettings.swift */; };
  /* End PBXBuildFile section */
-@@ -542,6 +547,7 @@
+@@ -542,6 +548,7 @@
  		1F0763484EE05424146492C1 /* PairingCeremonyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairingCeremonyTests.swift; sourceTree = "<group>"; };
  		20F8AC685DA90F638BF187DA /* SkillSuggestionTrigger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SkillSuggestionTrigger.swift; sourceTree = "<group>"; };
  		21B19CA0EB3B37BB6C50BA4B /* HeelerWidgets.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = HeelerWidgets.entitlements; sourceTree = "<group>"; };
@@ -132,7 +140,7 @@ index 41553bb..c2d689b 100644
  		233075006FC2C8907BBFF40F /* GitBranchNameTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitBranchNameTests.swift; sourceTree = "<group>"; };
  		239FD696B72E804AE3D85D72 /* ComposerStagingStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ComposerStagingStoreTests.swift; sourceTree = "<group>"; };
  		247FF74AD248F26A072EA263 /* TerminalKeyboard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalKeyboard.swift; sourceTree = "<group>"; };
-@@ -597,6 +603,7 @@
+@@ -597,6 +604,7 @@
  		48EF1E70193168E3794D6266 /* SkeletonTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SkeletonTests.swift; sourceTree = "<group>"; };
  		48F025CF6E2C3068BF911290 /* IBMPlexMono-Regular.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "IBMPlexMono-Regular.ttf"; sourceTree = "<group>"; };
  		4997A79DA8D98F7BA97E60F6 /* TerminalMouseReporting.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalMouseReporting.swift; sourceTree = "<group>"; };
@@ -140,7 +148,7 @@ index 41553bb..c2d689b 100644
  		4A6481A3DABC8178E3FA8EF7 /* AgentSessionUsageTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentSessionUsageTests.swift; sourceTree = "<group>"; };
  		4AB8C5EA497D1094E86F69C4 /* WeakNetworkE2ETests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WeakNetworkE2ETests.swift; sourceTree = "<group>"; };
  		4C07BE449E30F431C247AF01 /* TerminalFullKeyboardLayoutTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalFullKeyboardLayoutTests.swift; sourceTree = "<group>"; };
-@@ -781,6 +788,7 @@
+@@ -781,6 +789,7 @@
  		B64F59C086BFF5B062ADCE8C /* ScriptedTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScriptedTransport.swift; sourceTree = "<group>"; };
  		B6A9489C21BDCFA7616782BF /* AgentLiveActivityWidget.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentLiveActivityWidget.swift; sourceTree = "<group>"; };
  		B6C5732C32E96A6C433D82B7 /* LicenseNotices.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LicenseNotices.swift; sourceTree = "<group>"; };
@@ -148,7 +156,13 @@ index 41553bb..c2d689b 100644
  		BB47B059A9FC5B8A63C834F2 /* AttachmentStaging.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AttachmentStaging.swift; sourceTree = "<group>"; };
  		BBD76A6D34E9A458C7E07ED0 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
  		BC019B4A164A7B01F1D46344 /* TerminalKeysKeyboard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalKeysKeyboard.swift; sourceTree = "<group>"; };
-@@ -854,6 +862,7 @@
+@@ -849,11 +858,13 @@
+ 		E088B83BDB55BAFA2D41450F /* HostLatencyFormatting.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HostLatencyFormatting.swift; sourceTree = "<group>"; };
+ 		E0B72AE2059C59D8A59C9B2A /* AppActivityCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppActivityCoordinator.swift; sourceTree = "<group>"; };
+ 		E24C0B60FDE0AD3D3ABD13E4 /* AgentListFieldsAddFieldSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentListFieldsAddFieldSheet.swift; sourceTree = "<group>"; };
++		E2D58D0D2928F5FEB0B8A7EF /* AttachedBlockingWork.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AttachedBlockingWork.swift; sourceTree = "<group>"; };
+ 		E48CA996470393ED037D0364 /* AgentRoute.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentRoute.swift; sourceTree = "<group>"; };
+ 		E4F4EF125BAB77F0DE121AAB /* DeviceKey.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceKey.swift; sourceTree = "<group>"; };
  		E70C49925D454207F859F897 /* HeelerSSHHostKeyPolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HeelerSSHHostKeyPolicyTests.swift; sourceTree = "<group>"; };
  		E75D3D1E1411C63AE7360D30 /* SidebarConsoleIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SidebarConsoleIntegrationTests.swift; sourceTree = "<group>"; };
  		E7F93F9925E94FF2C2B0254B /* AgentDirectInputChrome.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentDirectInputChrome.swift; sourceTree = "<group>"; };
@@ -156,7 +170,7 @@ index 41553bb..c2d689b 100644
  		E9B93EC423746B334EF06419 /* AgentSurfaceReplacementTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentSurfaceReplacementTests.swift; sourceTree = "<group>"; };
  		E9F961651EBA7FE1BEE00647 /* AppModelActivityDriverTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModelActivityDriverTests.swift; sourceTree = "<group>"; };
  		E9FD6FF5FE83C022600169BE /* AgentSkill.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentSkill.swift; sourceTree = "<group>"; };
-@@ -900,8 +909,9 @@
+@@ -900,8 +911,9 @@
  			buildActionMask = 2147483647;
  			files = (
  				D618F80B03AABC27797586A1 /* HeelerSSH in Frameworks */,
@@ -168,7 +182,7 @@ index 41553bb..c2d689b 100644
  			);
  			runOnlyForDeploymentPostprocessing = 0;
  		};
-@@ -910,7 +920,8 @@
+@@ -910,7 +922,8 @@
  			buildActionMask = 2147483647;
  			files = (
  				8DF7095F918DBDA5B76F24F1 /* HeelerSSH in Frameworks */,
@@ -178,7 +192,7 @@ index 41553bb..c2d689b 100644
  			);
  			runOnlyForDeploymentPostprocessing = 0;
  		};
-@@ -964,6 +975,7 @@
+@@ -964,6 +977,7 @@
  				0B248F9372687FDBE3AD24A1 /* AppForegroundRecoveryTests.swift */,
  				E9F961651EBA7FE1BEE00647 /* AppModelActivityDriverTests.swift */,
  				93417EFE29FA2DC3DD3FAF9F /* AsyncDeadlineTests.swift */,
@@ -186,7 +200,7 @@ index 41553bb..c2d689b 100644
  				D6BD5F61844F525B628AB358 /* AttachRestorationTraceTests.swift */,
  				8C5A562F5A01AE08691B8479 /* AttachTerminalStoreTests.swift */,
  				AE9AF5C6F7066900959E7E10 /* AttachUserMessageIndexTests.swift */,
-@@ -1183,6 +1195,7 @@
+@@ -1183,6 +1197,7 @@
  		4892D7AF177E633F713692C3 /* Hosts */ = {
  			isa = PBXGroup;
  			children = (
@@ -194,7 +208,7 @@ index 41553bb..c2d689b 100644
  				32AE04F29C794799B45E5C68 /* Host.swift */,
  				0DBBD602AA4969937A9306C3 /* HostCredentialsProvider.swift */,
  				F3A63EFEB7D00E59949CF331 /* HostDraft.swift */,
-@@ -1363,6 +1376,7 @@
+@@ -1363,6 +1378,7 @@
  		80BAAF0BFB8E96E9532F0F06 /* Packages */ = {
  			isa = PBXGroup;
  			children = (
@@ -202,15 +216,16 @@ index 41553bb..c2d689b 100644
  				4582B5EA42CFA9C8878E6207 /* HeelerSSH */,
  			);
  			path = Packages;
-@@ -1416,6 +1430,7 @@
+@@ -1416,6 +1432,8 @@
  			children = (
  				3A383F050585E92B29A100E2 /* AgentModelProbe.swift */,
  				C25E1DC34365B2E2FA6C5AA8 /* AsyncDeadline.swift */,
++				E2D58D0D2928F5FEB0B8A7EF /* AttachedBlockingWork.swift */,
 +				49EC495316E0CA4703B13300 /* AttachedTransport.swift */,
  				E4F4EF125BAB77F0DE121AAB /* DeviceKey.swift */,
  				D24E7FB55E1DF14C8353ABDE /* DeviceKeyStore.swift */,
  				7625958E48639DCE4F5A8391 /* EventsSession.swift */,
-@@ -1602,6 +1617,7 @@
+@@ -1602,6 +1620,7 @@
  			name = Heeler;
  			packageProductDependencies = (
  				6B0C40F1407743FF92CC9242 /* HeelerSSH */,
@@ -218,7 +233,7 @@ index 41553bb..c2d689b 100644
  				19D717C20DA226346335AFF6 /* GhosttyTerminal */,
  				E086C559FC229264CF662993 /* GhosttyTheme */,
  			);
-@@ -1642,6 +1658,7 @@
+@@ -1642,6 +1661,7 @@
  			name = HeelerTests;
  			packageProductDependencies = (
  				13CFA5F5C15E83F411CC03BA /* HeelerSSH */,
@@ -226,7 +241,7 @@ index 41553bb..c2d689b 100644
  				BE53F92F352D5CEE9A715FA9 /* GhosttyTerminal */,
  			);
  			productName = HeelerTests;
-@@ -1703,6 +1720,7 @@
+@@ -1703,6 +1723,7 @@
  			minimizedProjectReferenceProxies = 1;
  			packageReferences = (
  				C24992F3A9C17BAA1883EEBB /* XCRemoteSwiftPackageReference "libghostty-spm" */,
@@ -234,7 +249,7 @@ index 41553bb..c2d689b 100644
  				056B9BE67ABA0AE15160C8D8 /* XCLocalSwiftPackageReference "Packages/HeelerSSH" */,
  			);
  			preferredProjectObjectVersion = 77;
-@@ -1712,8 +1730,8 @@
+@@ -1712,8 +1733,8 @@
  			targets = (
  				081A3B29EFF2C7B2FCAA3248 /* Heeler */,
  				DFFB82C74B73FA5CBCE6D5D2 /* HeelerNotificationService */,
@@ -244,16 +259,17 @@ index 41553bb..c2d689b 100644
  			);
  		};
  /* End PBXProject section */
-@@ -1833,6 +1851,8 @@
+@@ -1833,6 +1854,9 @@
  				A25418700A3D7FCCC08026BF /* AttachRestorationTrace.swift in Sources */,
  				052916002C06699B9F2F1A4B /* AttachTerminalStore.swift in Sources */,
  				CCEBF66BA9AFE64EDD371A78 /* AttachUserMessageIndex.swift in Sources */,
++				3F16079E304E138A65E300FA /* AttachedBlockingWork.swift in Sources */,
 +				AB4C1A3E5D4844661575102D /* AttachedHostImportView.swift in Sources */,
 +				E42FDDF1893954179E36501C /* AttachedTransport.swift in Sources */,
  				B787DA8CB25A81E3914F8638 /* AttachmentStaging.swift in Sources */,
  				35205050C9CB8E473D8A28C0 /* Base64URL.swift in Sources */,
  				D20C025851965986547FAAB5 /* ClosePaneStore.swift in Sources */,
-@@ -2048,6 +2068,7 @@
+@@ -2048,6 +2072,7 @@
  				3776558F9FD16419AC405116 /* AttachRestorationTraceTests.swift in Sources */,
  				E40D1C6F825ABCD68AA5F196 /* AttachTerminalStoreTests.swift in Sources */,
  				DED05CBB7CDC71B3D92B7B36 /* AttachUserMessageIndexTests.swift in Sources */,
@@ -261,7 +277,7 @@ index 41553bb..c2d689b 100644
  				5150B659FACE9AFD9ECF9F6D /* AuthorizedKeysTestLock.swift in Sources */,
  				C3D2936548DD57036A1FB254 /* CancellablePhaseGate.swift in Sources */,
  				61F58007C6B81F14D2F6B58B /* ClosePaneStoreTests.swift in Sources */,
-@@ -2553,6 +2574,10 @@
+@@ -2553,6 +2578,10 @@
  			isa = XCLocalSwiftPackageReference;
  			relativePath = Packages/HeelerSSH;
  		};
@@ -272,7 +288,7 @@ index 41553bb..c2d689b 100644
  /* End XCLocalSwiftPackageReference section */
  
  /* Begin XCRemoteSwiftPackageReference section */
-@@ -2580,6 +2605,10 @@
+@@ -2580,6 +2609,10 @@
  			isa = XCSwiftPackageProductDependency;
  			productName = HeelerSSH;
  		};
@@ -283,7 +299,7 @@ index 41553bb..c2d689b 100644
  		BE53F92F352D5CEE9A715FA9 /* GhosttyTerminal */ = {
  			isa = XCSwiftPackageProductDependency;
  			package = C24992F3A9C17BAA1883EEBB /* XCRemoteSwiftPackageReference "libghostty-spm" */;
-@@ -2590,6 +2619,10 @@
+@@ -2590,6 +2623,10 @@
  			package = C24992F3A9C17BAA1883EEBB /* XCRemoteSwiftPackageReference "libghostty-spm" */;
  			productName = GhosttyTheme;
  		};
@@ -513,7 +529,7 @@ index f04661d..a174bac 100644
              addImage: { isSelectingPhoto = true },
 diff --git a/Sources/Heeler/Hosts/AttachedHostImportView.swift b/Sources/Heeler/Hosts/AttachedHostImportView.swift
 new file mode 100644
-index 0000000..5ad48d4
+index 0000000..268dc7f
 --- /dev/null
 +++ b/Sources/Heeler/Hosts/AttachedHostImportView.swift
 @@ -0,0 +1,143 @@
@@ -607,11 +623,11 @@ index 0000000..5ad48d4
 +            let cancellation = AttachedCancellation()
 +            do {
 +                let result = try await withTaskCancellationHandler {
-+                    try await Task.detached {
++                    try await AttachedBlockingWork.run {
 +                        let client = try AttachedClient(downloadBundle: encoded)
 +                        defer { client.close() }
 +                        return (client.accountId(), try client.hosts(cancellation: cancellation))
-+                    }.value
++                    }
 +                } onCancel: {
 +                    cancellation.cancel()
 +                }
@@ -1022,12 +1038,40 @@ index f7fb800..519de0d 100644
 +            attachedAccountID: host.attachedAccountID)
      }
  }
+diff --git a/Sources/Heeler/Transport/AttachedBlockingWork.swift b/Sources/Heeler/Transport/AttachedBlockingWork.swift
+new file mode 100644
+index 0000000..0121af3
+--- /dev/null
++++ b/Sources/Heeler/Transport/AttachedBlockingWork.swift
+@@ -0,0 +1,22 @@
++import Dispatch
++
++/// UniFFI entry points synchronously wait for Rust network operations. Dispatch
++/// owns those blocking threads; Swift's cooperative executor stays available
++/// for terminal I/O, actor work, and cancellation. Callers cancel Rust explicitly
++/// with AttachedCancellation and check task cancellation after the result.
++enum AttachedBlockingWork {
++    private static let queue = DispatchQueue(
++        label: "dev.bybee.heeler.attached.ffi", qos: .userInitiated, attributes: .concurrent)
++
++    static func run<T: Sendable>(
++        _ operation: @escaping @Sendable () throws -> T
++    ) async throws -> T {
++        try await withCheckedThrowingContinuation { continuation in
++            queue.async {
++                do { continuation.resume(returning: try operation()) } catch {
++                    continuation.resume(throwing: error)
++                }
++            }
++        }
++    }
++}
 diff --git a/Sources/Heeler/Transport/AttachedTransport.swift b/Sources/Heeler/Transport/AttachedTransport.swift
 new file mode 100644
-index 0000000..f80df05
+index 0000000..18b1dd6
 --- /dev/null
 +++ b/Sources/Heeler/Transport/AttachedTransport.swift
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,158 @@
 +import AttachedMobile
 +import Darwin
 +import Foundation
@@ -1128,14 +1172,15 @@ index 0000000..f80df05
 +        let key = DeviceKey(privateKey: privateKey)
 +        let cancellation = AttachedCancellation()
 +        let tunnel = try await withTaskCancellationHandler {
-+            // UniFFI's synchronous API runs on a worker, never on MainActor.
++            // The synchronous FFI waits on Rust's runtime. Do not block Swift's
++            // cooperative task pool when several Hosts connect simultaneously.
 +            let tunnel: AttachedTunnel
 +            do {
-+                tunnel = try await Task.detached {
++                tunnel = try await AttachedBlockingWork.run {
 +                    try client.connect(
 +                        endpointId: settings.host, publicKey: key.openSSHPublicKey,
 +                        cancellation: cancellation)
-+                }.value
++                }
 +            } catch {
 +                if Task.isCancelled { throw TransportError.cancelled }
 +                throw TransportError.sshUnreachable(
@@ -1334,10 +1379,11 @@ index 819e8f6..4b46e91 100644
      /// the strategy from spec #16: `herdr remote-client-bridge` ensures the
 diff --git a/Tests/HeelerTests/AttachedTransportTests.swift b/Tests/HeelerTests/AttachedTransportTests.swift
 new file mode 100644
-index 0000000..7c600c6
+index 0000000..40d6454
 --- /dev/null
 +++ b/Tests/HeelerTests/AttachedTransportTests.swift
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,79 @@
++import AttachedMobile
 +import CryptoKit
 +import Foundation
 +import HeelerSSH
@@ -1347,6 +1393,16 @@ index 0000000..7c600c6
 +
 +@Suite("Attached transport")
 +struct AttachedTransportTests {
++    @MainActor @Test func blockingFFIRunsOffMainThreadAndPropagatesRustErrors() async throws {
++        let onMainThread = try await AttachedBlockingWork.run { Thread.isMainThread }
++        #expect(!onMainThread)
++        await #expect(throws: MobileError.self) {
++            _ = try await AttachedBlockingWork.run {
++                try AttachedClient(downloadBundle: "invalid-download-bundle")
++            }
++        }
++    }
++
 +    @Test func admissionKeyMustMatchTheSSHHandshakeBeforeAuthentication() throws {
 +        let device = DeviceKey(privateKey: Curve25519.Signing.PrivateKey())
 +        let key = SSHHostKey(algorithm: "ssh-ed25519", key: device.publicKeyBlob)
