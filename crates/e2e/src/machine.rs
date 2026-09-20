@@ -16,6 +16,10 @@ pub(crate) enum Action {
         service: String,
     },
     Export,
+    Health {
+        #[arg(long)]
+        service: String,
+    },
     Serve {
         #[arg(long)]
         proof: String,
@@ -60,6 +64,7 @@ fn verify_output(output: &str, proof: &str) -> Result<()> {
 
 pub(crate) async fn run(action: Action) -> Result<()> {
     match action {
+        Action::Health { service } => crate::backend::health(&service).await?,
         Action::Create { service } => {
             command(&["account", "create", "--service", &service], true, 0).await?;
             println!("PASS: new account created and saved");

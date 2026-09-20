@@ -99,9 +99,165 @@ pub(crate) async fn install(version: &str) -> Result<()> {
     Ok(())
 }
 
+pub(crate) async fn candidate_context(archive: &Path, runtime_image: &str) -> Result<Vec<u8>> {
+    let name = archive
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("invalid archive filename")?;
+    let package = name
+        .strip_suffix(".tar.xz")
+        .context("candidate must be a .tar.xz archive")?;
+    let checksum = archive.with_file_name(format!("{name}.sha256"));
+    let binary = executable(
+        &std::fs::read(archive)?,
+        &std::fs::read_to_string(checksum)?,
+        &format!("{package}/attached"),
+    )
+    .await?;
+    let directory = tempfile::tempdir()?;
+    std::fs::write(
+        directory.path().join("Dockerfile"),
+        format!("FROM {runtime_image}\nCOPY attached /usr/local/bin/attached\n"),
+    )?;
+    let path = directory.path().join("attached");
+    std::fs::write(&path, binary)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+    // These temporary files contain only the public candidate binary, never
+    // credentials. USTAR without xattrs avoids leaking host metadata and macOS
+    // AppleDouble/provenance records unsupported by the Linux Docker daemon.
+    let context = run(
+        "tar",
+        &strings(&[
+            "--format=ustar",
+            "--no-xattrs",
+            "-cf",
+            "-",
+            "-C",
+            &directory.path().to_string_lossy(),
+            "Dockerfile",
+            "attached",
+        ]),
+        None,
+        false,
+        Duration::from_secs(30),
+    )
+    .await?;
+    ensure!(
+        context.code == 0,
+        "could not prepare candidate Docker context"
+    );
+    Ok(context.stdout)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn candidate_uses_verified_archive_not_source_build_or_download() {
+        use crate::{
+            docker::tests::Fake,
+            smoke::{Options, Smoke},
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let package = "attached-x86_64-unknown-linux-gnu";
+        std::fs::create_dir(directory.path().join(package)).unwrap();
+        std::fs::write(
+            directory.path().join(package).join("attached"),
+            b"\x7fELFbinary",
+        )
+        .unwrap();
+        let packed = run(
+            "tar",
+            &strings(&[
+                "-cJf",
+                "-",
+                "-C",
+                &directory.path().to_string_lossy(),
+                package,
+            ]),
+            None,
+            false,
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(packed.code, 0);
+        let archive = directory.path().join(format!("{package}.tar.xz"));
+        let checksum = directory.path().join(format!("{package}.tar.xz.sha256"));
+        std::fs::write(&archive, &packed.stdout).unwrap();
+        std::fs::write(&checksum, digest(&packed.stdout)).unwrap();
+        let mut test = Smoke::new(
+            Fake::default(),
+            Options {
+                service: String::new(),
+                release: None,
+                archive: Some(archive),
+            },
+        )
+        .unwrap();
+        test.build().await.unwrap();
+        {
+            let calls = test.executor.calls.lock().unwrap();
+            assert!(calls[0].args.contains(&"runtime".into()));
+            assert!(calls.iter().all(|s| {
+                !s.args
+                    .iter()
+                    .any(|arg| arg.starts_with("ATTACHED_VERSION="))
+            }));
+            assert!(
+                calls
+                    .last()
+                    .unwrap()
+                    .args
+                    .iter()
+                    .any(|arg| arg.ends_with("Dockerfile.backend"))
+            );
+        }
+        let context = test.executor.calls.lock().unwrap()[1]
+            .input
+            .clone()
+            .unwrap();
+        // First record must be the regular Dockerfile, not a PAX/xattr header
+        // importing macOS provenance metadata unsupported by the Linux daemon.
+        assert_eq!(&context[..10], b"Dockerfile");
+        assert_eq!(context[156], b'0');
+        let tar = directory.path().join("context.tar");
+        std::fs::write(&tar, context).unwrap();
+        let listed = run(
+            "tar",
+            &strings(&["-tf", &tar.to_string_lossy()]),
+            None,
+            false,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(listed.stdout).unwrap(),
+            "Dockerfile\nattached\n"
+        );
+        let executable = run(
+            "tar",
+            &strings(&["-xOf", &tar.to_string_lossy(), "attached"]),
+            None,
+            false,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(executable.stdout, b"\x7fELFbinary");
+        test.executor.calls.lock().unwrap().clear();
+        std::fs::write(checksum, "0".repeat(64)).unwrap();
+        assert!(
+            test.build()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("checksum mismatch")
+        );
+        assert!(test.executor.calls.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn stable_version_and_architecture_are_pinned_not_interpolated_unsafely() {
