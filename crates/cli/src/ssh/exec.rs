@@ -29,6 +29,7 @@ pub(super) struct Service {
     pub cancellation: CancellationToken,
     pub tasks: TaskTracker,
     pub channels: Arc<Semaphore>,
+    pub forwarding: Arc<Semaphore>,
     pub channel_cancellations: HashMap<ChannelId, CancellationToken>,
 }
 
@@ -59,7 +60,9 @@ impl Handler for Service {
     ) -> Result<()> {
         // Count channels awaiting the peer's CLOSE acknowledgement as well as
         // running tasks, so a peer cannot accumulate unacknowledged channel state.
-        if self.channel_cancellations.len() >= 8 {
+        self.channel_cancellations
+            .retain(|_, token| !token.is_cancelled());
+        if self.channel_cancellations.len() >= 26 {
             return Ok(());
         }
         let Ok(permit) = self.channels.clone().try_acquire_owned() else {
@@ -79,6 +82,60 @@ impl Handler for Service {
                     _ = cancellation.cancelled() => {},
                     _ = async { let _ = handle.channel_failure(id).await; let _ = handle.close(id).await; } => {},
                 }
+            }
+        });
+        Ok(())
+    }
+    async fn channel_open_direct_streamlocal(
+        &mut self,
+        channel: Channel<Msg>,
+        socket_path: &str,
+        reply: server::ChannelOpenHandle,
+        session: &mut Session,
+    ) -> Result<()> {
+        // The authenticated consumer already has shell access as this OS user.
+        // Socket permissions remain enforced by the OS; never accept abstract,
+        // relative or NUL-containing paths and never run a privileged proxy.
+        if !std::path::Path::new(socket_path).is_absolute()
+            || socket_path.as_bytes().contains(&0)
+            || socket_path.len() > 4096
+        {
+            return Ok(());
+        }
+        self.channel_cancellations
+            .retain(|_, token| !token.is_cancelled());
+        if self.channel_cancellations.len() >= 26 {
+            return Ok(());
+        }
+        let Ok(permit) = self.forwarding.clone().try_acquire_owned() else {
+            return Ok(());
+        };
+        let cancellation = self.cancellation.child_token();
+        self.channel_cancellations
+            .insert(channel.id(), cancellation.clone());
+        let path = socket_path.to_owned();
+        let handle = session.handle();
+        self.tasks.spawn(async move {
+            let _permit = permit;
+            let id = channel.id();
+            let connected = tokio::select! {
+                _ = cancellation.cancelled() => return,
+                result = tokio::time::timeout(Duration::from_secs(5), tokio::net::UnixStream::connect(path)) => result,
+            };
+            let Ok(Ok(socket)) = connected else {
+                // A rejected open has no CLOSE exchange. Reclaim its map entry
+                // at the next admission without freeing accepted channel state.
+                cancellation.cancel();
+                return;
+            };
+            reply.accept().await;
+            tokio::select! {
+                _ = cancellation.cancelled() => {},
+                _ = super::forward::bridge(channel.into_stream(), socket) => {},
+            }
+            tokio::select! {
+                _ = cancellation.cancelled() => {},
+                _ = async { let _ = handle.eof(id).await; let _ = handle.close(id).await; } => {},
             }
         });
         Ok(())
@@ -120,11 +177,18 @@ async fn run_channel(
     cancellation: CancellationToken,
 ) -> Result<()> {
     let id = channel.id();
+    let mut terminal = None;
     let request = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             tokio::select! {
                 _ = cancellation.cancelled() => bail!("SSH channel cancelled"),
                 msg = channel.wait() => match msg {
+                    Some(ChannelMsg::RequestPty { term, col_width, row_height, want_reply, terminal_modes, .. }) if terminal.is_none() => {
+                        match super::pty::allocate(&term, col_width, row_height, &terminal_modes) {
+                            Ok(pty) => { terminal = Some((pty, term)); if want_reply { handle.channel_success(id).await.map_err(|_| anyhow::anyhow!("SSH session closed"))?; } },
+                            Err(_) => { if want_reply { handle.channel_failure(id).await.map_err(|_| anyhow::anyhow!("SSH session closed"))?; } },
+                        }
+                    }
                     Some(ChannelMsg::Exec { command, want_reply }) => break Ok((Some(command), want_reply)),
                     Some(ChannelMsg::RequestShell { want_reply }) => break Ok((None, want_reply)),
                     Some(ChannelMsg::Eof | ChannelMsg::Close) | None => bail!("channel closed before command"),
@@ -133,6 +197,9 @@ async fn run_channel(
             }
         }
     }).await??;
+    if let Some((pty, term)) = terminal {
+        return super::pty::run(channel, handle, policy, cancellation, pty, term, request).await;
+    }
     let mut command = Command::new(&policy.shell);
     if let Some(ref bytes) = request.0 {
         anyhow::ensure!(
@@ -226,14 +293,18 @@ async fn run_channel(
     }
 }
 
-struct ProcessGroup(u32);
+pub(super) struct ProcessGroup(pub(super) u32);
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
         crate::bounded_process::terminate_process_group(self.0);
     }
 }
 
-async fn reject_request(msg: &ChannelMsg, handle: &server::Handle, id: ChannelId) -> Result<()> {
+pub(super) async fn reject_request(
+    msg: &ChannelMsg,
+    handle: &server::Handle,
+    id: ChannelId,
+) -> Result<()> {
     let reply = match msg {
         ChannelMsg::Exec { want_reply, .. }
         | ChannelMsg::RequestShell { want_reply }
@@ -286,7 +357,8 @@ where
         authenticated: authenticated.clone(),
         cancellation: cancellation.child_token(),
         tasks: tasks.clone(),
-        channels: Arc::new(Semaphore::new(8)),
+        channels: Arc::new(Semaphore::new(10)),
+        forwarding: Arc::new(Semaphore::new(16)),
         channel_cancellations: HashMap::new(),
     };
     let running = tokio::time::timeout(

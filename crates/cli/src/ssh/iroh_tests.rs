@@ -8,7 +8,7 @@ use russh::{
     keys::{PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate},
 };
 use std::{net::Ipv4Addr, sync::Arc};
-use tokio::time::timeout;
+use tokio::{io::AsyncWriteExt, time::timeout};
 
 const DEADLINE: Duration = Duration::from_secs(20);
 
@@ -280,7 +280,7 @@ async fn iroh_rejects_wrong_ssh_host_key() {
 }
 
 #[tokio::test]
-async fn iroh_rejects_pty_env_subsystems_and_forwarding() {
+async fn iroh_rejects_invalid_pty_env_subsystems_and_tcp_forwarding() {
     let harness = Harness::new(|_| {}).await;
     let client = harness.authenticated().await;
     assert!(
@@ -292,7 +292,7 @@ async fn iroh_rejects_pty_env_subsystems_and_forwarding() {
     assert!(client.tcpip_forward("127.0.0.1", 0).await.is_err());
     let mut channel = client.channel_open_session().await.unwrap();
     channel
-        .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+        .request_pty(true, "xterm", 0, 24, 0, 0, &[])
         .await
         .unwrap();
     assert!(matches!(
@@ -547,9 +547,164 @@ async fn ssh_session_channel_limit_is_bounded() {
     let harness = Harness::new(|_| {}).await;
     let client = harness.authenticated().await;
     let mut channels = Vec::new();
-    for _ in 0..8 {
+    for _ in 0..10 {
         channels.push(client.channel_open_session().await.unwrap());
     }
     assert!(client.channel_open_session().await.is_err());
+    harness.close().await;
+}
+
+#[tokio::test]
+async fn interactive_pty_resizes_and_executes_with_a_controlling_terminal() {
+    let harness = Harness::new(|_| {}).await;
+    let client = harness.authenticated().await;
+    let mut channel = client.channel_open_session().await.unwrap();
+    channel
+        .request_pty(
+            true,
+            "xterm-256color",
+            80,
+            24,
+            0,
+            0,
+            &[(russh::Pty::ECHO, 0)],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        timeout(DEADLINE, channel.wait()).await.unwrap(),
+        Some(ChannelMsg::Success)
+    ));
+    channel.exec(true, "test -t 0 && test -t 1 && test -t 2 || exit 9; printf 'READY\n'; read answer; stty size; printf '%s:%s' \"$TERM\" \"$answer\"; exit 7").await.unwrap();
+    let mut prefix = Vec::new();
+    timeout(DEADLINE, async {
+        while !prefix.windows(5).any(|s| s == b"READY") {
+            if let Some(ChannelMsg::Data { data }) = channel.wait().await {
+                prefix.extend_from_slice(&data);
+            }
+        }
+    })
+    .await
+    .unwrap();
+    channel.window_change(120, 40, 0, 0).await.unwrap();
+    channel.data_bytes(b"hello\n".to_vec()).await.unwrap();
+    let (output, errors, status) = command_output(channel).await;
+    assert!(
+        String::from_utf8_lossy(&output).contains("40 120"),
+        "{output:?}"
+    );
+    assert!(output.ends_with(b"xterm-256color:hello"));
+    assert!(errors.is_empty());
+    assert_eq!(status, Some(7));
+    harness.close().await;
+}
+
+#[tokio::test]
+async fn pty_output_larger_than_kernel_buffer_does_not_deadlock() {
+    let harness = Harness::new(|_| {}).await;
+    let client = harness.authenticated().await;
+    let mut channel = client.channel_open_session().await.unwrap();
+    channel
+        .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+        .await
+        .unwrap();
+    assert!(matches!(
+        timeout(DEADLINE, channel.wait()).await.unwrap(),
+        Some(ChannelMsg::Success)
+    ));
+    channel
+        .exec(true, "head -c 262144 /dev/zero")
+        .await
+        .unwrap();
+    let (output, _, status) = command_output(channel).await;
+    assert_eq!(output, vec![0; 262144]);
+    assert_eq!(status, Some(0));
+    harness.close().await;
+}
+
+#[tokio::test]
+async fn pty_eof_does_not_type_ctrl_d_into_the_persistent_terminal() {
+    let harness = Harness::new(|_| {}).await;
+    let client = harness.authenticated().await;
+    let mut channel = client.channel_open_session().await.unwrap();
+    channel
+        .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+        .await
+        .unwrap();
+    assert!(matches!(
+        timeout(DEADLINE, channel.wait()).await.unwrap(),
+        Some(ChannelMsg::Success)
+    ));
+    let input = harness.root.path().join("terminal-input");
+    channel
+        .exec(
+            true,
+            format!(
+                "stty raw -echo; printf ready; dd bs=1 count=1 of='{}' 2>/dev/null",
+                input.display()
+            ),
+        )
+        .await
+        .unwrap();
+    timeout(DEADLINE, async {
+        while !matches!(channel.wait().await, Some(ChannelMsg::Data { .. })) {}
+    })
+    .await
+    .unwrap();
+    channel.eof().await.unwrap();
+    // Another round-trip ensures EOF was processed before observing the PTY.
+    let probe = client.channel_open_session().await.unwrap();
+    probe.exec(true, "printf alive").await.unwrap();
+    assert_eq!(command_output(probe).await.0, b"alive");
+    channel.close().await.unwrap();
+    harness.cancel.cancel();
+    timeout(DEADLINE, harness.connection.closed())
+        .await
+        .unwrap();
+    assert!(
+        std::fs::read(input).unwrap_or_default().is_empty(),
+        "transport EOF was injected as keyboard input"
+    );
+    harness.close().await;
+}
+
+#[tokio::test]
+async fn streamlocal_supports_rpc_eof_and_subscription_alongside_exec() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let harness = Harness::new(|_| {}).await;
+    let client = harness.authenticated().await;
+    let socket = harness.root.path().join("herdr.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut input = [0; 5];
+        stream.read_exact(&mut input).await.unwrap();
+        assert_eq!(&input, b"ping\n");
+        stream.write_all(b"pong\nevent\n").await.unwrap();
+        // One-shot API close must reach SSH even without client EOF.
+    });
+    let channel = client
+        .channel_open_direct_streamlocal(socket.to_str().unwrap())
+        .await
+        .unwrap();
+    channel.data_bytes(b"ping\n".to_vec()).await.unwrap();
+    let command = client.channel_open_session().await.unwrap();
+    command.exec(true, "printf concurrent").await.unwrap();
+    let (stream, exec) = tokio::join!(command_output(channel), command_output(command));
+    assert_eq!(stream.0, b"pong\nevent\n");
+    assert_eq!(exec.0, b"concurrent");
+    server.await.unwrap();
+    assert!(
+        client
+            .channel_open_direct_streamlocal("relative.sock")
+            .await
+            .is_err()
+    );
+    assert!(
+        client
+            .channel_open_direct_streamlocal(socket.to_str().unwrap())
+            .await
+            .is_err()
+    );
     harness.close().await;
 }
