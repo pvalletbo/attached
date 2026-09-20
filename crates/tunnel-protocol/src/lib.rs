@@ -1,3 +1,5 @@
+pub mod ssh;
+
 use std::fmt;
 
 use anyhow::{Context, Result, bail, ensure};

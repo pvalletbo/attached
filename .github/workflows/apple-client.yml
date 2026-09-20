@@ -1,0 +1,29 @@
+name: Apple consumer package
+on:
+  pull_request:
+    paths:
+      - crates/mobile/**
+      - crates/tunnel-protocol/**
+      - crates/session-sync-protocol/**
+      - bindings/apple/**
+      - scripts/build-apple-client.sh
+      - Cargo.lock
+      - .github/workflows/apple-client.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  apple-package:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: 1.97.1
+      - name: Build device, simulator and macOS package
+        run: scripts/build-apple-client.sh
+      - name: Typecheck generated Swift bindings
+        run: swift build --package-path target/AttachedMobile

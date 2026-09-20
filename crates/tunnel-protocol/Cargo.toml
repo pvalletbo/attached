@@ -18,3 +18,4 @@ iroh.workspace = true
 serde.workspace = true
 tokio = { version = "1", features = ["io-util"] }
 zeroize.workspace = true
+serde_json.workspace = true

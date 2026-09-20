@@ -6,17 +6,18 @@ mod configuration;
 mod descriptor;
 mod exec;
 mod export;
+mod forward;
+mod pty;
 mod state;
 
 use anyhow::{Context, Result, ensure};
 use attached_tunnel_protocol::CapabilitySecret;
+use attached_tunnel_protocol::ssh::{Request, Response, read_frame, write_frame};
 use russh::keys::PublicKey;
-use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) use attached_tunnel_protocol::SSH_ALPN as ALPN;
@@ -28,37 +29,6 @@ const SETUP_TIMEOUT: Duration = Duration::from_secs(20);
 /// Invalid, missing, or inaccessible account credentials fail closed at admission too.
 pub(crate) fn access_enabled(path: &Path, consumer: &[u8; 32]) -> bool {
     state::policy(path, consumer).is_ok()
-}
-
-#[derive(Serialize, Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
-#[serde(deny_unknown_fields)]
-struct Request {
-    capability: [u8; 32],
-    public_key: String,
-}
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Response {
-    username: String,
-    host_key: String,
-}
-
-async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(writer: &mut W, value: &T) -> Result<()> {
-    let bytes = zeroize::Zeroizing::new(serde_json::to_vec(value)?);
-    ensure!(bytes.len() <= 8192, "SSH setup frame too large");
-    writer.write_u32(bytes.len() as u32).await?;
-    writer.write_all(&bytes).await?;
-    writer.flush().await?;
-    Ok(())
-}
-async fn read_frame<R: AsyncRead + Unpin, T: serde::de::DeserializeOwned>(
-    reader: &mut R,
-) -> Result<T> {
-    let length = reader.read_u32().await? as usize;
-    ensure!(length <= 8192, "SSH setup frame too large");
-    let mut bytes = zeroize::Zeroizing::new(vec![0; length]);
-    reader.read_exact(&mut bytes).await?;
-    Ok(serde_json::from_slice(&bytes)?)
 }
 
 pub(crate) async fn serve(

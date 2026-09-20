@@ -24,6 +24,9 @@ on:
       - crates/session-sync-protocol/**
       - crates/session-sync-worker/**
       - crates/tunnel-protocol/**
+      - crates/mobile/**
+      - bindings/apple/**
+      - scripts/build-apple-client.sh
       - "**/Cargo.toml"
   workflow_dispatch:
 
@@ -72,6 +75,9 @@ jobs:
               - 'crates/session-sync-protocol/**'
               - 'crates/session-sync-worker/**'
               - 'crates/tunnel-protocol/**'
+              - 'crates/mobile/**'
+              - 'bindings/apple/**'
+              - 'scripts/build-apple-client.sh'
             worker:
               - '.github/workflows/ci.yml'
               - '.github/workflows/deploy-cloudflare-worker.yml'
@@ -122,6 +128,7 @@ jobs:
           --package attached-session-sync-protocol
           --package attached-session-sync-worker
           --package attached-tunnel-protocol
+          --package attached-mobile
           -- --check
       - name: Run core workspace tests
         run: >-
@@ -227,6 +234,7 @@ jobs:
           --package attached-session-sync-protocol
           --package attached-session-sync-worker
           --package attached-tunnel-protocol
+          --package attached-mobile
           -- --check
       - name: Run core workspace tests on macOS
         run: >-
