@@ -1,0 +1,73 @@
+name: Docker account and SSH E2E
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/e2e.yml
+      - .dockerignore
+      - e2e/**
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/e2e.yml
+      - .dockerignore
+      - e2e/**
+  # Live runs are deliberate: each creates a production account, and the backend
+  # currently has no deletion API. PRs run only offline harness regression tests.
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Stable release (e.g. 0.3.5); leave empty to build this ref'
+        type: string
+        default: ''
+      service:
+        description: 'Backend origin (default is production)'
+        type: string
+        default: 'https://herdr.attached.sh'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-e2e-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  harness:
+    name: Offline E2E harness tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build test driver (no account creation)
+        run: docker build --target runtime --file e2e/Dockerfile --tag attached-e2e-harness .
+      - name: Test isolation, cleanup, PTY prompts, checksums, and SSH assertions
+        run: >-
+          docker run --rm --network none attached-e2e-harness
+          python3 -m unittest discover -s /opt/e2e -p 'test_*.py' -v
+      - name: Check whitespace
+        run: git diff --check
+
+  live:
+    name: Live account, publish bundle, and remote SSH
+    if: github.event_name == 'workflow_dispatch'
+    needs: harness
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      E2E_RELEASE: ${{ inputs.release }}
+      E2E_SERVICE: ${{ inputs.service }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Test in disposable client and publisher containers
+        # Quoted environment variables keep dispatch inputs out of shell source.
+        run: |
+          args=(--service "$E2E_SERVICE")
+          if [[ -n "$E2E_RELEASE" ]]; then
+            args+=(--release "$E2E_RELEASE")
+          fi
+          python3 e2e/run.py "${args[@]}"

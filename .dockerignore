@@ -1,0 +1,14 @@
+# The root build context is used only by e2e/Dockerfile. Never send local
+# credentials, worktrees, build artifacts, or dependency directories to Docker.
+**
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!crates/
+!crates/*/
+!crates/*/Cargo.toml
+!crates/*/src/
+!crates/*/src/**
+!e2e/
+!e2e/Dockerfile
+!e2e/*.py
