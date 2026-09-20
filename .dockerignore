@@ -11,4 +11,3 @@
 !crates/*/src/**
 !e2e/
 !e2e/Dockerfile
-!e2e/*.py

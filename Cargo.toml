@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/cli",
+    "crates/e2e",
     "crates/herdr-plugin",
     "crates/session-sync-protocol",
     "crates/session-sync-worker",

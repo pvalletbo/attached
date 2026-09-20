@@ -279,6 +279,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "attached-e2e"
+version = "0.3.5"
+dependencies = [
+ "anyhow",
+ "clap",
+ "getrandom 0.4.3",
+ "reqwest",
+ "sha2",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "attached-herdr-plugin"
 version = "0.1.0"
 dependencies = [

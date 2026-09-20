@@ -1,0 +1,23 @@
+[package]
+name = "attached-e2e"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Disposable Docker account, publishing, and SSH smoke tests"
+
+[package.metadata.dist]
+dist = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+getrandom.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
