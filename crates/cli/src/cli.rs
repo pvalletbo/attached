@@ -20,7 +20,7 @@ use crate::{
 #[command(
     version,
     about = "Discover machines and connect over SSH through secure Iroh tunnels",
-    after_long_help = "CONFIGURATION:\n    Attached reads $HOME/.config/attached/config.toml when it exists. Supported TOML settings:\n\n        password_source = \"password\" # or \"1password\"\n        config_directory = \"/absolute/path\" # defaults to $HOME/.config/attached\n\n    --use-1password overrides password_source for the current invocation."
+    after_long_help = "CONFIGURATION:\n    Attached reads $HOME/.config/attached/config.toml when it exists. Supported TOML settings:\n\n        password_source = \"password\" # or \"1password\"\n        config_directory = \"/absolute/path\" # defaults to $HOME/.config/attached\n        one_password_item_tag = \"org.example.attached/encryption-password-v1\"\n            # defaults to attached/encryption-password-v1\n\n    --use-1password overrides password_source for the current invocation."
 )]
 pub struct Cli {
     /// Increase diagnostic verbosity (`-v` for lifecycle, `-vv` for debug details).
@@ -261,7 +261,8 @@ impl Cli {
             config::Config::load().context("could not load Attached configuration")?;
         local_encryption::configure_use_one_password(
             self.use_1password || configuration.password_source() == PasswordSource::OnePassword,
-        );
+            configuration.one_password_item_tag(),
+        )?;
         match self.command {
             Command::Ssh {
                 target,
@@ -841,6 +842,8 @@ mod tests {
         assert!(help.contains("generate and store"), "{help}");
         assert!(help.contains("password_source = \"password\""), "{help}");
         assert!(help.contains("config_directory"), "{help}");
+        assert!(help.contains("one_password_item_tag"), "{help}");
+        assert!(help.contains("attached/encryption-password-v1"), "{help}");
     }
 
     #[test]

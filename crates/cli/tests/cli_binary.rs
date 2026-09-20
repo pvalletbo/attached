@@ -481,6 +481,48 @@ async fn account_roundtrip_uses_production_encryption_and_refuses_overwrite() {
 }
 
 #[tokio::test]
+async fn configured_one_password_item_tag_selects_the_managed_item() {
+    let fixture = CliFixture::new();
+    let config_directory = fixture.path("home/.config/attached");
+    fs::create_dir_all(&config_directory).unwrap();
+    fs::write(
+        config_directory.join("config.toml"),
+        "password_source = \"1password\"\none_password_item_tag = \"org.example.attached/encryption-password-v1\"\n",
+    )
+    .unwrap();
+    fixture.script(
+        "op",
+        r#"
+printf '%s\n' "$*" >> "$FIXTURE_ROOT/op-calls"
+case "$*" in
+  'item list --categories=Password --tags=org.example.attached/encryption-password-v1 --format=json')
+    printf '%s\n' '[{"id":"testitem","title":"Attached encryption password","vault":{"id":"testvault"}}]';;
+  'item get testitem --vault=testvault --fields=label=password --reveal')
+    printf '%s\n' 'fixture-only-encryption-password';;
+  *) echo 'unexpected op invocation' >&2; exit 90;;
+esac
+"#,
+    );
+    fs::write(
+        fixture.path("download.bundle"),
+        format!("{}\n", bundle("https://sync.example", IDENTITY)),
+    )
+    .unwrap();
+
+    let output = fixture
+        .run(&["account", "import", "--bundle-file", "download.bundle"])
+        .await;
+    output.assert_code(0);
+
+    let calls = fs::read_to_string(fixture.path("op-calls")).unwrap();
+    assert!(
+        calls.contains("--tags=org.example.attached/encryption-password-v1"),
+        "{calls}"
+    );
+    assert!(!calls.contains("pvalletbo"), "{calls}");
+}
+
+#[tokio::test]
 async fn invalid_stdin_bundle_fails_without_installing_state_or_echoing_secrets() {
     let fixture = CliFixture::new();
     for input in [

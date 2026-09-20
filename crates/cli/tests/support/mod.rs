@@ -32,7 +32,7 @@ impl CliFixture {
         let fixture = Self { root };
         fixture.script("op", r#"
 case "$*" in
-  'item list --categories=Password --tags=com.pvalletbo.attached/encryption-password-v1 --format=json')
+  'item list --categories=Password --tags=attached/encryption-password-v1 --format=json')
     printf '%s\n' '[{"id":"testitem","title":"Attached encryption password","vault":{"id":"testvault"}}]';;
   'item get testitem --vault=testvault --fields=label=password --reveal')
     printf '%s\n' 'fixture-only-encryption-password';;
