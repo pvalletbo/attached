@@ -9,8 +9,6 @@ fn test_policy() -> state::Policy {
         username: "attached-test".into(),
         home: std::env::temp_dir(),
         shell: "/bin/sh".into(),
-        generation: [1; 32],
-        enabled: true,
     }
 }
 

@@ -20,7 +20,7 @@ use crate::{
 #[command(
     version,
     about = "Discover machines and connect over SSH through secure Iroh tunnels",
-    after_long_help = "CONFIGURATION:\n    Attached reads $HOME/.config/attached/config.toml when it exists. Supported TOML settings:\n\n        password_source = \"password\" # or \"1password\"\n        config_directory = \"/absolute/path\" # defaults to $HOME/.config/attached\n\n    --use-1password overrides password_source for the current invocation.\n\nENVIRONMENT:\n    ATTACHED_ENCRYPTION_PASSWORD supplies the local encryption password without\n    prompting or confirmation when password_source = \"password\" (the default).\n    --use-1password or password_source = \"1password\" takes precedence over it.\n    The value is used verbatim: 1-1024 bytes of valid UTF-8. Empty or invalid\n    values fail instead of prompting. Reuse the same password to unlock state.\n    For unattended publishers, inject it alongside ATTACHED_PUBLISH_BUNDLE and\n    run `attached serve`. Prefer secret injection over literals in shell history.\n    Attached does not persist the password, but the environment remains visible\n    to child processes and other processes allowed to inspect it."
+    after_long_help = "CONFIGURATION:\n    Attached reads $HOME/.config/attached/config.toml when it exists. Supported TOML settings:\n\n        password_source = \"password\" # or \"1password\"\n        config_directory = \"/absolute/path\" # defaults to $HOME/.config/attached\n        one_password_item_tag = \"org.example.attached/encryption-password-v1\"\n            # defaults to attached/encryption-password-v1\n\n    --use-1password overrides password_source for the current invocation.\n\nENVIRONMENT:\n    ATTACHED_ENCRYPTION_PASSWORD supplies the local encryption password without\n    prompting or confirmation when password_source = \"password\" (the default).\n    --use-1password or password_source = \"1password\" takes precedence over it.\n    The value is used verbatim: 1-1024 bytes of valid UTF-8. Empty or invalid\n    values fail instead of prompting. Reuse the same password to unlock state.\n    For unattended publishers, inject it alongside ATTACHED_PUBLISH_BUNDLE and\n    run `attached serve`. Prefer secret injection over literals in shell history.\n    Attached does not persist the password, but the environment remains visible\n    to child processes and other processes allowed to inspect it."
 )]
 pub struct Cli {
     /// Increase diagnostic verbosity (`-v` for lifecycle, `-vv` for debug details).
@@ -50,6 +50,9 @@ enum Command {
     },
 
     /// Publish this machine and serve authorized SSH tunnels.
+    ///
+    /// SSH access is enabled by default for the publish bundle's consumer.
+    /// Commands run as this OS account; stop serving to end access.
     Serve {
         /// Stable label shown for this host in synchronized catalogs.
         #[arg(long)]
@@ -74,8 +77,8 @@ enum Command {
 
     /// Execute a command or a non-PTY shell through an authorized publisher tunnel.
     ///
-    /// Uses system OpenSSH and automatic, connection-scoped keys. Publisher consent:
-    /// `attached ssh-access enable`. Commands run as the publisher's OS account.
+    /// Uses system OpenSSH and automatic, connection-scoped keys.
+    /// Commands run as the publisher's OS account; SSH is enabled by default.
     /// For automatic OpenSSH aliases for all hosts, run `attached export-ssh-config`.
     /// For concurrent relayed connections, use one broker: separate
     /// Attached processes share the consumer Iroh identity and can displace one
@@ -104,7 +107,7 @@ enum Command {
     /// Automatically configure OpenSSH for every authorized host; keep running until Ctrl-C.
     ///
     /// Run once in a terminal, then use `ssh attached-HOST [command]` without symlinks
-    /// or -F. Requires an imported download account and publisher SSH consent.
+    /// or -F. Requires an imported download account and a running publisher.
     /// Installs a reversible Include at the top of ~/.ssh/config, preserving existing
     /// settings. New hosts appear automatically. Duplicate labels use only
     /// attached-ENDPOINT-ID aliases. Ctrl-C, SIGTERM, or SIGHUP removes the Include
@@ -115,14 +118,6 @@ enum Command {
         #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
         refresh_interval: u64,
         #[arg(long, hide = true)]
-        state_dir: Option<PathBuf>,
-    },
-
-    /// Grant or revoke persistent account-level SSH access for the configured consumer.
-    SshAccess {
-        #[command(subcommand)]
-        command: SshAccessCommand,
-        #[arg(long, hide = true, global = true)]
         state_dir: Option<PathBuf>,
     },
 
@@ -159,20 +154,17 @@ enum Command {
     },
 }
 
-#[derive(Subcommand)]
-enum SshAccessCommand {
-    /// Permit arbitrary shell execution as this publisher OS account. Persists until disabled.
-    Enable,
-    /// Reject new SSH connections and cancel existing ones within one second.
-    Disable,
-}
-
 const DEFAULT_SERVICE_ORIGIN: &str = "https://herdr.attached.sh";
 
 #[derive(Subcommand)]
 enum SessionsCommand {
     /// Refresh and list SSH-enabled machines (not application sessions).
     List {
+        /// Print a JSON array with host labels, stable endpoint IDs, SSH aliases,
+        /// Attached versions, and publication times. Never includes credentials.
+        #[arg(long)]
+        json: bool,
+
         /// Override persistent state location (primarily for testing).
         #[arg(long, hide = true)]
         state_dir: Option<PathBuf>,
@@ -269,7 +261,8 @@ impl Cli {
             config::Config::load().context("could not load Attached configuration")?;
         local_encryption::configure_use_one_password(
             self.use_1password || configuration.password_source() == PasswordSource::OnePassword,
-        );
+            configuration.one_password_item_tag(),
+        )?;
         match self.command {
             Command::Ssh {
                 target,
@@ -305,11 +298,6 @@ impl Cli {
                 let state_dir = resolved_state_dir(state_dir, &configuration)?;
                 crate::ssh::export(&state_dir, std::time::Duration::from_secs(refresh_interval))
                     .await
-            }
-            Command::SshAccess { command, state_dir } => {
-                let state_dir = resolved_state_dir(state_dir, &configuration)?;
-                crate::ssh::set_access(&state_dir, matches!(command, SshAccessCommand::Enable))?;
-                Ok(0)
             }
             Command::SshLocalProxy { .. } => unreachable!(),
             Command::Account { command } => {
@@ -381,7 +369,11 @@ impl Cli {
                 Ok(0)
             }
             Command::Sessions { command } => match command {
-                SessionsCommand::List { state_dir } => {
+                SessionsCommand::List { json, state_dir } => {
+                    use std::io::IsTerminal;
+                    local_encryption::configure_noninteractive(
+                        !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal(),
+                    );
                     let state_dir = resolved_state_dir(state_dir, &configuration)?;
                     sync::state::load_account(&state_dir, ApiKeyScope::Download)
                         .context("`sessions list` requires a download account bundle")?;
@@ -391,7 +383,11 @@ impl Cli {
                     for warning in refresh_warnings_to_display(&refreshed.warnings, self.verbose) {
                         eprintln!("Warning: {warning}");
                     }
-                    let rendered = host_picker::render_list(&refreshed.hosts)?;
+                    let rendered = if json {
+                        host_picker::render_json(&refreshed.hosts)?
+                    } else {
+                        host_picker::render_list(&refreshed.hosts)?
+                    };
                     write_session_list(&mut stdout().lock(), &rendered)?;
                     Ok(0)
                 }
@@ -469,7 +465,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ssh_cli_preserves_openssh_style_commands_and_explicit_consent() {
+    fn ssh_cli_preserves_openssh_style_commands_and_removes_access_toggle() {
         let cli = Cli::try_parse_from(["attached", "ssh", "host", "printf", "%s", "--remote-flag"])
             .unwrap();
         assert!(
@@ -495,7 +491,7 @@ mod tests {
             Cli::try_parse_from(["attached", "ssh", "--expose-config", "host", "cmd"]).is_err()
         );
         for action in ["enable", "disable"] {
-            assert!(Cli::try_parse_from(["attached", "ssh-access", action]).is_ok());
+            assert!(Cli::try_parse_from(["attached", "ssh-access", action]).is_err());
         }
         assert!(Cli::try_parse_from(["attached", "ssh-access"]).is_err());
     }
@@ -556,6 +552,7 @@ mod tests {
                 "/tmp/publish.bundle",
             ],
             vec!["attached", "sessions", "list"],
+            vec!["attached", "sessions", "list", "--json"],
             vec!["attached", "export-ssh-config"],
             vec![
                 "attached",
@@ -745,14 +742,21 @@ mod tests {
             "serve",
             "sessions",
             "ssh",
-            "ssh-access",
             "update",
             "completions",
             "uninstall",
         ] {
             assert!(help.contains(command), "{help}");
         }
-        for removed in ["attach", "connect", "remote", "session", "admin", "sync"] {
+        for removed in [
+            "attach",
+            "connect",
+            "remote",
+            "session",
+            "admin",
+            "sync",
+            "ssh-access",
+        ] {
             assert!(!help.contains(&format!("  {removed}  ")), "{help}");
         }
         assert!(!help.contains(account_clipboard::HELPER_COMMAND), "{help}");
@@ -799,6 +803,7 @@ mod tests {
             assert!(!generated.is_empty(), "empty {shell} completion script");
             assert!(generated.contains("sessions"), "{shell}: {generated}");
             assert!(generated.contains("completions"), "{shell}: {generated}");
+            assert!(!generated.contains("ssh-access"), "{shell}: {generated}");
         }
     }
 
@@ -841,6 +846,8 @@ mod tests {
         assert!(help.contains("takes precedence over it"), "{help}");
         assert!(help.contains("1-1024 bytes of valid UTF-8"), "{help}");
         assert!(help.contains("ATTACHED_PUBLISH_BUNDLE"), "{help}");
+        assert!(help.contains("one_password_item_tag"), "{help}");
+        assert!(help.contains("attached/encryption-password-v1"), "{help}");
     }
 
     #[test]

@@ -245,7 +245,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "attached"
-version = "0.3.1"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "arboard",
@@ -279,8 +279,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "attached-e2e"
+version = "0.3.6"
+dependencies = [
+ "anyhow",
+ "clap",
+ "getrandom 0.4.3",
+ "reqwest",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "toml",
+]
+
+[[package]]
+name = "attached-herdr-plugin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fs4",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "attached-session-sync-protocol"
-version = "0.3.1"
+version = "0.3.6"
 dependencies = [
  "attached-tunnel-protocol",
  "base64",
@@ -300,7 +329,7 @@ dependencies = [
 
 [[package]]
 name = "attached-session-sync-worker"
-version = "0.3.1"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "attached-session-sync-protocol",
@@ -319,7 +348,7 @@ dependencies = [
 
 [[package]]
 name = "attached-tunnel-protocol"
-version = "0.3.1"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "iroh",

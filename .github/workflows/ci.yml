@@ -19,6 +19,8 @@ on:
       - deny.toml
       - rust-toolchain.toml
       - crates/cli/**
+      - crates/herdr-plugin/**
+      - plugins/herdr/**
       - crates/session-sync-protocol/**
       - crates/session-sync-worker/**
       - crates/tunnel-protocol/**
@@ -65,6 +67,8 @@ jobs:
               - 'rust-toolchain.toml'
               - '**/Cargo.toml'
               - 'crates/cli/**'
+              - 'crates/herdr-plugin/**'
+              - 'plugins/herdr/**'
               - 'crates/session-sync-protocol/**'
               - 'crates/session-sync-worker/**'
               - 'crates/tunnel-protocol/**'
@@ -114,6 +118,7 @@ jobs:
         run: >-
           cargo fmt
           --package attached
+          --package attached-herdr-plugin
           --package attached-session-sync-protocol
           --package attached-session-sync-worker
           --package attached-tunnel-protocol
@@ -218,6 +223,7 @@ jobs:
         run: >-
           cargo fmt
           --package attached
+          --package attached-herdr-plugin
           --package attached-session-sync-protocol
           --package attached-session-sync-worker
           --package attached-tunnel-protocol

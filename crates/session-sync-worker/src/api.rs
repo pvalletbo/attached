@@ -15,6 +15,7 @@ use worker::{Env, Headers, Method, Request, RequestInit, Response, RouteContext,
 use crate::{
     issuance,
     model::{ENCODED_ACCOUNT_BYTES, MutationError, MutationOutcome, StoredAccount},
+    rate_limit,
     storage::{self, InitializeOutcome, StoreError},
 };
 
@@ -209,6 +210,20 @@ async fn handle_accounts(
 ) -> worker::Result<Response> {
     if request.method() != Method::Post {
         return method_not_allowed_response(ALLOW_ACCOUNTS);
+    }
+    // Charge attempts before reading a body, generating credentials, or
+    // allocating a Durable Object. Limiter failures must never allow issuance.
+    match rate_limit::allow_account_creation(&request, &context.env).await {
+        Ok(true) => {}
+        Ok(false) => {
+            discard_request_body(&mut request).await?;
+            let response = error_response(STATUS_TOO_MANY_REQUESTS, ErrorCode::RateLimited)?;
+            return set_header(response, "retry-after", rate_limit::RETRY_AFTER_SECONDS);
+        }
+        Err(_) => {
+            discard_request_body(&mut request).await?;
+            return unavailable_response();
+        }
     }
     let body = match read_bounded_body(&mut request, MAX_API_BODY_BYTES).await {
         Ok(body) => body,
@@ -457,6 +472,17 @@ async fn cancel_request_body(request: &Request) -> worker::Result<()> {
         .await
         .map(|_| ())
         .map_err(worker::Error::from)
+}
+
+async fn discard_request_body(request: &mut Request) -> worker::Result<()> {
+    // Drain without retaining bytes. Cancelling an inbound HTTP body can break
+    // workerd's forwarding stream and poison subsequent keep-alive requests.
+    match read_bounded_body(request, 0).await {
+        Ok(_) | Err(BodyReadError::TooLarge) => Ok(()),
+        Err(BodyReadError::Unavailable) => Err(worker::Error::RustError(
+            "request body discard failed".to_owned(),
+        )),
+    }
 }
 
 async fn read_bounded_body(request: &mut Request, limit: usize) -> Result<Vec<u8>, BodyReadError> {

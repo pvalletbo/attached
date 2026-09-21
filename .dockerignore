@@ -1,0 +1,20 @@
+# Root context is only for E2E builds. Never send credentials or host state.
+**
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!dist-workspace.toml
+!.github/
+!.github/workflows/
+!.github/workflows/*.yml
+!crates/
+!crates/*/
+!crates/*/Cargo.toml
+!crates/*/src/
+!crates/*/src/**
+!crates/session-sync-worker/package.json
+!crates/session-sync-worker/pnpm-lock.yaml
+!crates/session-sync-worker/pnpm-workspace.yaml
+!crates/session-sync-worker/wrangler.toml
+!e2e/
+!e2e/Dockerfile*

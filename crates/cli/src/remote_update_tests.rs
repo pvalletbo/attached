@@ -2,8 +2,11 @@ use super::*;
 use attached_tunnel_protocol::{
     AttachedUpdateRequest, read_attached_update_request, write_attached_update_response,
 };
-use iroh::{RelayMode, endpoint::BindOpts};
-use std::{future::Future, net::Ipv4Addr};
+use iroh::{
+    RelayMode,
+    endpoint::{BindError, BindOpts},
+};
+use std::{future::Future, io::ErrorKind, net::Ipv4Addr};
 async fn within<F: Future>(future: F) -> F::Output {
     tokio::time::timeout(Duration::from_secs(15), future)
         .await
@@ -13,20 +16,78 @@ async fn attached_update_endpoint(
     identity: iroh::SecretKey,
     bind_addr: Option<std::net::SocketAddr>,
 ) -> Endpoint {
-    Endpoint::builder(presets::N0)
-        .secret_key(identity)
-        .clear_ip_transports()
-        .bind_addr_with_opts(
-            bind_addr.unwrap_or_else(|| (Ipv4Addr::LOCALHOST, 0).into()),
-            BindOpts::default().set_prefix_len(8),
-        )
-        .unwrap()
-        .relay_mode(RelayMode::Disabled)
-        .clear_address_lookup()
-        .alpns(vec![ATTACHED_UPDATE_ALPN.to_vec()])
-        .bind()
+    bind_attached_update_endpoint(identity, bind_addr)
         .await
         .unwrap()
+}
+
+async fn bind_attached_update_endpoint(
+    identity: iroh::SecretKey,
+    bind_addr: Option<std::net::SocketAddr>,
+) -> Result<Endpoint> {
+    // Endpoint shutdown can leave its UDP socket held briefly by background
+    // tasks. Await the actual bind, not just close()/Drop, before assuming the
+    // replacement can reuse the port. Never retry unrelated bind failures or
+    // wait indefinitely if another process owns the port.
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let result = Endpoint::builder(presets::N0)
+                .secret_key(identity.clone())
+                .clear_ip_transports()
+                .bind_addr_with_opts(
+                    bind_addr.unwrap_or_else(|| (Ipv4Addr::LOCALHOST, 0).into()),
+                    BindOpts::default().set_prefix_len(8),
+                )?
+                .relay_mode(RelayMode::Disabled)
+                .clear_address_lookup()
+                .alpns(vec![ATTACHED_UPDATE_ALPN.to_vec()])
+                .bind()
+                .await;
+            match result {
+                Err(BindError::Sockets { ref source, .. })
+                    if bind_addr.is_some() && source.kind() == ErrorKind::AddrInUse =>
+                {
+                    sleep(Duration::from_millis(10)).await;
+                }
+                result => return result.context("could not bind offline update endpoint"),
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for offline update endpoint port release")?
+}
+
+#[tokio::test]
+async fn replacement_endpoint_waits_for_occupied_port_to_be_released() {
+    let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let addr = socket.local_addr().unwrap();
+    let identity = iroh::SecretKey::generate();
+    let binding = bind_attached_update_endpoint(identity.clone(), Some(addr));
+    tokio::pin!(binding);
+    // Poll while the port is definitely occupied, then release it. No race
+    // between a spawned task's first bind and the socket owner's shutdown.
+    assert!(
+        timeout(Duration::from_millis(50), &mut binding)
+            .await
+            .is_err()
+    );
+    drop(socket);
+    let endpoint = within(binding).await.unwrap();
+    assert_eq!(endpoint.bound_sockets(), [addr]);
+    assert_eq!(endpoint.id(), identity.public());
+    endpoint.close().await;
+}
+
+#[tokio::test]
+async fn replacement_endpoint_does_not_wait_forever_for_an_occupied_port() {
+    let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let result = within(bind_attached_update_endpoint(
+        iroh::SecretKey::generate(),
+        Some(socket.local_addr().unwrap()),
+    ))
+    .await;
+    let error = result.expect_err("bound an occupied port");
+    assert!(error.to_string().contains("timed out waiting"), "{error:#}");
 }
 
 #[tokio::test]

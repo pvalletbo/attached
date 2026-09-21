@@ -82,15 +82,11 @@ async fn serving_admits_only_the_consumer_and_only_ssh_or_attached_update() {
 async fn production_dispatch_serves_ssh_and_host_update_without_application_state() {
     timeout(Duration::from_secs(15), async {
         let root = crate::test_support::canonical_tempdir();
-        crate::secure_state::prepare_private_dir(root.path()).unwrap();
-        let consumer = ConsumerIdentitySecret::from_bytes([0x5a; 32]);
+        state::test_support::create_publisher(root.path(), "https://sync.example").unwrap();
+        let consumer = ConsumerIdentitySecret::from_bytes([0x43; 32]);
         let publisher = offline(server_endpoint_builder(&iroh::SecretKey::generate(), consumer.authorized_identity())).await;
         let client = offline(Endpoint::builder(presets::N0).secret_key(iroh::SecretKey::from_bytes(consumer.as_bytes()))).await;
-        crate::secure_state::StateDir::open(root.path()).unwrap().atomic_replace("ssh-access.json", &serde_json::to_vec(&serde_json::json!({
-            "consumer": client.id().as_bytes(), "uid": rustix::process::geteuid().as_raw(),
-            "username": "attached-test", "home": root.path(), "shell": "/bin/sh",
-            "generation": vec![3; 32], "enabled": true,
-        })).unwrap()).unwrap();
+        assert!(!root.path().join("ssh-access.json").exists());
         let capability = CapabilitySecret::from_bytes([7; 32]);
         let abort = CancellationToken::new();
         let resources = Arc::new(UpdateResources {
@@ -112,7 +108,7 @@ async fn production_dispatch_serves_ssh_and_host_update_without_application_stat
             assert!(length <= 8192);
             let mut bytes = vec![0; length]; receive.read_exact(&mut bytes).await.unwrap();
             let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(response["username"], "attached-test");
+            assert!(!response["username"].as_str().unwrap().is_empty());
             assert!(response["host_key"].as_str().unwrap().starts_with("ssh-ed25519 "));
             ssh.close(0u32.into(), b"test complete");
             let update = client.connect(publisher.addr(), ATTACHED_UPDATE_ALPN).await.unwrap();

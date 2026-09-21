@@ -6,89 +6,47 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use attached_session_sync_protocol::account::ApiKeyScope;
 use russh::keys::{PrivateKey, ssh_key::private::Ed25519Keypair};
-use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::{
     local_encryption::{self, Purpose},
-    secure_state::{self, StateDir},
-    sync,
+    secure_state, sync,
 };
 
-const POLICY: &str = "ssh-access.json";
 const HOST_KEY: &str = "ssh-host.key";
 
-/// Account-level consent, never inferred from an ordinary tunnel capability.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+/// SSH authorization derived from the publish bundle and effective OS account.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Policy {
     pub consumer: [u8; 32],
     pub uid: u32,
     pub username: String,
     pub home: PathBuf,
     pub shell: PathBuf,
-    pub generation: [u8; 32],
-    pub enabled: bool,
+}
+
+pub(super) fn authorize(path: &Path, consumer: &[u8; 32]) -> Result<()> {
+    let account = sync::state::load_account(path, ApiKeyScope::Publish)?;
+    let authorized = account
+        .authorized_consumer_identity()
+        .context("publish bundle has no consumer identity")?;
+    ensure!(
+        authorized.as_bytes() == consumer,
+        "SSH access belongs to another consumer"
+    );
+    Ok(())
 }
 
 pub(super) fn policy(path: &Path, consumer: &[u8; 32]) -> Result<Policy> {
-    let bytes = StateDir::open(path)?
-        .read_secret_bounded(POLICY, 8192)
-        .context("SSH access is disabled; run `attached ssh-access enable` on the publisher")?;
-    let policy: Policy = serde_json::from_slice(&bytes)?;
-    ensure!(
-        policy.enabled
-            && &policy.consumer == consumer
-            && policy.uid == rustix::process::geteuid().as_raw(),
-        "SSH access is disabled or belongs to another consumer/account"
-    );
-    Ok(policy)
-}
-
-pub(crate) fn set_access(path: &Path, enabled: bool) -> Result<()> {
-    let account = sync::state::load_account(path, ApiKeyScope::Publish)?;
-    let consumer = *account
-        .authorized_consumer_identity()
-        .context("publish bundle has no consumer identity")?
-        .as_bytes();
+    authorize(path, consumer)?;
     let user = super::account::lookup(rustix::process::geteuid().as_raw())?;
-    let username = user.username;
-    ensure!(
-        !username.is_empty()
-            && username
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b)),
-        "unsupported OS username"
-    );
-    let mut generation = [0; 32];
-    getrandom::fill(&mut generation)?;
-    let policy = Policy {
-        consumer,
+    Ok(Policy {
+        consumer: *consumer,
         uid: user.uid,
-        username,
+        username: user.username,
         home: user.home,
         shell: user.shell,
-        generation,
-        enabled,
-    };
-    ensure!(
-        policy.shell.is_absolute() && policy.home.is_absolute(),
-        "account shell and home must be absolute paths"
-    );
-    secure_state::with_exclusive_lock(path, "ssh-access.lock", |dir| {
-        dir.atomic_replace(POLICY, &serde_json::to_vec(&policy)?)
-    })?;
-    if enabled {
-        eprintln!(
-            "SSH enabled: the configured consumer may execute arbitrary commands as {} (uid {}). Permission persists until `attached ssh-access disable`. Existing sessions are cancelled when permission changes.",
-            policy.username, policy.uid
-        );
-    } else {
-        eprintln!(
-            "SSH disabled. Active sessions will be cancelled within one second; deliberately detached processes cannot be recalled."
-        );
-    }
-    Ok(())
+    })
 }
 
 pub(super) fn key_from_seed(seed: &[u8; 32]) -> Result<PrivateKey> {
@@ -166,6 +124,7 @@ pub(super) fn pin_host(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secure_state::StateDir;
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -217,7 +176,7 @@ mod tests {
     }
 
     #[test]
-    fn publisher_consent_is_explicit_persistent_and_revocable() {
+    fn ssh_is_automatic_for_the_publish_bundles_consumer_and_effective_account() {
         let root = crate::test_support::canonical_tempdir();
         let creator = root.path().join("creator");
         let publisher = root.path().join("publisher");
@@ -225,18 +184,38 @@ mod tests {
         let bundle = sync::account::export(&creator, ApiKeyScope::Publish).unwrap();
         sync::state::import_account(&publisher, bundle.as_bytes()).unwrap();
         let consumer = iroh::SecretKey::from_bytes(&[0x43; 32]).public();
-        assert!(policy(&publisher, consumer.as_bytes()).is_err());
-        set_access(&publisher, true).unwrap();
         let enabled = policy(&publisher, consumer.as_bytes()).unwrap();
-        assert_eq!(enabled.uid, rustix::process::geteuid().as_raw());
+        let user = super::super::account::lookup(rustix::process::geteuid().as_raw()).unwrap();
+        assert_eq!(enabled.uid, user.uid);
+        assert_eq!(enabled.username, user.username);
+        assert_eq!(enabled.home, user.home);
+        assert_eq!(enabled.shell, user.shell);
         assert_eq!(enabled, policy(&publisher, consumer.as_bytes()).unwrap());
+        assert!(!publisher.join("ssh-access.json").exists());
         assert!(policy(&publisher, &[0; 32]).is_err());
-        set_access(&publisher, false).unwrap();
+        assert!(policy(&creator, consumer.as_bytes()).is_err());
+
+        let downloader = root.path().join("downloader");
+        let bundle = sync::account::export(&creator, ApiKeyScope::Download).unwrap();
+        sync::state::import_account(&downloader, bundle.as_bytes()).unwrap();
+        assert!(policy(&downloader, consumer.as_bytes()).is_err());
+
+        // Obsolete opt-in state is ignored, including a previously disabled policy.
+        let dir = StateDir::open(&publisher).unwrap();
+        let disabled = serde_json::to_vec(&serde_json::json!({
+            "consumer": consumer.as_bytes(), "uid": enabled.uid,
+            "username": enabled.username, "home": enabled.home, "shell": enabled.shell,
+            "generation": vec![1; 32], "enabled": false,
+        }))
+        .unwrap();
+        for legacy in [disabled.as_slice(), b"corrupt"] {
+            dir.atomic_replace("ssh-access.json", legacy).unwrap();
+            assert_eq!(enabled, policy(&publisher, consumer.as_bytes()).unwrap());
+        }
+        dir.atomic_replace("sync-account.bundle", b"corrupt")
+            .unwrap();
         assert!(policy(&publisher, consumer.as_bytes()).is_err());
-        set_access(&publisher, true).unwrap();
-        assert_ne!(
-            enabled.generation,
-            policy(&publisher, consumer.as_bytes()).unwrap().generation
-        );
+        std::fs::remove_file(publisher.join("sync-account.bundle")).unwrap();
+        assert!(policy(&publisher, consumer.as_bytes()).is_err());
     }
 }

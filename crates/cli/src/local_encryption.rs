@@ -41,7 +41,6 @@ const MAX_PASSWORD_BYTES: usize = 1024;
 #[cfg(not(test))]
 const ENCRYPTION_PASSWORD_ENV: &str = "ATTACHED_ENCRYPTION_PASSWORD";
 const ONE_PASSWORD_ITEM_TITLE: &str = "Attached encryption password";
-const ONE_PASSWORD_ITEM_TAG: &str = "com.pvalletbo.attached/encryption-password-v1";
 const ONE_PASSWORD_FIELD: &str = "password";
 const ONE_PASSWORD_LOCATOR_FILE: &str = "one-password-item.json";
 const MAX_ONE_PASSWORD_LOCATOR_BYTES: usize = 1024;
@@ -54,6 +53,8 @@ const MASTER_KEY_LOCK: &str = "local-master-key.lock";
 
 static USE_ONE_PASSWORD: AtomicBool = AtomicBool::new(false);
 static NONINTERACTIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(not(test))]
+static CONFIGURED_ONE_PASSWORD_ITEM_TAG: OnceLock<String> = OnceLock::new();
 
 pub(crate) fn configure_noninteractive(enabled: bool) {
     NONINTERACTIVE.store(enabled, Ordering::SeqCst);
@@ -76,8 +77,15 @@ impl MasterKeyStore for HandoffMasterKeyStore {
 #[cfg(not(test))]
 static HANDOFF_MASTER_KEY_STORE: OnceLock<HandoffMasterKeyStore> = OnceLock::new();
 
-pub(crate) fn configure_use_one_password(enabled: bool) {
+pub(crate) fn configure_use_one_password(enabled: bool, item_tag: &str) -> Result<()> {
     USE_ONE_PASSWORD.store(enabled, Ordering::SeqCst);
+    #[cfg(not(test))]
+    CONFIGURED_ONE_PASSWORD_ITEM_TAG
+        .set(item_tag.to_owned())
+        .map_err(|_| anyhow::anyhow!("1Password item tag was already configured"))?;
+    #[cfg(test)]
+    let _ = item_tag;
+    Ok(())
 }
 
 pub(crate) trait MasterKeyStore: Send + Sync {
@@ -346,6 +354,7 @@ impl OpRunner for ProcessOpRunner {
 
 struct OnePasswordProvider<R> {
     runner: R,
+    item_tag: String,
     cached: Mutex<Option<Zeroizing<Vec<u8>>>>,
 }
 
@@ -406,7 +415,7 @@ impl<R: OpRunner> OnePasswordProvider<R> {
             "item".to_owned(),
             "list".to_owned(),
             "--categories=Password".to_owned(),
-            format!("--tags={ONE_PASSWORD_ITEM_TAG}"),
+            format!("--tags={}", self.item_tag),
             "--format=json".to_owned(),
         ])?;
         ensure!(output.success, ONE_PASSWORD_UNAVAILABLE);
@@ -494,7 +503,7 @@ impl<R: OpRunner> OnePasswordProvider<R> {
             "create".to_owned(),
             "--category=Password".to_owned(),
             format!("--title={ONE_PASSWORD_ITEM_TITLE}"),
-            format!("--tags={ONE_PASSWORD_ITEM_TAG}"),
+            format!("--tags={}", self.item_tag),
             "--generate-password=letters,digits,symbols,64".to_owned(),
         ])?;
         ensure!(output.success, ONE_PASSWORD_UNAVAILABLE);
@@ -596,6 +605,10 @@ static ONE_PASSWORD_STORE: LazyLock<PasswordMasterKeyStore<OnePasswordProvider<P
             runner: ProcessOpRunner {
                 executable: PathBuf::from("op"),
             },
+            item_tag: CONFIGURED_ONE_PASSWORD_ITEM_TAG
+                .get()
+                .expect("1Password item tag must be configured before use")
+                .clone(),
             cached: Mutex::new(None),
         },
         cached_key: Mutex::new(None),
@@ -892,6 +905,8 @@ mod tests {
 
     use super::*;
 
+    const TEST_ONE_PASSWORD_ITEM_TAG: &str = "org.example.attached/encryption-password-v1";
+
     struct FakePrompt {
         responses: Mutex<VecDeque<Vec<u8>>>,
         prompts: Mutex<Vec<String>>,
@@ -1137,6 +1152,7 @@ mod tests {
         ]);
         let provider = OnePasswordProvider {
             runner,
+            item_tag: TEST_ONE_PASSWORD_ITEM_TAG.to_owned(),
             cached: Mutex::new(None),
         };
 
@@ -1155,7 +1171,7 @@ mod tests {
             calls[0]
                 .arguments
                 .iter()
-                .any(|argument| { argument == &format!("--tags={ONE_PASSWORD_ITEM_TAG}") })
+                .any(|argument| { argument == &format!("--tags={TEST_ONE_PASSWORD_ITEM_TAG}") })
         );
         assert!(
             calls[1]
@@ -1194,6 +1210,7 @@ mod tests {
 
         let resumed = OnePasswordProvider {
             runner: FakeOpRunner::with_outputs([successful_op_output(format!("{password}\n"))]),
+            item_tag: "a.different.tag/does-not-affect-the-cached-locator".to_owned(),
             cached: Mutex::new(None),
         };
         assert_eq!(
@@ -1247,6 +1264,7 @@ mod tests {
                 successful_op_output(serde_json::to_vec(&listed).unwrap()),
                 successful_op_output(b"rediscovered-password\n"),
             ]),
+            item_tag: TEST_ONE_PASSWORD_ITEM_TAG.to_owned(),
             cached: Mutex::new(None),
         };
 
@@ -1291,6 +1309,7 @@ mod tests {
                 successful_op_output(serde_json::to_vec(&listed).unwrap()),
                 successful_op_output(b"generated-password\n"),
             ]),
+            item_tag: TEST_ONE_PASSWORD_ITEM_TAG.to_owned(),
             cached: Mutex::new(None),
         };
 
@@ -1306,6 +1325,11 @@ mod tests {
         assert!(
             create
                 .iter()
+                .any(|argument| argument == &format!("--tags={TEST_ONE_PASSWORD_ITEM_TAG}"))
+        );
+        assert!(
+            create
+                .iter()
                 .any(|argument| { argument == "--generate-password=letters,digits,symbols,64" })
         );
     }
@@ -1318,6 +1342,7 @@ mod tests {
                 success: false,
                 stdout: Zeroizing::new(b"synthetic sensitive backend detail".to_vec()),
             }]),
+            item_tag: TEST_ONE_PASSWORD_ITEM_TAG.to_owned(),
             cached: Mutex::new(None),
         };
 
@@ -1349,6 +1374,7 @@ mod tests {
             runner: FakeOpRunner::with_outputs([successful_op_output(
                 serde_json::to_vec(&listed).unwrap(),
             )]),
+            item_tag: TEST_ONE_PASSWORD_ITEM_TAG.to_owned(),
             cached: Mutex::new(None),
         };
 
