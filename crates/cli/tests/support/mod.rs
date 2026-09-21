@@ -53,7 +53,11 @@ esac
     }
 
     pub fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_attached"));
+        self.command_at(Path::new(env!("CARGO_BIN_EXE_attached")), args)
+    }
+
+    pub fn command_at(&self, executable: &Path, args: &[&str]) -> Command {
+        let mut command = Command::new(executable);
         command
             .env_clear()
             .env("HOME", self.path("home"))
