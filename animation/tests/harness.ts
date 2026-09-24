@@ -1,5 +1,5 @@
 import {Player, Renderer, RendererResult, Stage, Vector2} from '@motion-canvas/core';
-import {Scene2D, Txt} from '@motion-canvas/2d';
+import {Scene2D, Txt, Video} from '@motion-canvas/2d';
 const style = new URLSearchParams(location.search).get('style') ?? 'original';
 if (!['original', 'zine'].includes(style)) throw new Error(`Unknown style: ${style}`);
 const {default: project} = style === 'zine'
@@ -34,7 +34,10 @@ function snapshot() {
       const box = node.cacheBBox().transform(node.localToWorld());
       return {text: node.text(), left: box.left, right: box.right, top: box.top, bottom: box.bottom};
     });
-  return {scene: scene.name, frame: player.playback.frame, texts};
+  const videos = scene.getView().findAll(node => node instanceof Video).map(video => ({
+    src: video.src(), time: video.getCurrentTime(), duration: video.getDuration(), playing: video.isPlaying(),
+  }));
+  return {scene: scene.name, frame: player.playback.frame, texts, videos};
 }
 
 type Snapshot = ReturnType<typeof snapshot>;

@@ -7,7 +7,8 @@
     "serve": "vite",
     "build": "tsc --noEmit && vite build",
     "test": "playwright test",
-    "render": "node scripts/render.mjs"
+    "render": "node scripts/render.mjs",
+    "blender": "node scripts/blender.mjs"
   },
   "dependencies": {
     "@motion-canvas/core": "^3.17.2",

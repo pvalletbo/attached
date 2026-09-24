@@ -1,4 +1,5 @@
-import {Circle, makeScene2D, Rect} from '@motion-canvas/2d';
+import {Circle, makeScene2D, Rect, Video} from '@motion-canvas/2d';
+import padlockClip from '../assets/blender-padlock.mp4';
 import {all, chain, waitFor} from '@motion-canvas/core';
 import {COMMANDS} from '../storyboard';
 import {ACID, BLUE, INK, PAPER, RED, arrow, cut, laptop, line, scrap, sheet, shout, slam, stamp, travel, type} from './art';
@@ -116,7 +117,11 @@ export default makeScene2D(function* (view) {
   {
     const s = sheet(view, SHOTS[6], INK, PAPER);
     s.body.add(shout(s.shot.headline, [0, -313], 137, PAPER));
-    const checklist = scrap([-226, 57], 1110, 410, -2);
+    const checklist = scrap([-310, 57], 1050, 410, -2);
+    // A real Blender render, composited by Motion Canvas and synced to its clock.
+    const padlock = new Video({
+      src: padlockClip, position: [575, -3], size: 460, loop: true, play: true,
+    });
     const lines = [
       'Authorized consumer Iroh identity',
       'Tunnel capability',
@@ -133,10 +138,11 @@ export default makeScene2D(function* (view) {
       checklist.add(tick);
       return tick;
     });
-    const approved = stamp('YOU CAN COME IN.', [529, 161], RED, 11, 485);
-    s.body.add([checklist, approved]);
+    const approved = stamp('YOU CAN COME IN.', [535, 270], RED, -5, 485);
+    s.body.add([checklist, padlock, approved]);
     s.body.add(type('Identity first. Application traffic second.', [0, 329], 27, ACID));
     yield* cut(s, chain(slam(checklist), ...checks.map(tick => tick.end(1, 0.65)), slam(approved)));
+    padlock.pause();
   }
 
   // 08: Terminal type, at full size, without simulated product chrome.

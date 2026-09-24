@@ -35,6 +35,10 @@ jobs:
           cache: npm
           cache-dependency-path: animation/package-lock.json
       - run: npm ci
+      - name: Install Blender and FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y blender ffmpeg
+      - name: Build and validate the tiny 3D insert
+        run: npm run blender
       - run: npx playwright install --with-deps chromium
       - run: npm run build
       - run: npm test
@@ -48,5 +52,8 @@ jobs:
           path: |
             animation/test-results/**/*.png
             animation/output/*.mp4
+            animation/output/blender/padlock.blend
+            animation/output/blender/padlock-0001.png
+            animation/src/assets/blender-padlock.mp4
           if-no-files-found: warn
           retention-days: 14
