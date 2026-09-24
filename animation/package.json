@@ -14,6 +14,7 @@
     "@motion-canvas/2d": "^3.17.2",
     "@motion-canvas/ffmpeg": "3.17.2",
     "@fontsource/inter": "^5.2.8",
+    "@fontsource/anton": "^5.2.8",
     "@fontsource/jetbrains-mono": "^5.2.8"
   },
   "overrides": {

@@ -1,10 +1,15 @@
 import {Player, Renderer, RendererResult, Stage, Vector2} from '@motion-canvas/core';
 import {Scene2D, Txt} from '@motion-canvas/2d';
-import project from '../src/project?project';
+const style = new URLSearchParams(location.search).get('style') ?? 'original';
+if (!['original', 'zine'].includes(style)) throw new Error(`Unknown style: ${style}`);
+const {default: project} = style === 'zine'
+  ? await import('../src/zine-project?project')
+  : await import('../src/project?project');
 import {VIDEO} from '../src/storyboard';
 
 // Both browser tests and the headless MP4 renderer use the real Motion Canvas project.
 await Promise.all([
+  document.fonts.load('400 126px Anton'),
   document.fonts.load('400 28px Inter'),
   document.fonts.load('600 64px Inter'),
   document.fonts.load('400 22px "JetBrains Mono"'),
@@ -53,7 +58,9 @@ const api = {
     renderer.onFinished.subscribe(value => {result.value = value;});
     await renderer.render({
       ...project.meta.getFullRenderingSettings(),
-      name: seconds ? 'attached-smoke-test' : 'attached-explained',
+      name: style === 'zine'
+        ? (seconds ? 'attached-zine-smoke-test' : 'attached-zine')
+        : (seconds ? 'attached-smoke-test' : 'attached-explained'),
       range: [0, seconds ?? Infinity],
       fps: VIDEO.fps,
     });

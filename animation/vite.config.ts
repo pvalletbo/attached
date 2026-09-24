@@ -6,7 +6,7 @@ export default defineConfig({
   // The editor/export bridge is a local authoring tool, not a public web service.
   server: {host: '127.0.0.1'},
   plugins: [
-    motionCanvas(),
+    motionCanvas({project: ['./src/zine-project.ts', './src/project.ts']}),
     ffmpeg(),
   ],
 });
