@@ -31,6 +31,11 @@ test('Blender clip plays, loops, and seeks with the Motion Canvas timeline', asy
   expect(looped.videos[0].time).toBeCloseTo(0.5, 1);
   await page.evaluate(time => window.animation.seek(time), checksStart + 0.5);
   expect((await page.screenshot({clip})).equals(front), 'Backward seeking should restore the same decoded frame.').toBe(true);
+  const final = await page.evaluate(time => window.animation.seek(time), checksStart + 8);
+  const approval = final.texts.find(node => node.text === 'YOU CAN COME IN.')!;
+  const identity = final.texts.find(node => node.text === 'Identity first. Application traffic second.')!;
+  expect(approval.left > identity.right || approval.bottom < identity.top,
+    'The approval stamp must not cover the identity note.').toBe(true);
   const after = await page.evaluate(time => window.animation.seek(time), checksStart + 9.5);
   expect(after.videos).toHaveLength(0);
   expect(await page.evaluate(() => window.animation.errors)).toEqual([]);

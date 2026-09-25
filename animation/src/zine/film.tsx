@@ -120,7 +120,7 @@ export default makeScene2D(function* (view) {
     const checklist = scrap([-310, 57], 1050, 410, -2);
     // A real Blender render, composited by Motion Canvas and synced to its clock.
     const padlock = new Video({
-      src: padlockClip, position: [575, -3], size: 460, loop: true, play: true,
+      src: padlockClip, position: [575, -3], size: 460, loop: true,
     });
     const lines = [
       'Authorized consumer Iroh identity',
@@ -138,9 +138,12 @@ export default makeScene2D(function* (view) {
       checklist.add(tick);
       return tick;
     });
-    const approved = stamp('YOU CAN COME IN.', [535, 270], RED, -5, 485);
+    const approved = stamp('YOU CAN COME IN.', [565, 230], RED, -5, 485);
     s.body.add([checklist, padlock, approved]);
-    s.body.add(type('Identity first. Application traffic second.', [0, 329], 27, ACID));
+    s.body.add(type('Identity first. Application traffic second.', [-285, 329], 27, ACID));
+    // Resolve media metadata before reading its duration through the playback clock.
+    yield padlock;
+    padlock.play();
     yield* cut(s, chain(slam(checklist), ...checks.map(tick => tick.end(1, 0.65)), slam(approved)));
     padlock.pause();
   }
