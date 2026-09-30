@@ -104,6 +104,35 @@ enum Command {
         command: Vec<String>,
     },
 
+    /// Copy a file or directory between this machine and an Attached publisher.
+    ///
+    /// Exactly one operand must be HOST:PATH, using an Attached host label or
+    /// stable endpoint ID. Relative remote paths start in the publisher's home.
+    /// Uses system OpenSSH scp in SFTP mode and reuses a running SSH exporter.
+    /// Requires an SFTP-enabled Attached publisher. Remote paths must be UTF-8;
+    /// use ./file:name to disambiguate local filenames containing a colon.
+    /// Existing destination files are overwritten; interrupted transfers may
+    /// leave partial files. No remote-to-remote copies or shell expansion.
+    /// Examples: attached cp office:/tmp/file .
+    ///           attached cp -r ./project office:projects/
+    Cp {
+        /// Source file or directory (HOST:PATH for a download).
+        source: String,
+        /// Destination file or directory (HOST:PATH for an upload).
+        destination: String,
+        /// Copy directories recursively (follows source symlinks like scp).
+        #[arg(short = 'r', long)]
+        recursive: bool,
+        /// Refresh publisher discovery before connecting.
+        #[arg(long)]
+        no_cache: bool,
+        /// Deliberately replace the selected publisher's pinned SSH identity.
+        #[arg(long)]
+        trust_new_host_key: bool,
+        #[arg(long, hide = true)]
+        state_dir: Option<PathBuf>,
+    },
+
     /// Automatically configure OpenSSH for every authorized host; keep running until Ctrl-C.
     ///
     /// Run once in a terminal, then use `ssh attached-HOST [command]` without symlinks
@@ -112,7 +141,7 @@ enum Command {
     /// settings. New hosts appear automatically. Duplicate labels use only
     /// attached-ENDPOINT-ID aliases. Ctrl-C, SIGTERM, or SIGHUP removes the Include
     /// and temporary keys. Supports Linux and macOS; no background service is installed.
-    /// Uses the existing non-PTY command/shell service (not SFTP or port forwarding).
+    /// Supports non-PTY commands/shells and SFTP (scp/sftp); not port forwarding.
     ExportSshConfig {
         /// Seconds between host discovery refreshes; unavailable hosts are retried.
         #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
@@ -282,6 +311,29 @@ impl Cli {
                     &target,
                     command,
                     expose_config,
+                    no_cache,
+                    trust_new_host_key,
+                )
+                .await
+            }
+            Command::Cp {
+                source,
+                destination,
+                recursive,
+                no_cache,
+                trust_new_host_key,
+                state_dir,
+            } => {
+                use std::io::IsTerminal;
+                local_encryption::configure_noninteractive(
+                    !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal(),
+                );
+                let state_dir = resolved_state_dir(state_dir, &configuration)?;
+                crate::ssh::copy(
+                    &state_dir,
+                    &source,
+                    &destination,
+                    recursive,
                     no_cache,
                     trust_new_host_key,
                 )
@@ -497,6 +549,31 @@ mod tests {
     }
 
     #[test]
+    fn copy_cli_requires_two_operands_and_exposes_recursive_and_trust_options() {
+        let cli = Cli::try_parse_from([
+            "attached",
+            "cp",
+            "-r",
+            "--no-cache",
+            "--trust-new-host-key",
+            "./source",
+            "office:destination",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command, Command::Cp { source, destination, recursive: true, no_cache: true, trust_new_host_key: true, .. } if source == "./source" && destination == "office:destination")
+        );
+        for args in [
+            vec!["attached", "cp"],
+            vec!["attached", "cp", "office:file"],
+            vec!["attached", "cp", "a", "b", "c"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        assert!(Cli::try_parse_from(["attached", "cp", "--", "-local", "office:file"]).is_ok());
+    }
+
+    #[test]
     fn ssh_export_is_one_command_for_all_hosts_with_a_bounded_refresh_interval() {
         let cli = Cli::try_parse_from(["attached", "export-ssh-config"]).unwrap();
         assert!(matches!(
@@ -554,6 +631,7 @@ mod tests {
             vec!["attached", "sessions", "list"],
             vec!["attached", "sessions", "list", "--json"],
             vec!["attached", "export-ssh-config"],
+            vec!["attached", "cp", "office:/tmp/file", "."],
             vec![
                 "attached",
                 "serve",

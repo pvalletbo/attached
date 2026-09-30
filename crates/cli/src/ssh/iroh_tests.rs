@@ -200,6 +200,38 @@ async fn iroh_multiplexes_shell_commands_and_preserves_binary_eof() {
 }
 
 #[tokio::test]
+async fn iroh_sftp_shares_authorized_ssh_with_concurrent_exec() {
+    use tokio::io::AsyncWriteExt;
+    let harness = Harness::new(|_| {}).await;
+    let client = harness.authenticated().await;
+    let mut channel = client.channel_open_session().await.unwrap();
+    channel.request_subsystem(true, "sftp").await.unwrap();
+    assert!(matches!(
+        timeout(DEADLINE, channel.wait()).await.unwrap(),
+        Some(ChannelMsg::Success)
+    ));
+    let session = russh_sftp::client::SftpSession::new(channel.into_stream())
+        .await
+        .unwrap();
+    let path = harness.root.path().join("sftp binary 'file");
+    let path = path.to_str().unwrap();
+    let payload = (0..256 * 1024)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let mut file = session.create(path).await.unwrap();
+    file.write_all(&payload).await.unwrap();
+    file.close().await.unwrap();
+    let exec = client.channel_open_session().await.unwrap();
+    exec.exec(true, "printf exec-ok").await.unwrap();
+    exec.eof().await.unwrap();
+    let (download, command) = tokio::join!(session.read(path), command_output(exec));
+    assert_eq!(download.unwrap(), payload);
+    assert_eq!(command, (b"exec-ok".to_vec(), vec![], Some(0)));
+    session.close().await.unwrap();
+    harness.close().await;
+}
+
+#[tokio::test]
 async fn iroh_rejects_wrong_consumer_missing_or_corrupt_account_and_capability() {
     for mutation in 0..4 {
         let key = if mutation == 0 {
@@ -280,7 +312,7 @@ async fn iroh_rejects_wrong_ssh_host_key() {
 }
 
 #[tokio::test]
-async fn iroh_rejects_pty_env_subsystems_and_forwarding() {
+async fn iroh_rejects_pty_env_unknown_subsystems_and_forwarding() {
     let harness = Harness::new(|_| {}).await;
     let client = harness.authenticated().await;
     assert!(
@@ -307,7 +339,10 @@ async fn iroh_rejects_pty_env_subsystems_and_forwarding() {
         timeout(DEADLINE, channel.wait()).await.unwrap(),
         Some(ChannelMsg::Failure)
     ));
-    channel.request_subsystem(true, "sftp").await.unwrap();
+    channel
+        .request_subsystem(true, "unknown-subsystem")
+        .await
+        .unwrap();
     assert!(matches!(
         timeout(DEADLINE, channel.wait()).await.unwrap(),
         Some(ChannelMsg::Failure)

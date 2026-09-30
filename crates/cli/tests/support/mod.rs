@@ -26,6 +26,9 @@ impl CliFixture {
             .prefix("at-")
             .tempdir_in(base)
             .unwrap();
+        // Real publishers grant this OS account's filesystem authority. Keep
+        // disposable bundle files inaccessible to other local accounts too.
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         for directory in ["home", "bin", "tmp", "runtime"] {
             fs::create_dir(root.path().join(directory)).unwrap();
         }
@@ -102,6 +105,32 @@ pub struct RunningCli {
 }
 
 impl RunningCli {
+    pub fn stdout(&self) -> Vec<u8> {
+        fs::read(self.stdout.path()).unwrap()
+    }
+
+    pub fn stderr(&self) -> String {
+        fs::read_to_string(self.stderr.path()).unwrap()
+    }
+
+    pub fn signal(&self, signal: rustix::process::Signal) {
+        rustix::process::kill_process(self.pid, signal).unwrap();
+    }
+
+    pub async fn write_stdin(&mut self, bytes: &[u8]) {
+        self.child
+            .stdin
+            .as_mut()
+            .expect("fixture has no piped stdin")
+            .write_all(bytes)
+            .await
+            .unwrap();
+    }
+
+    pub fn close_stdin(&mut self) {
+        self.child.stdin.take();
+    }
+
     pub async fn wait(mut self) -> CliOutput {
         let result = tokio::time::timeout(DEADLINE, self.child.wait()).await;
         let stdout = fs::read_to_string(self.stdout.path()).unwrap();
