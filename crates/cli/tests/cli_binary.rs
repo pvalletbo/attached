@@ -4,6 +4,8 @@
 mod discovery;
 #[path = "ssh/copy.rs"]
 mod ssh_copy;
+#[path = "ssh/copy_end_to_end.rs"]
+mod ssh_copy_end_to_end;
 #[path = "ssh/export.rs"]
 mod ssh_export;
 #[path = "ssh/renewal.rs"]
