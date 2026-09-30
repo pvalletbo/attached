@@ -46,3 +46,7 @@ tracing-flame.workspace = true
 tracing-subscriber.workspace = true
 zeroize.workspace = true
 russh = { version = "=0.63.3", default-features = false, features = ["ring"] }
+# 2.4 matches the workspace's pinned wasm-bindgen family (3.x requires 0.2.128).
+# The protocol API is stream-based, independent of the russh crate version.
+russh-sftp = "=2.4.0"
+bytes = "1"

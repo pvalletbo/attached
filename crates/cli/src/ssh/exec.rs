@@ -120,21 +120,48 @@ async fn run_channel(
     cancellation: CancellationToken,
 ) -> Result<()> {
     let id = channel.id();
+    enum Request {
+        Command(Option<Vec<u8>>, bool),
+        Sftp(bool),
+    }
     let request = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             tokio::select! {
                 _ = cancellation.cancelled() => bail!("SSH channel cancelled"),
                 msg = channel.wait() => match msg {
-                    Some(ChannelMsg::Exec { command, want_reply }) => break Ok((Some(command), want_reply)),
-                    Some(ChannelMsg::RequestShell { want_reply }) => break Ok((None, want_reply)),
+                    Some(ChannelMsg::Exec { command, want_reply }) => break Ok(Request::Command(Some(command), want_reply)),
+                    Some(ChannelMsg::RequestShell { want_reply }) => break Ok(Request::Command(None, want_reply)),
+                    Some(ChannelMsg::RequestSubsystem { name, want_reply }) if name == "sftp" => break Ok(Request::Sftp(want_reply)),
                     Some(ChannelMsg::Eof | ChannelMsg::Close) | None => bail!("channel closed before command"),
                     Some(msg) => reject_request(&msg, handle, id).await?,
                 }
             }
         }
     }).await??;
+    let (command_bytes, want_reply) = match request {
+        Request::Command(command, want_reply) => (command, want_reply),
+        Request::Sftp(want_reply) => {
+            if want_reply {
+                handle
+                    .channel_success(id)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("SSH session closed"))?;
+            }
+            let result =
+                super::sftp::serve(channel.into_stream(), policy.home, cancellation.clone()).await;
+            tokio::select! {
+                _ = cancellation.cancelled() => {},
+                _ = async {
+                    let _ = handle.exit_status_request(id, if result.is_ok() { 0 } else { 1 }).await;
+                    let _ = handle.eof(id).await;
+                    let _ = handle.close(id).await;
+                } => {},
+            }
+            return result;
+        }
+    };
     let mut command = Command::new(&policy.shell);
-    if let Some(ref bytes) = request.0 {
+    if let Some(ref bytes) = command_bytes {
         anyhow::ensure!(
             bytes.len() <= 32768 && !bytes.contains(&0),
             "invalid SSH command"
@@ -163,7 +190,7 @@ async fn run_channel(
         .spawn()
         .context("could not start publisher account shell")?;
     let guard = ProcessGroup(child.id().context("missing child PID")?);
-    if request.1 {
+    if want_reply {
         tokio::select! {
             _ = cancellation.cancelled() => bail!("SSH channel cancelled"),
             result = handle.channel_success(id) => result.map_err(|_| anyhow::anyhow!("SSH session closed"))?,

@@ -1,11 +1,13 @@
 //! Account-authorized SSH over a versioned Iroh ALPN.
-//! russh implements SSH; Attached implements the deliberately limited exec/shell service.
+//! russh implements SSH; Attached provides exec/shell and embedded SFTP services.
 mod account;
 mod client;
 mod configuration;
+mod copy;
 mod descriptor;
 mod exec;
 mod export;
+mod sftp;
 mod state;
 
 use anyhow::{Context, Result, ensure};
@@ -21,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) use attached_tunnel_protocol::SSH_ALPN as ALPN;
 pub(crate) use client::{connect, local_proxy};
+pub(crate) use copy::copy;
 pub(crate) use export::export;
 const SETUP_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -137,5 +140,7 @@ async fn serve_inner(
 
 #[cfg(test)]
 mod iroh_tests;
+#[cfg(test)]
+mod sftp_openssh_tests;
 #[cfg(test)]
 mod tests;

@@ -329,6 +329,120 @@ fn runtime_files(configuration: &str) -> Vec<PathBuf> {
 }
 
 #[tokio::test]
+async fn copy_reuses_exporter_without_interrupting_sessions_or_weakening_trust() {
+    let fixture = CliFixture::new();
+    super::ssh_copy::scp_shim(&fixture);
+    let discovery = Discovery::new().await;
+    let consumer = iroh::SecretKey::generate().to_bytes();
+    import_with_identity(&fixture, &discovery.origin, consumer).await;
+    let publisher = Publisher::new(consumer, 71).await;
+    publisher
+        .advertise(&discovery, "Office", 1, true, 300)
+        .await;
+    let broker = start(&fixture);
+    let configured = wait_config(&fixture, |text| text.contains(" attached-office\n")).await;
+    let runtime = runtime_files(&configured);
+    let config = fixture.path("home/.ssh/config");
+    let mut active = ssh(&config, "attached-office", "cat")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = active.stdin.take().unwrap();
+    let mut stdout = active.stdout.take().unwrap();
+    round_trip(&mut stdin, &mut stdout, b"before-copy\0\xff").await;
+    let output = fixture
+        .run(&["--use-1password", "cp", "Office:/tmp/file", "."])
+        .await;
+    output.assert_code(7);
+    assert_eq!(output.stdout, "expected");
+    assert_eq!(output.stderr, "expected-error");
+    let args = fs::read_to_string(fixture.path("scp.args")).unwrap();
+    assert!(args.contains(fixture.path("home/.ssh/attached/config").to_str().unwrap()));
+    assert_eq!(
+        runtime_files(&fs::read_to_string(fixture.path("home/.ssh/attached/config")).unwrap()),
+        runtime
+    );
+    round_trip(&mut stdin, &mut stdout, b"after-copy\0\xff").await;
+    fs::remove_file(fixture.path("scp.args")).unwrap();
+    let rejected = fixture
+        .run(&[
+            "--use-1password",
+            "cp",
+            "--trust-new-host-key",
+            "Office:file",
+            ".",
+        ])
+        .await;
+    rejected.assert_code(1);
+    assert!(rejected.stderr.contains("cannot change host trust"));
+    assert!(!fixture.path("scp.args").exists());
+    let duplicate = Publisher::new(consumer, 72).await;
+    duplicate
+        .advertise(&discovery, "Office", 1, true, 300)
+        .await;
+    let ambiguous = fixture
+        .run(&["--use-1password", "cp", "--no-cache", "Office:file", "."])
+        .await;
+    ambiguous.assert_code(1);
+    assert!(
+        ambiguous.stderr.contains("ambiguous publisher label"),
+        "{ambiguous:?}"
+    );
+    assert!(!fixture.path("scp.args").exists());
+    // An explicit ID remains usable despite the label collision. Interrupting
+    // its transfer must terminate scp descendants, not the shared exporter.
+    fixture.script(
+        "scp",
+        "sleep 30 & echo $! > \"$FIXTURE_ROOT/copy-child.pid\"; wait",
+    );
+    let copying = fixture
+        .command(&[
+            "--use-1password",
+            "cp",
+            &format!("{}:file", publisher.endpoint.id()),
+            ".",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    timeout(DEADLINE, async {
+        while !fixture.path("copy-child.pid").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(copying.id().unwrap() as i32).unwrap(),
+        rustix::process::Signal::TERM,
+    )
+    .unwrap();
+    let interrupted = timeout(DEADLINE, copying.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(interrupted.status.code(), Some(143), "{interrupted:?}");
+    round_trip(&mut stdin, &mut stdout, b"after-cancelled-copy\n").await;
+    drop(stdin);
+    drop(stdout);
+    assert!(
+        timeout(DEADLINE, active.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    stop(broker, rustix::process::Signal::INT).await;
+    for file in runtime {
+        assert!(!file.exists());
+    }
+    duplicate.stop().await;
+    publisher.stop().await;
+    discovery.stop().await;
+}
+
+#[tokio::test]
 async fn exporter_autodiscovers_all_hosts_and_reconciles_aliases_without_interrupting_streams() {
     let fixture = CliFixture::new();
     let discovery = Discovery::new().await;
@@ -342,7 +456,13 @@ async fn exporter_autodiscovers_all_hosts_and_reconciles_aliases_without_interru
     let personal = b"# personal config\nHost personal\n  HostName personal.example\n  User original\nHost *\n  User unwanted\n  ProxyCommand false\n  RequestTTY force\n  StrictHostKeyChecking no\n";
     fs::write(&config, personal).unwrap();
     let broker = start(&fixture);
-    wait_config(&fixture, |text| text.contains("Host attached-*\n")).await;
+    // The fallback snippet is published before the user Include is installed.
+    // Wait for both commits, not just the first file, even under parallel load.
+    wait_config(&fixture, |text| {
+        text.contains("Host attached-*\n")
+            && fs::read_to_string(&config).is_ok_and(|text| text.starts_with("# BEGIN Attached"))
+    })
+    .await;
     assert!(
         fs::read_to_string(&config)
             .unwrap()

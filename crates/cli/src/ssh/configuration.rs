@@ -22,6 +22,47 @@ const FALLBACK: &str =
     "Host attached-*\n    ProxyCommand false\n    CanonicalizeHostname no\nHost *\n";
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 
+/// Reuse only a live, validated exporter and its generated configuration. A
+/// live exporter without the selected alias must not spawn a competing relay
+/// endpoint, nor may a stale configuration fall back to DNS/direct SSH.
+pub(super) fn active_export(home: &Path, alias: &str) -> Result<Option<PathBuf>> {
+    let path = home.join(".ssh/attached");
+    if !path.try_exists()? {
+        return Ok(None);
+    }
+    let directory = StateDir::open(&path)?;
+    let Some(lock) = directory.open_private_lock_file("broker.lock", false)? else {
+        return Ok(None);
+    };
+    match FileExt::try_lock(&lock) {
+        Ok(()) => return Ok(None),
+        Err(fs4::TryLockError::WouldBlock) => {}
+        Err(fs4::TryLockError::Error(error)) => {
+            return Err(error).context("could not check SSH exporter");
+        }
+    }
+    directory.verify_locked_file(&path, "broker.lock", &lock)?;
+    let bytes = directory
+        .read_secret_optional_bounded("config", MAX_CONFIG_BYTES)?
+        .context("running SSH exporter has no configuration; retry once the host is ready")?;
+    ensure!(
+        bytes.starts_with(HEADER.as_bytes()),
+        "SSH exporter configuration is unmanaged"
+    );
+    let config = std::str::from_utf8(&bytes)?;
+    ensure!(
+        config.lines().any(|line| {
+            line.strip_prefix("Host ").is_some_and(|hosts| {
+                hosts
+                    .split_whitespace()
+                    .any(|host| host.eq_ignore_ascii_case(alias))
+            })
+        }),
+        "the running SSH exporter has not made this publisher available; wait for discovery or restart the exporter"
+    );
+    Ok(Some(path.join("config").canonicalize()?))
+}
+
 pub(super) struct ManagedConfig {
     source: PathBuf,
     target: PathBuf,
@@ -257,6 +298,25 @@ fn replace_config(source: &Path, target: &Path, previous: &ConfigFile, bytes: &[
 mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn copy_reuses_only_a_live_exporter_with_the_selected_stable_alias() {
+        let home = crate::test_support::canonical_tempdir();
+        assert!(active_export(home.path(), "attached-id").unwrap().is_none());
+        let managed = ManagedConfig::install(home.path()).unwrap();
+        assert!(active_export(home.path(), "attached-id").is_err());
+        managed
+            .publish("Host attached-id attached-office\n    ProxyCommand false\n")
+            .unwrap();
+        assert_eq!(
+            active_export(home.path(), "attached-id").unwrap(),
+            Some(home.path().join(".ssh/attached/config"))
+        );
+        assert!(active_export(home.path(), "attached-other").is_err());
+        drop(managed);
+        // A crashed/stopped exporter must not provide stale credentials.
+        assert!(active_export(home.path(), "attached-id").unwrap().is_none());
+    }
 
     #[test]
     fn installs_without_symlinks_restores_bytes_and_preserves_concurrent_edits() {

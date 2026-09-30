@@ -153,6 +153,71 @@ pub(crate) async fn connect(
 ) -> Result<i32> {
     let account = sync::state::load_account(path, ApiKeyScope::Download)?;
     let attachment = sync::refresh::ssh_host(path, &account, target, no_cache).await?;
+    connect_discovered(
+        path,
+        attachment,
+        account,
+        Operation::Ssh {
+            command,
+            expose_config,
+        },
+        trust_new_host_key,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+}
+
+enum Operation {
+    Ssh {
+        command: Vec<String>,
+        expose_config: bool,
+    },
+    Copy(super::copy::Copy),
+}
+
+pub(super) async fn copy(
+    path: &Path,
+    copy: super::copy::Copy,
+    no_cache: bool,
+    trust_new_host_key: bool,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> Result<i32> {
+    let account = sync::state::load_account(path, ApiKeyScope::Download)?;
+    let attachment = tokio::select! {
+        _ = cancellation.cancelled() => return Ok(130),
+        result = sync::refresh::ssh_host(path, &account, copy.target(), no_cache) => result?,
+    };
+    let alias = format!(
+        "attached-{}",
+        iroh::EndpointId::from_bytes(&attachment.endpoint_identity)?
+    );
+    let home = std::env::var_os("HOME").context("HOME is not set")?;
+    if let Some(config) = super::configuration::active_export(Path::new(&home), &alias)? {
+        ensure!(
+            !trust_new_host_key,
+            "cannot change host trust while an SSH exporter is running; stop the exporter and verify the publisher first"
+        );
+        return super::copy::run_client(copy.command(&config, &alias), cancellation).await;
+    }
+    connect_discovered(
+        path,
+        attachment,
+        account,
+        Operation::Copy(copy),
+        trust_new_host_key,
+        cancellation,
+    )
+    .await
+}
+
+async fn connect_discovered(
+    path: &Path,
+    attachment: sync::state_catalog::HostConnection,
+    account: sync::state::AccountCredentials,
+    operation: Operation,
+    trust_new_host_key: bool,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> Result<i32> {
     let consumer = iroh::SecretKey::from_bytes(
         account
             .consumer_identity_secret()
@@ -167,18 +232,28 @@ pub(crate) async fn connect(
             .relay_mode(iroh::RelayMode::Disabled)
             .clear_address_lookup();
     }
-    let endpoint = builder.bind().await?;
+    let endpoint = tokio::select! {
+        _ = cancellation.cancelled() => return Ok(130),
+        result = builder.bind() => result?,
+    };
     let result = run(
         &endpoint,
         path,
         attachment,
         account,
-        command,
-        expose_config,
+        operation,
         trust_new_host_key,
+        cancellation,
     )
     .await;
-    endpoint.close().await;
+    // Like the exporter, do not let an unreachable peer's QUIC draining delay
+    // cancellation indefinitely. Dropping the endpoint releases registration.
+    if tokio::time::timeout(std::time::Duration::from_secs(3), endpoint.close())
+        .await
+        .is_err()
+    {
+        tracing::debug!("SSH client stopped waiting for QUIC close acknowledgements");
+    }
     result
 }
 
@@ -338,28 +413,29 @@ async fn run(
     path: &Path,
     attachment: sync::state_catalog::HostConnection,
     account: sync::state::AccountCredentials,
-    command: Vec<String>,
-    expose_config: bool,
+    operation: Operation,
     trust_new_host_key: bool,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<i32> {
-    let prepared = Broker::prepare(
-        endpoint,
-        path,
-        attachment,
-        Arc::new(account),
-        trust_new_host_key,
-    )
-    .await?;
+    let prepared = tokio::select! {
+        _ = cancellation.cancelled() => return Ok(130),
+        result = Broker::prepare(endpoint, path, attachment, Arc::new(account), trust_new_host_key) => result?,
+    };
     let config_path = prepared.runtime.join("config");
     let alias = &prepared.alias;
-    let cancellation = tokio_util::sync::CancellationToken::new();
     let _cancel = cancellation.clone().drop_guard();
     let broker = prepared.serve(
         cancellation.clone(),
         tokio_util::sync::CancellationToken::new(),
     );
     tokio::pin!(broker);
-    if expose_config {
+    if matches!(
+        operation,
+        Operation::Ssh {
+            expose_config: true,
+            ..
+        }
+    ) {
         // Foreground export keeps the ephemeral key unlocked. Users can point ordinary
         // OpenSSH at this file; no changes to ~/.ssh/config or background key agents.
         println!("{}", config_path.display());
@@ -373,6 +449,18 @@ async fn run(
         }
         return Ok(0);
     }
+    let command = match operation {
+        Operation::Copy(copy) => {
+            let result = tokio::select! {
+                result = super::copy::run_client(copy.command(&config_path, alias), cancellation.clone()) => result,
+                result = &mut broker => { result?; anyhow::bail!("SSH proxy ended unexpectedly"); }
+            };
+            cancellation.cancel();
+            broker.await?;
+            return result;
+        }
+        Operation::Ssh { command, .. } => command,
+    };
     let mut child = openssh_command(&config_path, alias, &command)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
