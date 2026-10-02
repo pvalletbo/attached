@@ -38,6 +38,8 @@ const KDF_ITERATIONS: u32 = PRODUCTION_KDF_ITERATIONS;
 #[cfg(test)]
 const KDF_ITERATIONS: u32 = 1;
 const MAX_PASSWORD_BYTES: usize = 1024;
+#[cfg(not(test))]
+const ENCRYPTION_PASSWORD_ENV: &str = "ATTACHED_ENCRYPTION_PASSWORD";
 const ONE_PASSWORD_ITEM_TITLE: &str = "Attached encryption password";
 const ONE_PASSWORD_FIELD: &str = "password";
 const ONE_PASSWORD_LOCATOR_FILE: &str = "one-password-item.json";
@@ -122,7 +124,7 @@ impl PasswordPrompt for TtyPasswordPrompt {
     fn read_password(&self, prompt: &str) -> Result<Zeroizing<Vec<u8>>> {
         ensure!(
             !NONINTERACTIVE.load(Ordering::SeqCst),
-            "Attached credentials are locked; run `attached export-ssh-config` in a terminal, or configure an unlocked 1Password CLI for noninteractive SSH"
+            "Attached credentials are locked; run `attached export-ssh-config` in a terminal, set ATTACHED_ENCRYPTION_PASSWORD, or configure an unlocked 1Password CLI for noninteractive SSH"
         );
         let password = rpassword::prompt_password(prompt)
             .context("could not read the encryption password from the controlling terminal")?;
@@ -169,6 +171,31 @@ impl<P: PasswordPrompt> PasswordProvider for UserPasswordProvider<P> {
         }
 
         *cached = Some(Zeroizing::new(password.to_vec()));
+        Ok(password)
+    }
+}
+
+#[cfg(not(test))]
+struct EnvironmentPasswordProvider;
+
+#[cfg(not(test))]
+impl PasswordProvider for EnvironmentPasswordProvider {
+    #[tracing::instrument(name = "environment_password", level = "debug", skip_all)]
+    fn password(
+        &self,
+        _directory: &crate::secure_state::StateDir,
+        _create: bool,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        // Do not propagate VarError: its Display/Debug can expose an invalid value.
+        let password = match std::env::var(ENCRYPTION_PASSWORD_ENV) {
+            Ok(value) => Zeroizing::new(value.into_bytes()),
+            Err(std::env::VarError::NotPresent) => bail!("{ENCRYPTION_PASSWORD_ENV} is not set"),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                bail!("{ENCRYPTION_PASSWORD_ENV} must contain valid UTF-8")
+            }
+        };
+        validate_password(&password)
+            .map_err(|error| anyhow::anyhow!("invalid {ENCRYPTION_PASSWORD_ENV}: {error}"))?;
         Ok(password)
     }
 }
@@ -565,6 +592,13 @@ static USER_PASSWORD_STORE: LazyLock<
 });
 
 #[cfg(not(test))]
+static ENVIRONMENT_PASSWORD_STORE: LazyLock<PasswordMasterKeyStore<EnvironmentPasswordProvider>> =
+    LazyLock::new(|| PasswordMasterKeyStore {
+        passwords: EnvironmentPasswordProvider,
+        cached_key: Mutex::new(None),
+    });
+
+#[cfg(not(test))]
 static ONE_PASSWORD_STORE: LazyLock<PasswordMasterKeyStore<OnePasswordProvider<ProcessOpRunner>>> =
     LazyLock::new(|| PasswordMasterKeyStore {
         passwords: OnePasswordProvider {
@@ -704,6 +738,9 @@ pub(crate) fn active_store() -> &'static dyn MasterKeyStore {
         store
     } else if USE_ONE_PASSWORD.load(Ordering::SeqCst) {
         &*ONE_PASSWORD_STORE
+    } else if std::env::var_os(ENCRYPTION_PASSWORD_ENV).is_some() {
+        // Empty or non-UTF-8 values must fail, not fall back to a terminal prompt.
+        &*ENVIRONMENT_PASSWORD_STORE
     } else {
         &*USER_PASSWORD_STORE
     }

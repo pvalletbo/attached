@@ -20,7 +20,7 @@ use crate::{
 #[command(
     version,
     about = "Discover machines and connect over SSH through secure Iroh tunnels",
-    after_long_help = "CONFIGURATION:\n    Attached reads $HOME/.config/attached/config.toml when it exists. Supported TOML settings:\n\n        password_source = \"password\" # or \"1password\"\n        config_directory = \"/absolute/path\" # defaults to $HOME/.config/attached\n        one_password_item_tag = \"org.example.attached/encryption-password-v1\"\n            # defaults to attached/encryption-password-v1\n\n    --use-1password overrides password_source for the current invocation."
+    after_long_help = "CONFIGURATION:\n    Attached reads $HOME/.config/attached/config.toml when it exists. Supported TOML settings:\n\n        password_source = \"password\" # or \"1password\"\n        config_directory = \"/absolute/path\" # defaults to $HOME/.config/attached\n        one_password_item_tag = \"org.example.attached/encryption-password-v1\"\n            # defaults to attached/encryption-password-v1\n\n    --use-1password overrides password_source for the current invocation.\n\nENVIRONMENT:\n    ATTACHED_ENCRYPTION_PASSWORD supplies the local encryption password without\n    prompting or confirmation when password_source = \"password\" (the default).\n    --use-1password or password_source = \"1password\" takes precedence over it.\n    The value is used verbatim: 1-1024 bytes of valid UTF-8. Empty or invalid\n    values fail instead of prompting. Reuse the same password to unlock state.\n    For unattended publishers, inject it alongside ATTACHED_PUBLISH_BUNDLE and\n    run `attached serve`. Prefer secret injection over literals in shell history.\n    Attached does not persist the password, but the environment remains visible\n    to child processes and other processes allowed to inspect it."
 )]
 pub struct Cli {
     /// Increase diagnostic verbosity (`-v` for lifecycle, `-vv` for debug details).
@@ -33,7 +33,7 @@ pub struct Cli {
     #[arg(long, value_name = "FILE", global = true)]
     flamegraph: Option<PathBuf>,
 
-    /// Have 1Password generate and store the encryption password instead of prompting for one.
+    /// Have 1Password generate and store the encryption password instead of using the environment or prompting for one.
     #[arg(long, global = true)]
     use_1password: bool,
 
@@ -842,6 +842,10 @@ mod tests {
         assert!(help.contains("generate and store"), "{help}");
         assert!(help.contains("password_source = \"password\""), "{help}");
         assert!(help.contains("config_directory"), "{help}");
+        assert!(help.contains("ATTACHED_ENCRYPTION_PASSWORD"), "{help}");
+        assert!(help.contains("takes precedence over it"), "{help}");
+        assert!(help.contains("1-1024 bytes of valid UTF-8"), "{help}");
+        assert!(help.contains("ATTACHED_PUBLISH_BUNDLE"), "{help}");
         assert!(help.contains("one_password_item_tag"), "{help}");
         assert!(help.contains("attached/encryption-password-v1"), "{help}");
     }
