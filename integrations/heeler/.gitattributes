@@ -1,0 +1,3 @@
+# Patch context retains upstream whitespace (including blank lines and tabs).
+# test-prepare.sh checks whitespace on the applied source instead.
+heeler-attached.patch -whitespace
