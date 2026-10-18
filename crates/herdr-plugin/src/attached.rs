@@ -1,6 +1,13 @@
 //! The replaceable Attached integration boundary. A future library-backed source
 //! can implement DiscoverySource without changing reconciliation or Herdr calls.
-use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fs::OpenOptions,
+    io::Read,
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    path::PathBuf,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
@@ -16,7 +23,6 @@ pub(crate) struct Host {
 }
 
 pub(crate) trait DiscoverySource {
-    async fn hosts(&self) -> Result<Vec<Host>>;
     async fn ready(&self, host: &Host) -> Result<bool>;
 }
 
@@ -32,15 +38,51 @@ impl Default for CliAttached {
     }
 }
 
-impl DiscoverySource for CliAttached {
-    async fn hosts(&self) -> Result<Vec<Host>> {
-        let mut command = Command::new(&self.binary);
-        command.args(["sessions", "list", "--json"]);
-        let output = process::output(command, Duration::from_secs(20)).await
-            .context("Attached discovery failed (requires unattended credentials and sessions list --json)")?;
-        parse_hosts(&output)
-    }
+/// Versioned, credential-free snapshot produced by the already-unlocked exporter.
+#[derive(Debug, Deserialize)]
+pub(crate) struct Discovery {
+    pub version: u32,
+    pub generation: String,
+    pub checked_at: u64,
+    pub complete: bool,
+    pub hosts: Vec<Host>,
+}
 
+impl CliAttached {
+    pub fn hosts(&self) -> Result<Discovery> {
+        let home = std::env::var_os("HOME").context("HOME is not set")?;
+        let path = PathBuf::from(home).join(".ssh/attached/discovery.json");
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(
+                (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
+            )
+            .open(path)
+            .context(
+                "could not read exporter discovery; update Attached if discovery.json is missing",
+            )?;
+        let metadata = file.metadata()?;
+        ensure!(
+            metadata.is_file()
+                && metadata.nlink() == 1
+                && metadata.uid() == rustix::process::geteuid().as_raw()
+                && metadata.mode() & 0o077 == 0,
+            "exporter discovery must be an owner-only regular file"
+        );
+        let mut output = String::new();
+        file.take(4 * 1024 * 1024 + 1).read_to_string(&mut output)?;
+        ensure!(
+            output.len() <= 4 * 1024 * 1024,
+            "exporter discovery is too large"
+        );
+        parse_discovery(
+            &output,
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+        )
+    }
+}
+
+impl DiscoverySource for CliAttached {
     async fn ready(&self, host: &Host) -> Result<bool> {
         let mut command = Command::new("ssh");
         command.args(["-G", &host.ssh_target]);
@@ -49,9 +91,27 @@ impl DiscoverySource for CliAttached {
     }
 }
 
-pub(crate) fn parse_hosts(output: &str) -> Result<Vec<Host>> {
-    let hosts: Vec<Host> =
-        serde_json::from_str(output).context("invalid Attached JSON host list")?;
+fn parse_discovery(output: &str, now: u64) -> Result<Discovery> {
+    let mut discovery: Discovery =
+        serde_json::from_str(output).context("invalid Attached JSON discovery")?;
+    ensure!(
+        discovery.version == 1,
+        "unsupported exporter discovery version"
+    );
+    ensure!(
+        !discovery.generation.is_empty() && discovery.generation.len() <= 64,
+        "invalid exporter discovery generation"
+    );
+    ensure!(
+        now.checked_sub(discovery.checked_at)
+            .is_some_and(|age| age <= 90),
+        "exporter discovery is stale or from the future"
+    );
+    discovery.hosts = validate_hosts(discovery.hosts)?;
+    Ok(discovery)
+}
+
+fn validate_hosts(hosts: Vec<Host>) -> Result<Vec<Host>> {
     let mut unique = BTreeMap::new();
     for host in hosts {
         ensure!(
@@ -106,6 +166,34 @@ fn tunnel_ready(output: &str, target: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_hosts(output: &str) -> Result<Vec<Host>> {
+        validate_hosts(serde_json::from_str(output)?)
+    }
+
+    #[test]
+    fn snapshots_require_a_supported_version_valid_generation_and_fresh_check() {
+        let valid = serde_json::json!({
+            "version":1, "generation":"one", "checked_at":100,
+            "complete":true, "hosts":[]
+        });
+        assert!(parse_discovery(&valid.to_string(), 100).unwrap().complete);
+        assert!(parse_discovery(&valid.to_string(), 191).is_err());
+        assert!(parse_discovery(&valid.to_string(), 99).is_err());
+        for (field, value) in [
+            ("version", serde_json::json!(2)),
+            ("generation", serde_json::json!("")),
+            (
+                "hosts",
+                serde_json::json!([{"host":"Office","endpoint_id":"bad","ssh_target":"bad"}]),
+            ),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = value;
+            assert!(parse_discovery(&invalid.to_string(), 100).is_err());
+        }
+        assert!(parse_discovery("[]", 100).is_err());
+    }
 
     #[test]
     fn parses_empty_and_duplicate_hosts_without_accepting_arbitrary_targets() {

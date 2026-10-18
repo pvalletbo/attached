@@ -78,13 +78,15 @@ impl ManagedConfig {
         let mut next = block.as_bytes().to_vec();
         next.extend_from_slice(original);
         replace_config(&source, &target, &current, &next)?;
-        Ok(Self {
+        let managed = Self {
             source,
             target,
             block,
             directory,
             _lock: lock,
-        })
+        };
+        managed.publish_discovery(&[], false)?;
+        Ok(managed)
     }
 
     pub(super) fn publish(&self, hosts: &str) -> Result<()> {
@@ -96,7 +98,29 @@ impl ManagedConfig {
         self.directory.atomic_replace("config", content.as_bytes())
     }
 
+    /// Public discovery metadata only. Credentials remain in the exporter's memory;
+    /// consumers must never interpret an old/error snapshot as a fresh empty list.
+    pub(super) fn publish_discovery(
+        &self,
+        hosts: &[crate::sync::state_catalog::SyncedHost],
+        complete: bool,
+    ) -> Result<()> {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+        let hosts: serde_json::Value =
+            serde_json::from_str(&crate::host_picker::render_json(hosts)?)?;
+        let report = serde_json::json!({
+            "version": 1,
+            "generation": now.as_nanos().to_string(),
+            "checked_at": now.as_secs(),
+            "complete": complete,
+            "hosts": hosts,
+        });
+        self.directory
+            .atomic_replace("discovery.json", &serde_json::to_vec(&report)?)
+    }
+
     fn cleanup(&self) -> Result<()> {
+        let discovery = self.publish_discovery(&[], false);
         // Disable aliases even if a user edited/moved the Include and we cannot
         // safely remove it. The fixed fallback cannot dial an unrelated host.
         self.publish("")?;
@@ -115,7 +139,7 @@ impl ManagedConfig {
         {
             anyhow::bail!("managed SSH Include was edited; leaving the user's changes untouched");
         }
-        Ok(())
+        discovery
     }
 }
 
@@ -257,6 +281,45 @@ fn replace_config(source: &Path, target: &Path, previous: &ConfigFile, bytes: &[
 mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn discovery_snapshots_are_private_public_metadata_and_invalidated_on_start_and_stop() {
+        let home = crate::test_support::canonical_tempdir();
+        let path = home.path().join(".ssh/attached/discovery.json");
+        let managed = ManagedConfig::install(home.path()).unwrap();
+        let hosts = vec![crate::sync::state_catalog::SyncedHost {
+            target: "a".repeat(64),
+            host: "Office".into(),
+            attached_version: [1, 2, 3],
+            published_at: None,
+        }];
+        managed.publish_discovery(&hosts, true).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(report["version"], 1);
+        assert_eq!(report["complete"], true);
+        assert_eq!(
+            report["hosts"][0]["ssh_target"],
+            format!("attached-{}", "a".repeat(64))
+        );
+        assert_eq!(report["hosts"][0].as_object().unwrap().len(), 5);
+        assert!(!String::from_utf8(bytes).unwrap().contains("capability"));
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        let generation = report["generation"].clone();
+        managed.publish_discovery(&[], false).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_ne!(report["generation"], generation);
+        assert_eq!(report["complete"], false);
+        managed.publish_discovery(&hosts, true).unwrap();
+        drop(managed);
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(report["complete"], false);
+        assert_eq!(report["hosts"], serde_json::json!([]));
+        let managed = ManagedConfig::install(home.path()).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(report["complete"], false);
+        drop(managed);
+    }
 
     #[test]
     fn installs_without_symlinks_restores_bytes_and_preserves_concurrent_edits() {

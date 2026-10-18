@@ -12,11 +12,7 @@ use fs4::FileExt;
 use tokio::{io::AsyncReadExt, process::Command};
 
 use crate::{
-    INTERVAL,
-    attached::{CliAttached, DiscoverySource},
-    discovery::Reconciler,
-    herdr::Herdr,
-    process::ChildGroup,
+    INTERVAL, attached::CliAttached, discovery::Reconciler, herdr::Herdr, process::ChildGroup,
     state::Log,
 };
 
@@ -198,12 +194,13 @@ pub(crate) async fn worker() -> Result<()> {
                     return Ok(Some(Some(next)));
                 }
                 if plugin.enabled {
-                    let hosts = attached.hosts().await?;
                     exporter.ensure(&home, &attached, &log).await?;
-                    reconciler.poll(&hosts, &attached, &herdr).await?;
+                    let discovery = attached.hosts()?;
+                    reconciler.check(&discovery, &attached, &herdr).await?;
                 } else {
                     // Keep a dormant worker so re-enable resumes without an action.
                     exporter.stop().await;
+                    reconciler.reset_absences();
                 }
                 Ok::<_, anyhow::Error>(None)
             }
@@ -211,7 +208,10 @@ pub(crate) async fn worker() -> Result<()> {
             match result {
                 Ok(Some(next)) => break next,
                 Ok(None) => {}
-                Err(error) => log.record(format!("Discovery will retry: {error:#}")),
+                Err(error) => {
+                    reconciler.reset_absences();
+                    log.record(format!("Discovery will retry: {error:#}"));
+                }
             }
             tokio::time::sleep(INTERVAL).await;
         }
