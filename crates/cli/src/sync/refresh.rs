@@ -151,7 +151,6 @@ pub(crate) async fn refresh_hosts_unlocked(
     if registry.is_err() {
         push_registry_warning(&mut result.warnings);
     }
-    result.hosts = state_catalog::all_ssh_hosts(state_dir, account, super::utc_now_seconds())?;
     Ok(result)
 }
 

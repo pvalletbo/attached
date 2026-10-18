@@ -320,7 +320,7 @@ fn encode_catalog(catalog: &Catalog) -> Result<Zeroizing<Vec<u8>>> {
 
 /// SSH configuration exports include local publishers too: unlike the human
 /// discovery listing, they must provide aliases for every advertised SSH host.
-pub(super) fn all_ssh_hosts(
+pub(crate) fn all_ssh_hosts(
     state_dir: &Path,
     account: &AccountCredentials,
     now: DateTime<Utc>,

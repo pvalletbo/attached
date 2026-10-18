@@ -16,6 +16,9 @@ use crate::process::diagnostic;
 pub(crate) struct State {
     pub seen: BTreeSet<String>,
     pub pending: BTreeMap<String, String>,
+    // Legacy "seen" entries cannot prove ownership: never adopt them for cleanup.
+    #[serde(default)]
+    pub managed: BTreeMap<String, String>,
 }
 
 impl State {

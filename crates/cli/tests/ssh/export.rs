@@ -5,6 +5,7 @@ use super::ssh_renewal::{StreamSsh, round_trip, ssh};
 use super::*;
 use std::{
     collections::BTreeMap,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -78,6 +79,10 @@ impl Discovery {
                                 RecordId::parse(path.strip_prefix(&format!("{prefix}/")).unwrap())
                                     .unwrap();
                             if let Some(record) = records.get(&id) {
+                                if record.bytes.is_empty() {
+                                    reply(&mut stream, "503 Unavailable", b"", "").await;
+                                    continue;
+                                }
                                 reply(
                                     &mut stream,
                                     "200 OK",
@@ -278,6 +283,25 @@ async fn wait_config(fixture: &CliFixture, check: impl Fn(&str) -> bool) -> Stri
     })
 }
 
+async fn wait_discovery(
+    fixture: &CliFixture,
+    check: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    timeout(DEADLINE, async {
+        loop {
+            if let Ok(bytes) = fs::read(fixture.path("home/.ssh/attached/discovery.json"))
+                && let Ok(report) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                && check(&report)
+            {
+                return report;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    })
+    .await
+    .expect("exporter discovery never converged")
+}
+
 fn start(fixture: &CliFixture) -> tokio::process::Child {
     fixture
         .command(&[
@@ -377,6 +401,59 @@ async fn exporter_autodiscovers_all_hosts_and_reconciles_aliases_without_interru
     laptop.advertise(&discovery, "Laptop", 1, true, 300).await;
     let configured = wait_config(&fixture, |text| text.contains(" attached-laptop\n")).await;
     files.extend(runtime_files(&configured));
+    // Herdr can discover the new host through public metadata, with both the
+    // encrypted bundle and op removed: the exporter retains the unlocked account.
+    let report = wait_discovery(&fixture, |report| {
+        report["complete"] == true
+            && report["hosts"]
+                .as_array()
+                .is_some_and(|hosts| hosts.len() == 2)
+    })
+    .await;
+    assert_eq!(report["version"], 1);
+    assert!(
+        report["hosts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|host| host["host"] == "Laptop")
+    );
+    assert_private(&fixture.path("home/.ssh/attached/discovery.json"));
+    let generation = report["generation"].clone();
+    wait_discovery(&fixture, |report| {
+        report["generation"] != generation && report["complete"] == true
+    })
+    .await;
+    // The human/Herdr listing excludes a locally serving exact endpoint, but
+    // OpenSSH must still export it. Both views share the same unlocked account.
+    let marker = fixture.path(&format!(
+        "tmp/attached-{}/live-endpoints/{}.lock",
+        rustix::process::geteuid().as_raw(),
+        office.endpoint.id()
+    ));
+    let local = fs::File::create(&marker).unwrap();
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+    fs4::FileExt::lock(&local).unwrap();
+    wait_discovery(&fixture, |report| {
+        report["complete"] == true
+            && report["hosts"]
+                .as_array()
+                .is_some_and(|hosts| hosts.len() == 1 && hosts[0]["host"] == "Laptop")
+    })
+    .await;
+    assert!(
+        fs::read_to_string(fixture.path("home/.ssh/attached/config"))
+            .unwrap()
+            .contains(" attached-office\n")
+    );
+    drop(local);
+    wait_discovery(&fixture, |report| {
+        report["complete"] == true
+            && report["hosts"]
+                .as_array()
+                .is_some_and(|hosts| hosts.len() == 2)
+    })
+    .await;
     let mut clients = JoinSet::new();
     for alias in [
         "attached-office",
@@ -455,6 +532,10 @@ async fn exporter_autodiscovers_all_hosts_and_reconciles_aliases_without_interru
     modified.extend_from_slice(b"# new personal setting\n");
     fs::write(&config, modified).unwrap();
     stop(broker, rustix::process::Signal::INT).await;
+    wait_discovery(&fixture, |report| {
+        report["complete"] == false && report["hosts"] == serde_json::json!([])
+    })
+    .await;
     assert_eq!(
         fs::read(&config).unwrap(),
         [personal.as_slice(), b"# new personal setting\n"].concat()
@@ -476,6 +557,49 @@ async fn exporter_autodiscovers_all_hosts_and_reconciles_aliases_without_interru
     );
     office.stop().await;
     laptop.stop().await;
+    discovery.stop().await;
+}
+
+#[tokio::test]
+async fn exporter_marks_partial_refreshes_non_authoritative_and_recovers() {
+    let fixture = CliFixture::new();
+    let discovery = Discovery::new().await;
+    let consumer = iroh::SecretKey::generate().to_bytes();
+    import_with_identity(&fixture, &discovery.origin, consumer).await;
+    let office = Publisher::new(consumer, 67).await;
+    office.advertise(&discovery, "Office", 1, true, 300).await;
+    let unavailable = RecordId::from_bytes([99; 16]);
+    discovery.records.lock().await.as_mut().unwrap().insert(
+        unavailable,
+        Publication {
+            revision: 1,
+            bytes: vec![],
+        },
+    );
+    let broker = start(&fixture);
+    wait_discovery(&fixture, |report| {
+        report["complete"] == false
+            && report["hosts"]
+                .as_array()
+                .is_some_and(|hosts| hosts.len() == 1 && hosts[0]["host"] == "Office")
+    })
+    .await;
+    discovery
+        .records
+        .lock()
+        .await
+        .as_mut()
+        .unwrap()
+        .remove(&unavailable);
+    wait_discovery(&fixture, |report| {
+        report["complete"] == true
+            && report["hosts"]
+                .as_array()
+                .is_some_and(|hosts| hosts.len() == 1)
+    })
+    .await;
+    stop(broker, rustix::process::Signal::TERM).await;
+    office.stop().await;
     discovery.stop().await;
 }
 
@@ -508,6 +632,7 @@ async fn exporter_retains_live_hosts_during_outages_expires_aliases_and_recovers
     })
     .await
     .unwrap();
+    wait_discovery(&fixture, |report| report["complete"] == false).await;
     check_command(&config, "attached-office").await;
     // Replace the fixture snapshot atomically: publishing a transient empty
     // index would legitimately retire the broker before the short lease arrives.

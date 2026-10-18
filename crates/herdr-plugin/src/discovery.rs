@@ -8,7 +8,7 @@ use anyhow::Result;
 
 use crate::{
     INTERVAL,
-    attached::{DiscoverySource, Host, is_endpoint},
+    attached::{Discovery, DiscoverySource, Host, is_endpoint},
     herdr::MachineRegistry,
     state::{Log, State},
 };
@@ -16,6 +16,8 @@ use crate::{
 pub(crate) struct Reconciler {
     path: PathBuf,
     retry: BTreeMap<String, (Instant, u32)>,
+    missing: BTreeMap<String, u32>,
+    last_generation: Option<String>,
     log: Log,
 }
 
@@ -24,8 +26,74 @@ impl Reconciler {
         Self {
             path: directory.join("discovery-state.json"),
             retry: BTreeMap::new(),
+            missing: BTreeMap::new(),
+            last_generation: None,
             log,
         }
+    }
+
+    pub fn reset_absences(&mut self) {
+        self.missing.clear();
+    }
+
+    pub async fn check(
+        &mut self,
+        discovery: &Discovery,
+        source: &impl DiscoverySource,
+        registry: &impl MachineRegistry,
+    ) -> Result<()> {
+        self.poll(&discovery.hosts, source, registry).await?;
+        if !discovery.complete {
+            self.reset_absences();
+        } else if self.last_generation.as_ref() != Some(&discovery.generation) {
+            self.prune(&discovery.hosts, registry).await?;
+        }
+        self.last_generation = Some(discovery.generation.clone());
+        Ok(())
+    }
+
+    async fn prune(&mut self, hosts: &[Host], registry: &impl MachineRegistry) -> Result<()> {
+        let mut state = State::load(&self.path)?;
+        let machines = registry.machines().await?;
+        self.missing.retain(|id, _| state.managed.contains_key(id));
+        for (endpoint, profile) in state.managed.clone() {
+            // A manually removed/replaced profile stays removed. Never transfer
+            // ownership to a new profile with the same SSH target.
+            let target = format!("attached-{endpoint}");
+            if !machines
+                .iter()
+                .any(|m| m.id == profile && m.target.eq_ignore_ascii_case(&target))
+            {
+                state.managed.remove(&endpoint);
+                state.pending.remove(&endpoint);
+                self.missing.remove(&endpoint);
+                state.save(&self.path)?;
+                continue;
+            }
+            if hosts.iter().any(|host| host.endpoint_id == endpoint) {
+                self.missing.remove(&endpoint);
+                continue;
+            }
+            let misses = self.missing.entry(endpoint.clone()).or_default();
+            *misses = misses.saturating_add(1);
+            if *misses < 3 {
+                continue;
+            }
+            if let Err(error) = registry.remove(&profile).await {
+                self.log
+                    .record(format!("Will retry removing {target}: {error:#}"));
+                continue;
+            }
+            state.managed.remove(&endpoint);
+            state.seen.remove(&endpoint);
+            state.pending.remove(&endpoint);
+            self.missing.remove(&endpoint);
+            self.retry.remove(&endpoint);
+            state.save(&self.path)?;
+            self.log
+                .record(format!("Removed {target} after three missing checks"));
+        }
+        Ok(())
     }
 
     pub async fn poll(
@@ -87,14 +155,14 @@ impl Reconciler {
                 };
                 let result = async {
                     if !source.ready(host).await? {
-                        return Ok(false);
+                        return Ok(None);
                     }
-                    registry.add(&host.ssh_target, &display).await?;
-                    Ok::<_, anyhow::Error>(true)
+                    let profile = registry.add(&host.ssh_target, &display).await?;
+                    Ok::<_, anyhow::Error>(Some(profile))
                 }
                 .await;
                 match result {
-                    Ok(false) => continue,
+                    Ok(None) => continue,
                     Err(error) => {
                         let delay = Duration::from_secs(
                             (INTERVAL.as_secs() * 2_u64.pow(failures.min(4))).min(300),
@@ -107,7 +175,9 @@ impl Reconciler {
                             .record(format!("Will retry {}: {error:#}", host.ssh_target));
                         continue;
                     }
-                    Ok(true) => {}
+                    Ok(Some(profile)) => {
+                        state.managed.insert(host.endpoint_id.clone(), profile);
+                    }
                 }
                 state.seen.insert(host.endpoint_id.clone());
                 state
@@ -116,8 +186,7 @@ impl Reconciler {
                 self.log
                     .record(format!("Added {display} ({})", host.ssh_target));
             }
-            // Commit each add before toasting or trying another machine. Never
-            // use discovery absence as a reason to remove or disable a profile.
+            // Persist ownership before toasting or trying another machine.
             state.save(&self.path)?;
         }
         for (id, label) in state.pending.clone() {
@@ -148,11 +217,10 @@ mod tests {
         unready: RefCell<BTreeSet<String>>,
         failing: RefCell<BTreeSet<String>>,
         toast_offline: RefCell<bool>,
+        removes: RefCell<Vec<String>>,
+        remove_fails: RefCell<bool>,
     }
     impl DiscoverySource for Fake {
-        async fn hosts(&self) -> Result<Vec<Host>> {
-            unreachable!()
-        }
         async fn ready(&self, host: &Host) -> Result<bool> {
             Ok(!self.unready.borrow().contains(&host.endpoint_id))
         }
@@ -164,14 +232,23 @@ mod tests {
                 .borrow()
                 .iter()
                 .map(|target| Machine {
+                    id: format!("id-{target}"),
                     target: target.clone(),
                 })
                 .collect())
         }
-        async fn add(&self, target: &str, label: &str) -> Result<()> {
+        async fn add(&self, target: &str, label: &str) -> Result<String> {
             self.adds.borrow_mut().push((target.into(), label.into()));
             anyhow::ensure!(!self.failing.borrow().contains(target), "offline publisher");
             self.machines.borrow_mut().push(target.into());
+            Ok(format!("id-{target}"))
+        }
+        async fn remove(&self, id: &str) -> Result<()> {
+            self.removes.borrow_mut().push(id.into());
+            anyhow::ensure!(!*self.remove_fails.borrow(), "cannot remove");
+            self.machines
+                .borrow_mut()
+                .retain(|target| format!("id-{target}") != id);
             Ok(())
         }
         async fn notify(&self, label: &str) -> Result<bool> {
@@ -192,6 +269,206 @@ mod tests {
     }
     fn reconciler(path: &Path) -> Reconciler {
         Reconciler::new(path, Log::new(path))
+    }
+
+    fn report(generation: u32, hosts: Vec<Host>, complete: bool) -> Discovery {
+        Discovery {
+            version: 1,
+            generation: generation.to_string(),
+            checked_at: 0,
+            complete,
+            hosts,
+        }
+    }
+
+    #[tokio::test]
+    async fn removes_only_owned_profiles_after_three_distinct_checks_and_readds_on_return() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = Fake::default();
+        let owned = host(1, "Office");
+        let manual = host(2, "Manual");
+        *fake.machines.borrow_mut() = vec![manual.ssh_target.clone(), "attached-friendly".into()];
+        let mut task = reconciler(temp.path());
+        task.check(&report(1, vec![owned.clone(), manual], true), &fake, &fake)
+            .await
+            .unwrap();
+        assert_eq!(State::load(&task.path).unwrap().managed.len(), 1);
+        for generation in [2, 2, 2, 3] {
+            task.check(&report(generation, vec![], true), &fake, &fake)
+                .await
+                .unwrap();
+            assert!(fake.removes.borrow().is_empty());
+        }
+        task.check(&report(4, vec![], true), &fake, &fake)
+            .await
+            .unwrap();
+        assert_eq!(*fake.removes.borrow(), [format!("id-{}", owned.ssh_target)]);
+        assert_eq!(fake.machines.borrow().len(), 2);
+        assert!(State::load(&task.path).unwrap().managed.is_empty());
+        task.check(&report(5, vec![owned], true), &fake, &fake)
+            .await
+            .unwrap();
+        assert_eq!(fake.adds.borrow().len(), 2);
+        assert_eq!(fake.toasts.borrow().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn reappearance_partial_refresh_and_failed_checks_reset_the_grace_period() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = Fake::default();
+        let owned = host(1, "Office");
+        let mut task = reconciler(temp.path());
+        task.check(&report(0, vec![owned.clone()], true), &fake, &fake)
+            .await
+            .unwrap();
+        for generation in 1..=2 {
+            task.check(&report(generation, vec![], true), &fake, &fake)
+                .await
+                .unwrap();
+        }
+        task.check(&report(3, vec![owned], true), &fake, &fake)
+            .await
+            .unwrap();
+        for generation in 4..=5 {
+            task.check(&report(generation, vec![], true), &fake, &fake)
+                .await
+                .unwrap();
+        }
+        task.check(&report(6, vec![], false), &fake, &fake)
+            .await
+            .unwrap();
+        for generation in 7..=8 {
+            task.check(&report(generation, vec![], true), &fake, &fake)
+                .await
+                .unwrap();
+        }
+        task.reset_absences(); // Malformed/stale/unreadable snapshot or failed Herdr check.
+        for generation in 9..=10 {
+            task.check(&report(generation, vec![], true), &fake, &fake)
+                .await
+                .unwrap();
+        }
+        assert!(fake.removes.borrow().is_empty());
+        task.check(&report(11, vec![], true), &fake, &fake)
+            .await
+            .unwrap();
+        assert_eq!(fake.removes.borrow().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ownership_survives_restart_but_absence_counts_do_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = Fake::default();
+        let mut task = reconciler(temp.path());
+        task.check(&report(0, vec![host(1, "Office")], true), &fake, &fake)
+            .await
+            .unwrap();
+        for generation in 1..=2 {
+            task.check(&report(generation, vec![], true), &fake, &fake)
+                .await
+                .unwrap();
+        }
+        let mut restarted = reconciler(temp.path());
+        for generation in 3..=4 {
+            restarted
+                .check(&report(generation, vec![], true), &fake, &fake)
+                .await
+                .unwrap();
+        }
+        assert!(fake.removes.borrow().is_empty());
+        restarted
+            .check(&report(5, vec![], true), &fake, &fake)
+            .await
+            .unwrap();
+        assert_eq!(fake.removes.borrow().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn removal_failure_retries_without_forgetting_ownership_or_readding() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = Fake::default();
+        let owned = host(1, "Office");
+        let mut task = reconciler(temp.path());
+        task.check(&report(0, vec![owned.clone()], true), &fake, &fake)
+            .await
+            .unwrap();
+        *fake.remove_fails.borrow_mut() = true;
+        for generation in 1..=3 {
+            task.check(&report(generation, vec![], true), &fake, &fake)
+                .await
+                .unwrap();
+        }
+        assert!(
+            State::load(&task.path)
+                .unwrap()
+                .seen
+                .contains(&owned.endpoint_id)
+        );
+        assert_eq!(State::load(&task.path).unwrap().managed.len(), 1);
+        *fake.remove_fails.borrow_mut() = false;
+        task.check(&report(4, vec![], true), &fake, &fake)
+            .await
+            .unwrap();
+        assert_eq!(fake.removes.borrow().len(), 2);
+        assert!(State::load(&task.path).unwrap().managed.is_empty());
+        task.check(&report(5, vec![owned], true), &fake, &fake)
+            .await
+            .unwrap();
+        assert_eq!(fake.adds.borrow().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn manual_removals_replacements_and_legacy_entries_are_never_adopted() {
+        for replacement in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let fake = Fake::default();
+            let owned = host(1, "Office");
+            let mut task = reconciler(temp.path());
+            task.check(&report(0, vec![owned.clone()], true), &fake, &fake)
+                .await
+                .unwrap();
+            if replacement {
+                // A different saved ID is not the profile we added.
+                let mut state = State::load(&task.path).unwrap();
+                state
+                    .managed
+                    .insert(owned.endpoint_id.clone(), "old-profile-id".into());
+                state.save(&task.path).unwrap();
+            } else {
+                fake.machines.borrow_mut().clear();
+            }
+            for generation in 1..=4 {
+                task.check(&report(generation, vec![], true), &fake, &fake)
+                    .await
+                    .unwrap();
+            }
+            task.check(&report(5, vec![owned], true), &fake, &fake)
+                .await
+                .unwrap();
+            assert!(fake.removes.borrow().is_empty());
+            assert_eq!(fake.adds.borrow().len(), 1);
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let fake = Fake::default();
+        let legacy = host(2, "Legacy");
+        fake.machines.borrow_mut().push(legacy.ssh_target);
+        let mut task = reconciler(temp.path());
+        std::fs::write(
+            &task.path,
+            serde_json::json!({
+                "seen":[legacy.endpoint_id], "pending":{}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        for generation in 1..=4 {
+            task.check(&report(generation, vec![], true), &fake, &fake)
+                .await
+                .unwrap();
+        }
+        assert!(fake.removes.borrow().is_empty());
+        assert_eq!(fake.machines.borrow().len(), 1);
     }
 
     #[tokio::test]

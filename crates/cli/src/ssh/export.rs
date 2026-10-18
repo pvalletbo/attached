@@ -104,7 +104,8 @@ pub(crate) async fn export(path: &Path, refresh_interval: Duration) -> Result<i3
             .await;
             // All brokers and keys are gone. Do not leave stale proxy paths
             // published while the next endpoint is binding/discovering hosts.
-            let unpublished = managed.publish("");
+            let discovery = managed.publish_discovery(&[], false);
+            let unpublished = managed.publish("").and(discovery);
             // QUIC draining can otherwise outlive shutdown/resume when a peer
             // is unreachable. Drop the last endpoint handle even if draining
             // times out, so the old relay registration cannot outlive this loop.
@@ -140,7 +141,10 @@ pub(crate) async fn export(path: &Path, refresh_interval: Duration) -> Result<i3
     Ok(0)
 }
 
-async fn discover(path: &Path, account: &AccountCredentials) -> Result<Snapshot> {
+async fn discover(
+    path: &Path,
+    account: &AccountCredentials,
+) -> Result<(Snapshot, Vec<SyncedHost>, bool)> {
     let refreshed = sync::refresh::refresh_hosts_unlocked(path, account).await?;
     for warning in refreshed
         .warnings
@@ -149,8 +153,17 @@ async fn discover(path: &Path, account: &AccountCredentials) -> Result<Snapshot>
     {
         eprintln!("Warning: {warning}");
     }
+    // A partial catalog refresh may add hosts, but is not evidence of absence.
+    let complete = !refreshed.warnings.iter().any(|warning| {
+        matches!(
+            warning,
+            sync::refresh::RefreshWarning::RecordUnavailable { .. }
+        )
+    });
     let mut snapshot = BTreeMap::new();
-    for SyncedHost { target, host, .. } in refreshed.hosts {
+    for SyncedHost { target, host, .. } in
+        sync::state_catalog::all_ssh_hosts(path, account, sync::utc_now_seconds())?
+    {
         // Recheck consent and expiry against completion time, not HTTP start time.
         if let Ok(connection) =
             sync::state_catalog::host(path, account, &target, sync::utc_now_seconds())
@@ -165,7 +178,7 @@ async fn discover(path: &Path, account: &AccountCredentials) -> Result<Snapshot>
             );
         }
     }
-    Ok(snapshot)
+    Ok((snapshot, refreshed.hosts, complete))
 }
 
 async fn run(
@@ -227,8 +240,14 @@ async fn run(
                 }
                 snapshot = discoveries.recv() => {
                     match snapshot.context("SSH discovery task ended unexpectedly")? {
-                        Ok(snapshot) => { known = snapshot; }
-                        Err(error) => eprintln!("Warning: SSH discovery failed: {error:#}; retaining only unexpired hosts and retrying"),
+                        Ok((snapshot, hosts, complete)) => {
+                            managed.publish_discovery(&hosts, complete)?;
+                            known = snapshot;
+                        }
+                        Err(error) => {
+                            managed.publish_discovery(&[], false)?;
+                            eprintln!("Warning: SSH discovery failed: {error:#}; retaining only unexpired hosts and retrying");
+                        }
                     }
                 }
                 completed = preparing.join_next(), if !preparing.is_empty() => {

@@ -36,11 +36,11 @@ impl Fixture {
         .unwrap();
         fixture.plugin(true);
         fixture.hosts(&[1]);
-        fs::write(fixture.path("machines.json"), "[]").unwrap();
+        fs::write(fixture.path("machine-rows"), "").unwrap();
         fixture.script("herdr", r#"
 case "$*" in
   'plugin list --json') cat "$FIXTURE/plugin.json";;
-  'machine list --json') cat "$FIXTURE/machines.json";;
+  'machine list --json') printf 'check\n' >> "$FIXTURE/events"; awk 'BEGIN {printf "["} {if (NR > 1) printf ","; printf "%s", $0} END {print "]"}' "$FIXTURE/machine-rows";;
   'session list --json') printf '%s\n' '{"sessions":[{"name":"work","running":true,"socket_path":"/fixture/herdr.sock"}]}' ;;
   '--session work plugin action invoke attached.discovery.ensure') printf 'ensure\n' >> "$FIXTURE/events";;
   *)
@@ -49,7 +49,15 @@ case "$*" in
       # The worker must not supply stdin or permit SSH askpass.
       if read -r input; then exit 82; fi
       [ "$SSH_ASKPASS_REQUIRE" = 'never' ] || exit 83
+      profile=$(printf '%s' "${3#attached-}" | cut -c1-32)
+      printf '{"id":"%s","target":"%s"}\n' "$profile" "$3" >> "$FIXTURE/machine-rows"
       printf 'add %s %s\n' "$3" "$5" >> "$FIXTURE/events"
+      printf 'Saved SSH machine %s. Remote server is ready.\n' "$profile"
+    elif [ "$1 $2" = 'machine remove' ]; then
+      [ "$#" = 3 ] || exit 85
+      grep -v "\"id\":\"$3\"" "$FIXTURE/machine-rows" > "$FIXTURE/machine-rows.new" || :
+      mv "$FIXTURE/machine-rows.new" "$FIXTURE/machine-rows"
+      printf 'remove %s\n' "$3" >> "$FIXTURE/events"
     elif [ "$1 $2" = 'notification show' ]; then
       [ "$HERDR_SOCKET_PATH" = '/fixture/herdr.sock' ] || exit 84
       printf 'toast %s\n' "$5" >> "$FIXTURE/events"
@@ -62,7 +70,6 @@ esac
             "attached",
             r#"
 case "$*" in
-  'sessions list --json') cat "$FIXTURE/hosts.json";;
   'export-ssh-config')
     printf 'exporter-start\n' >> "$FIXTURE/events"
     trap 'printf "exporter-stop\n" >> "$FIXTURE/events"; exit 0' TERM INT HUP
@@ -99,17 +106,23 @@ printf 'hostname %s\nproxycommand /attached __ssh-local-proxy /fixture/socket\nb
     }
     fn hosts(&self, ids: &[u8]) {
         self.json(
-            "hosts.json",
-            json!(ids.iter().map(|id| {
+            "home/.ssh/attached/discovery.json",
+            json!({
+                "version":1,
+                "generation": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos().to_string(),
+                "checked_at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                "complete":true,
+                "hosts": ids.iter().map(|id| {
             let id = format!("{id:02x}").repeat(32);
             json!({"host":"office", "endpoint_id":id,"ssh_target":format!("attached-{id}")})
-        }).collect::<Vec<_>>()),
+        }).collect::<Vec<_>>() }),
         );
     }
     fn json(&self, name: &str, value: serde_json::Value) {
         let path = self.path(name);
         let temporary = path.with_extension("new");
         fs::write(&temporary, value.to_string()).unwrap();
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600)).unwrap();
         fs::rename(temporary, path).unwrap();
     }
     fn command(&self) -> Command {
@@ -226,6 +239,31 @@ fn worker_polls_new_publishers_without_interaction_and_survives_restart_without_
 }
 
 #[test]
+fn worker_prunes_after_three_new_snapshots_and_readds_a_returning_publisher() {
+    let fixture = Fixture::new();
+    let checks = |events: &str| events.lines().filter(|line| *line == "check").count();
+    let mut worker = fixture.start();
+    fixture.until(|events| events.contains("toast") && checks(events) >= 2);
+    fixture.hosts(&[]);
+    fixture.until(|events| checks(events) >= 4);
+    assert!(!fixture.events().contains("remove "));
+    fixture.hosts(&[]);
+    fixture.until(|events| checks(events) >= 6);
+    assert!(!fixture.events().contains("remove "));
+    fixture.hosts(&[]);
+    fixture.until(|events| events.contains(&format!("remove {}", "01".repeat(16))));
+    fixture.hosts(&[1]);
+    fixture.until(|events| {
+        events
+            .lines()
+            .filter(|line| line.starts_with("add "))
+            .count()
+            == 2
+    });
+    worker.stop();
+}
+
+#[test]
 fn disabling_and_uninstalling_stop_only_the_owned_exporter() {
     let fixture = Fixture::new();
     let mut worker = fixture.start();
@@ -323,9 +361,13 @@ esac
 }
 
 #[test]
-fn malformed_discovery_never_runs_machine_add_or_starts_an_exporter() {
+fn malformed_discovery_never_runs_machine_add_but_keeps_the_exporter() {
     let fixture = Fixture::new();
-    fs::write(fixture.path("hosts.json"), "not JSON").unwrap();
+    fs::write(
+        fixture.path("home/.ssh/attached/discovery.json"),
+        "not JSON",
+    )
+    .unwrap();
     let mut worker = fixture.start();
     let start = Instant::now();
     while !fs::read_to_string(fixture.path("state/discovery.log"))
@@ -335,7 +377,9 @@ fn malformed_discovery_never_runs_machine_add_or_starts_an_exporter() {
         assert!(start.elapsed() < Duration::from_secs(5));
         std::thread::sleep(Duration::from_millis(20));
     }
+    fixture.until(|events| events.contains("exporter-start"));
     worker.stop();
-    assert!(fixture.events().is_empty());
+    assert!(fixture.events().contains("exporter-start"));
+    assert!(!fixture.events().contains("add "));
     assert!(!Path::new(&fixture.path("state/discovery-state.json")).exists());
 }
