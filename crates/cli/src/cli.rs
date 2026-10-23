@@ -80,9 +80,7 @@ enum Command {
     /// Uses system OpenSSH and automatic, connection-scoped keys.
     /// Commands run as the publisher's OS account; SSH is enabled by default.
     /// For automatic OpenSSH aliases for all hosts, run `attached export-ssh-config`.
-    /// For concurrent relayed connections, use one broker: separate
-    /// Attached processes share the consumer Iroh identity and can displace one
-    /// another on relays.
+    /// Concurrent Attached commands share one automatically managed local network broker.
     Ssh {
         /// Publisher host label or stable endpoint ID.
         target: String,
@@ -110,8 +108,7 @@ enum Command {
     /// Point the application at 127.0.0.1:4096 and keep this process running.
     /// Both machines need a version of Attached that supports TCP forwarding.
     /// Only TCP and remote loopback destinations are supported, never other hosts.
-    /// Separate Attached processes share the consumer Iroh identity and can
-    /// displace one another on relays; avoid concurrent relayed SSH brokers.
+    /// Can run alongside `attached export-ssh-config` and other port forwarders.
     Forward {
         /// Publisher host label or stable endpoint ID.
         target: String,
@@ -144,6 +141,9 @@ enum Command {
         #[arg(long, hide = true)]
         state_dir: Option<PathBuf>,
     },
+
+    #[command(name = "__client-broker", hide = true)]
+    ClientBroker { runtime: PathBuf },
 
     #[command(name = "__ssh-local-proxy", hide = true)]
     SshLocalProxy { socket: PathBuf },
@@ -281,6 +281,10 @@ impl Cli {
             return crate::ssh::local_proxy(socket.clone()).await;
         }
 
+        if let Command::ClientBroker { runtime } = &self.command {
+            return crate::client_broker::run(runtime.clone()).await;
+        }
+
         let configuration =
             config::Config::load().context("could not load Attached configuration")?;
         local_encryption::configure_use_one_password(
@@ -337,7 +341,7 @@ impl Cli {
                 crate::ssh::export(&state_dir, std::time::Duration::from_secs(refresh_interval))
                     .await
             }
-            Command::SshLocalProxy { .. } => unreachable!(),
+            Command::SshLocalProxy { .. } | Command::ClientBroker { .. } => unreachable!(),
             Command::Account { command } => {
                 match command {
                     AccountCommand::Create { service, state_dir } => {

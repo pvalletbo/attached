@@ -46,3 +46,6 @@ tracing-flame.workspace = true
 tracing-subscriber.workspace = true
 zeroize.workspace = true
 russh = { version = "=0.63.3", default-features = false, features = ["ring"] }
+
+[dev-dependencies]
+iroh-relay = { version = "=1.0.3", default-features = false, features = ["server"] }

@@ -15,10 +15,9 @@ use attached_tunnel_protocol::{
     read_tcp_forward_status, write_tcp_forward_open, write_tcp_forward_request,
     write_tcp_forward_status,
 };
-use iroh::{Endpoint, endpoint::presets};
 use iroh_tickets::endpoint::EndpointTicket;
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::Mutex,
     task::JoinSet,
@@ -26,7 +25,12 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{proxy, publisher_descriptor::Descriptors, sync};
+use crate::{
+    client_transport::{ClientEndpoint, Connection},
+    proxy,
+    publisher_descriptor::Descriptors,
+    sync,
+};
 
 pub(crate) use attached_tunnel_protocol::TCP_FORWARD_ALPN as ALPN;
 const SETUP_TIMEOUT: Duration = Duration::from_secs(20);
@@ -34,7 +38,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_STREAMS: usize = 64;
 
 /// Close uncommitted setup connections even when their future is cancelled.
-struct SetupConnection(Option<iroh::endpoint::Connection>);
+struct SetupConnection(Option<Connection>);
 
 impl Drop for SetupConnection {
     fn drop(&mut self) {
@@ -153,18 +157,15 @@ async fn serve_stream(
 }
 
 struct Client {
-    endpoint: Endpoint,
+    endpoint: ClientEndpoint,
     descriptors: Descriptors,
     account: sync::state::AccountCredentials,
     port: u16,
-    connection: Mutex<Option<iroh::endpoint::Connection>>,
+    connection: Mutex<Option<Connection>>,
 }
 
 impl Client {
-    async fn open(
-        &self,
-        host: &sync::state_catalog::HostConnection,
-    ) -> Result<iroh::endpoint::Connection> {
+    async fn open(&self, host: &sync::state_catalog::HostConnection) -> Result<Connection> {
         ensure!(
             sync::utc_now_seconds() < host.expires_at,
             "publisher descriptor expired"
@@ -191,7 +192,7 @@ impl Client {
             );
             // Setup ends here; no application bytes are ever sent on this stream.
             ensure!(
-                receive.read_to_end(0).await?.is_empty(),
+                receive.read(&mut [0; 1]).await? == 0,
                 "trailing TCP setup response bytes"
             );
         }
@@ -201,7 +202,7 @@ impl Client {
 
     /// Single-flight connection setup. Reconnect only for new TCP connections;
     /// never replay application bytes or try to resurrect an interrupted stream.
-    async fn connection(&self) -> Result<iroh::endpoint::Connection> {
+    async fn connection(&self) -> Result<Connection> {
         let mut current = self.connection.lock().await;
         if let Some(connection) = &*current
             && connection.close_reason().is_none()
@@ -307,18 +308,7 @@ pub(crate) async fn forward(
                 .consumer_identity_secret()
                 .context("download bundle has no consumer identity")?,
         );
-        let ticket = EndpointTicket::from_str(&host.endpoint_ticket)?;
-        let mut builder = Endpoint::builder(presets::N0).secret_key(key);
-        let loopback_only = !ticket.endpoint_addr().addrs.is_empty()
-            && ticket.endpoint_addr().addrs.iter().all(|address| {
-                matches!(address, iroh::TransportAddr::Ip(socket) if socket.ip().is_loopback())
-            });
-        if loopback_only {
-            builder = builder
-                .relay_mode(iroh::RelayMode::Disabled)
-                .clear_address_lookup();
-        }
-        let endpoint = builder.bind().await?;
+        let endpoint = ClientEndpoint::new(key).await?;
         let client = Arc::new(Client {
             endpoint: endpoint.clone(),
             descriptors: Descriptors::new(host),

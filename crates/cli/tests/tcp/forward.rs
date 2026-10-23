@@ -17,7 +17,7 @@ async fn forwarding_help_and_bind_errors_do_not_require_credentials() {
     assert!(output.stdout.contains("--remote"));
     assert!(output.stdout.contains("127.0.0.1"));
     assert!(output.stdout.contains("never other hosts"));
-    assert!(output.stdout.contains("relays"));
+    assert!(output.stdout.contains("alongside"));
     let busy = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = busy.local_addr().unwrap().port().to_string();
     let output = fixture

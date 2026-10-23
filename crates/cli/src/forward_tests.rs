@@ -1,6 +1,9 @@
 use super::*;
 use attached_session_sync_protocol::account::RecordId;
-use iroh::{RelayMode, endpoint::BindOpts};
+use iroh::{
+    Endpoint, RelayMode,
+    endpoint::{BindOpts, presets},
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const DEADLINE: Duration = Duration::from_secs(15);
@@ -83,7 +86,7 @@ impl Harness {
 
     fn client(&self, port: u16) -> Arc<Client> {
         Arc::new(Client {
-            endpoint: self.consumer.clone(),
+            endpoint: ClientEndpoint::direct(self.consumer.clone()),
             descriptors: Descriptors::new(sync::state_catalog::HostConnection {
                 record_id: RecordId::from_bytes([1; 16]),
                 service_revision: 1,
@@ -109,7 +112,12 @@ impl Harness {
     }
 }
 
-async fn open_stream(client: &Client) -> (iroh::endpoint::SendStream, iroh::endpoint::RecvStream) {
+async fn open_stream(
+    client: &Client,
+) -> (
+    crate::client_transport::SendStream,
+    crate::client_transport::RecvStream,
+) {
     let connection = client.connection().await.unwrap();
     let (mut send, mut receive) = connection.open_bi().await.unwrap();
     write_tcp_forward_open(&mut send).await.unwrap();
@@ -275,7 +283,7 @@ async fn revocation_and_cancellation_terminate_idle_application_streams() {
             let result = timeout(Duration::from_secs(4), receive.read(&mut byte))
                 .await
                 .unwrap();
-            assert!(!matches!(result, Ok(Some(n)) if n != 0));
+            assert!(!matches!(result, Ok(n) if n != 0));
             harness.close().await;
         })
         .await

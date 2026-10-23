@@ -3,8 +3,8 @@ use attached_tunnel_protocol::{
     AttachedUpdateRequest, read_attached_update_request, write_attached_update_response,
 };
 use iroh::{
-    RelayMode,
-    endpoint::{BindError, BindOpts},
+    Endpoint, RelayMode,
+    endpoint::{BindError, BindOpts, presets},
 };
 use std::{future::Future, io::ErrorKind, net::Ipv4Addr};
 async fn within<F: Future>(future: F) -> F::Output {
@@ -160,9 +160,13 @@ async fn attached_update_client_reconnects_to_replacement_endpoint_entirely_offl
         });
 
         let client = attached_update_endpoint(client_identity, None).await;
-        let installed = request_attached_update_on_endpoint(&client, old_addr, &capability)
-            .await
-            .unwrap();
+        let installed = request_attached_update_on_endpoint(
+            &crate::client_transport::ClientEndpoint::direct(client.clone()),
+            old_addr,
+            &capability,
+        )
+        .await
+        .unwrap();
         assert_eq!(installed, candidate_version);
         client.close().await;
         old_server.await.unwrap();
