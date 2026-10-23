@@ -23,7 +23,7 @@ async fn offline(builder: iroh::endpoint::Builder) -> Endpoint {
 }
 
 #[tokio::test]
-async fn serving_admits_only_the_consumer_and_only_ssh_or_attached_update() {
+async fn serving_admits_only_the_consumer_for_ssh_tcp_and_attached_update() {
     timeout(Duration::from_secs(15), async {
         let consumer = ConsumerIdentitySecret::from_bytes([0x5a; 32]);
         let key = iroh::SecretKey::from_bytes(consumer.as_bytes());
@@ -32,7 +32,7 @@ async fn serving_admits_only_the_consumer_and_only_ssh_or_attached_update() {
             consumer.authorized_identity(),
         ))
         .await;
-        for alpn in [crate::ssh::ALPN, ATTACHED_UPDATE_ALPN] {
+        for alpn in [crate::ssh::ALPN, crate::forward::ALPN, ATTACHED_UPDATE_ALPN] {
             for authorized in [true, false] {
                 let peer_key = if authorized {
                     key.clone()
@@ -79,7 +79,7 @@ async fn serving_admits_only_the_consumer_and_only_ssh_or_attached_update() {
 }
 
 #[tokio::test]
-async fn production_dispatch_serves_ssh_and_host_update_without_application_state() {
+async fn production_dispatch_serves_ssh_tcp_and_host_update_without_application_state() {
     timeout(Duration::from_secs(15), async {
         let root = crate::test_support::canonical_tempdir();
         state::test_support::create_publisher(root.path(), "https://sync.example").unwrap();
@@ -111,6 +111,20 @@ async fn production_dispatch_serves_ssh_and_host_update_without_application_stat
             assert!(!response["username"].as_str().unwrap().is_empty());
             assert!(response["host_key"].as_str().unwrap().starts_with("ssh-ed25519 "));
             ssh.close(0u32.into(), b"test complete");
+            let service = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let forward = client.connect(publisher.addr(), crate::forward::ALPN).await.unwrap();
+            let (mut send, mut receive) = forward.open_bi().await.unwrap();
+            attached_tunnel_protocol::write_tcp_forward_request(&mut send, &capability, service.local_addr().unwrap().port()).await.unwrap();
+            assert_eq!(attached_tunnel_protocol::read_tcp_forward_status(&mut receive).await.unwrap(), attached_tunnel_protocol::TcpForwardStatus::Ready);
+            let (mut send, mut receive) = forward.open_bi().await.unwrap();
+            attached_tunnel_protocol::write_tcp_forward_open(&mut send).await.unwrap();
+            assert_eq!(attached_tunnel_protocol::read_tcp_forward_status(&mut receive).await.unwrap(), attached_tunnel_protocol::TcpForwardStatus::Ready);
+            let (mut remote, _) = service.accept().await.unwrap();
+            remote.write_all(b"tcp-dispatch").await.unwrap();
+            let mut data = [0; 12];
+            receive.read_exact(&mut data).await.unwrap();
+            assert_eq!(&data, b"tcp-dispatch");
+            forward.close(0u32.into(), b"test complete");
             let update = client.connect(publisher.addr(), ATTACHED_UPDATE_ALPN).await.unwrap();
             let (mut send, mut receive) = update.open_bi().await.unwrap();
             write_attached_update_confirm_request(&mut send, &capability, UpdateOperationId::from_bytes([6; 16]), attached_version::current()).await.unwrap();

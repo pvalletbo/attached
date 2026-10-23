@@ -7,7 +7,6 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use attached_session_sync_protocol::account::ApiKeyScope;
-use iroh::{Endpoint, endpoint::presets};
 use iroh_tickets::endpoint::EndpointTicket;
 use tokio::{
     net::{UnixListener, UnixStream},
@@ -15,11 +14,11 @@ use tokio::{
     task::JoinSet,
 };
 
-use super::{
-    ALPN, Request, Response, SETUP_TIMEOUT, descriptor::Descriptors, read_frame, state, write_frame,
-};
+use super::{ALPN, Request, Response, SETUP_TIMEOUT, read_frame, state, write_frame};
 use crate::{
+    client_transport::{ClientEndpoint as Endpoint, Connection, RecvStream, SendStream},
     proxy,
+    publisher_descriptor::Descriptors,
     secure_state::{self, StateDir},
     sync,
 };
@@ -81,12 +80,7 @@ async fn open(
     endpoint: &Endpoint,
     attachment: &sync::state_catalog::HostConnection,
     public_key: &str,
-) -> Result<(
-    iroh::endpoint::Connection,
-    iroh::endpoint::SendStream,
-    iroh::endpoint::RecvStream,
-    Response,
-)> {
+) -> Result<(Connection, SendStream, RecvStream, Response)> {
     ensure!(
         sync::utc_now_seconds() < attachment.expires_at,
         "SSH publisher descriptor expired during connection setup"
@@ -116,12 +110,7 @@ async fn open_current(
     descriptors: &Descriptors,
     account: &sync::state::AccountCredentials,
     public_key: &str,
-) -> Result<(
-    iroh::endpoint::Connection,
-    iroh::endpoint::SendStream,
-    iroh::endpoint::RecvStream,
-    Response,
-)> {
+) -> Result<(Connection, SendStream, RecvStream, Response)> {
     tokio::time::timeout(SETUP_TIMEOUT, async {
         let attachment = descriptors.get(account, None).await?;
         match open(endpoint, &attachment, public_key).await {
@@ -158,16 +147,7 @@ pub(crate) async fn connect(
             .consumer_identity_secret()
             .context("download bundle has no consumer identity")?,
     );
-    let ticket = EndpointTicket::from_str(&attachment.endpoint_ticket)?;
-    let mut builder = Endpoint::builder(presets::N0).secret_key(consumer);
-    if loopback_only(ticket.endpoint_addr()) {
-        // A strictly local descriptor needs no public relay registration or
-        // address lookup. Keep local operation (and disposable fixtures) offline.
-        builder = builder
-            .relay_mode(iroh::RelayMode::Disabled)
-            .clear_address_lookup();
-    }
-    let endpoint = builder.bind().await?;
+    let endpoint = Endpoint::new(consumer).await?;
     let result = run(
         &endpoint,
         path,
@@ -406,12 +386,6 @@ fn openssh_command(
     command
 }
 
-fn loopback_only(address: &iroh::EndpointAddr) -> bool {
-    !address.addrs.is_empty() && address.addrs.iter().all(|address| {
-        matches!(address, iroh::TransportAddr::Ip(socket) if socket.ip().is_loopback())
-    })
-}
-
 fn canonical_host_key(encoded: &str) -> Result<String> {
     let parsed = russh::keys::PublicKey::from_openssh(encoded)?;
     ensure!(
@@ -543,23 +517,6 @@ mod tests {
         );
         assert!(!effective.contains("unwanted-local-command"));
         assert!(effective.contains("__ssh-local-proxy"));
-    }
-
-    #[test]
-    fn only_strictly_loopback_descriptors_disable_public_relays() {
-        let id = iroh::SecretKey::generate().public();
-        let empty = iroh::EndpointAddr::new(id);
-        assert!(!loopback_only(&empty));
-        let local = empty
-            .clone()
-            .with_ip_addr("127.0.0.1:1234".parse::<std::net::SocketAddr>().unwrap());
-        assert!(loopback_only(&local));
-        let remote = local
-            .clone()
-            .with_ip_addr("192.0.2.1:1234".parse::<std::net::SocketAddr>().unwrap());
-        assert!(!loopback_only(&remote));
-        let relayed = local.with_relay_url("https://relay.example".parse().unwrap());
-        assert!(!loopback_only(&relayed));
     }
 
     #[test]

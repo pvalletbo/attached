@@ -1,4 +1,4 @@
-//! On-demand renewal of a broker's discovery lease, not of its SSH sessions.
+//! On-demand renewal of a publisher's discovery lease, never of application streams.
 use std::{future::Future, str::FromStr, time::Duration};
 
 use anyhow::{Context, Result, ensure};
@@ -13,7 +13,7 @@ use crate::sync::{self, state::AccountCredentials, state_catalog::HostConnection
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
 const REFRESH_RETRY_DELAY: Duration = Duration::from_secs(2);
 
-pub(super) struct Descriptors {
+pub(crate) struct Descriptors {
     state: Mutex<State>,
 }
 
@@ -23,7 +23,7 @@ struct State {
 }
 
 impl Descriptors {
-    pub(super) fn new(current: HostConnection) -> Self {
+    pub(crate) fn new(current: HostConnection) -> Self {
         Self {
             state: Mutex::new(State {
                 current,
@@ -36,7 +36,7 @@ impl Descriptors {
     /// loop behind an on-demand refresh. A busy refresh owns the newer decision;
     /// the exporter retries this observation on its next tick. Never roll back
     /// a lease already renewed independently by a connection.
-    pub(super) fn observe(&self, next: &HostConnection) {
+    pub(crate) fn observe(&self, next: &HostConnection) {
         if let Ok(mut state) = self.state.try_lock()
             && next.endpoint_identity == state.current.endpoint_identity
             && next.record_id == state.current.record_id
@@ -47,7 +47,7 @@ impl Descriptors {
         }
     }
 
-    pub(super) async fn get(
+    pub(crate) async fn get(
         &self,
         account: &AccountCredentials,
         failed: Option<&HostConnection>,
@@ -83,7 +83,7 @@ impl Descriptors {
         {
             ensure!(
                 live,
-                "SSH publisher descriptor expired and discovery refresh is temporarily unavailable; retry shortly"
+                "publisher descriptor expired and discovery refresh is temporarily unavailable; retry shortly"
             );
             return Ok(state.current.clone());
         }
@@ -92,25 +92,25 @@ impl Descriptors {
         let result = timeout(REFRESH_TIMEOUT, fetch(state.current.clone())).await;
         state.last_attempt = Some(Instant::now());
         let next = result
-            .context("SSH publisher discovery refresh timed out")?
-            .context("could not refresh SSH publisher; existing SSH streams are unaffected")?;
+            .context("publisher discovery refresh timed out")?
+            .context("could not refresh publisher; existing application streams are unaffected")?;
         ensure!(
             next.endpoint_identity == state.current.endpoint_identity
                 && next.record_id == state.current.record_id,
-            "SSH publisher identity changed during discovery refresh"
+            "publisher identity changed during discovery refresh"
         );
         ensure!(
             next.service_revision >= state.current.service_revision,
-            "SSH publisher record revision moved backwards"
+            "publisher record revision moved backwards"
         );
         ensure!(
             sync::utc_now_seconds() < next.expires_at,
-            "refreshed SSH publisher descriptor is already expired"
+            "refreshed publisher descriptor is already expired"
         );
         let ticket = EndpointTicket::from_str(&next.endpoint_ticket)?;
         ensure!(
             ticket.endpoint_addr().id.as_bytes() == &next.endpoint_identity,
-            "refreshed SSH publisher ticket identity mismatch"
+            "refreshed publisher ticket identity mismatch"
         );
         state.current = next;
         Ok(state.current.clone())

@@ -26,8 +26,8 @@ struct Publication {
 }
 type Publications = Arc<Mutex<Option<BTreeMap<RecordId, Publication>>>>;
 
-struct Discovery {
-    origin: String,
+pub(super) struct Discovery {
+    pub(super) origin: String,
     records: Publications,
     requests: Arc<AtomicUsize>,
     cancel: CancellationToken,
@@ -35,7 +35,7 @@ struct Discovery {
 }
 
 impl Discovery {
-    async fn new() -> Self {
+    pub(super) async fn new() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let records = Arc::new(Mutex::new(Some(BTreeMap::<RecordId, Publication>::new())));
@@ -109,7 +109,7 @@ impl Discovery {
         }
     }
 
-    async fn stop(self) {
+    pub(super) async fn stop(self) {
         self.cancel.cancel();
         timeout(DEADLINE, self.task).await.unwrap().unwrap();
     }
@@ -136,7 +136,7 @@ async fn reply(stream: &mut tokio::net::TcpStream, status: &str, body: &[u8], et
     }
 }
 
-struct Publisher {
+pub(super) struct Publisher {
     endpoint: Endpoint,
     record: RecordId,
     commands: Arc<AtomicUsize>,
@@ -144,8 +144,34 @@ struct Publisher {
     task: JoinHandle<()>,
 }
 
+async fn tcp_connection(connection: iroh::endpoint::Connection) {
+    use attached_tunnel_protocol::{
+        TcpForwardStatus, read_tcp_forward_open, read_tcp_forward_request, write_tcp_forward_status,
+    };
+    let (mut send, mut receive) = connection.accept_bi().await.unwrap();
+    let port = read_tcp_forward_request(&mut receive, &CapabilitySecret::from_bytes([46; 32]))
+        .await
+        .unwrap();
+    write_tcp_forward_status(&mut send, TcpForwardStatus::Ready)
+        .await
+        .unwrap();
+    send.shutdown().await.unwrap();
+    let mut tasks = JoinSet::new();
+    while let Ok((mut send, mut receive)) = connection.accept_bi().await {
+        tasks.spawn(async move {
+            read_tcp_forward_open(&mut receive).await?;
+            let mut remote = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await?;
+            write_tcp_forward_status(&mut send, TcpForwardStatus::Ready).await?;
+            tokio::io::copy_bidirectional(&mut tokio::io::join(receive, send), &mut remote).await?;
+            Ok::<_, anyhow::Error>(())
+        });
+    }
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+}
+
 impl Publisher {
-    async fn new(consumer: [u8; 32], seed: u8) -> Self {
+    pub(super) async fn new(consumer: [u8; 32], seed: u8) -> Self {
         let endpoint = Endpoint::builder(presets::N0)
             .clear_ip_transports()
             .bind_addr_with_opts(
@@ -155,7 +181,10 @@ impl Publisher {
             .unwrap()
             .relay_mode(RelayMode::Disabled)
             .clear_address_lookup()
-            .alpns(vec![SSH_ALPN.to_vec()])
+            .alpns(vec![
+                SSH_ALPN.to_vec(),
+                attached_tunnel_protocol::TCP_FORWARD_ALPN.to_vec(),
+            ])
             .bind()
             .await
             .unwrap();
@@ -180,6 +209,10 @@ impl Publisher {
                             tasks.spawn(async move {
                                 let connection = incoming.await.unwrap();
                                 assert_eq!(connection.remote_id(), iroh::SecretKey::from_bytes(&consumer).public());
+                                if connection.alpn() == attached_tunnel_protocol::TCP_FORWARD_ALPN {
+                                    tcp_connection(connection).await;
+                                    return;
+                                }
                                 let (mut send, mut receive) = connection.accept_bi().await.unwrap();
                                 let length = receive.read_u32().await.unwrap() as usize;
                                 assert!(length <= 8192);
@@ -240,7 +273,7 @@ impl Publisher {
         }
     }
 
-    async fn advertise(
+    pub(super) async fn advertise(
         &self,
         discovery: &Discovery,
         label: &str,
@@ -254,19 +287,23 @@ impl Publisher {
         );
     }
 
-    async fn stop(self) {
+    pub(super) async fn stop(self) {
         self.cancel.cancel();
         timeout(DEADLINE, self.task).await.unwrap().unwrap();
         self.endpoint.close().await;
     }
 }
 
-async fn wait_config(fixture: &CliFixture, check: impl Fn(&str) -> bool) -> String {
+pub(super) async fn wait_config(fixture: &CliFixture, check: impl Fn(&str) -> bool) -> String {
     timeout(DEADLINE, async {
         loop {
             let content =
                 fs::read_to_string(fixture.path("home/.ssh/attached/config")).unwrap_or_default();
-            if check(&content) {
+            // Installation publishes the fail-closed generated file BEFORE the
+            // user's Include. Seeing that fallback alone is not exporter readiness.
+            let include_installed = fs::read_to_string(fixture.path("home/.ssh/config"))
+                .is_ok_and(|config| config.starts_with("# BEGIN Attached"));
+            if include_installed && check(&content) {
                 return content;
             }
             tokio::time::sleep(Duration::from_millis(40)).await;
@@ -302,7 +339,7 @@ async fn wait_discovery(
     .expect("exporter discovery never converged")
 }
 
-fn start(fixture: &CliFixture) -> tokio::process::Child {
+pub(super) fn start(fixture: &CliFixture) -> tokio::process::Child {
     fixture
         .command(&[
             "--use-1password",
@@ -316,7 +353,7 @@ fn start(fixture: &CliFixture) -> tokio::process::Child {
         .unwrap()
 }
 
-async fn stop(broker: tokio::process::Child, signal: rustix::process::Signal) {
+pub(super) async fn stop(broker: tokio::process::Child, signal: rustix::process::Signal) {
     rustix::process::kill_process(
         rustix::process::Pid::from_raw(broker.id().unwrap() as i32).unwrap(),
         signal,
@@ -329,7 +366,7 @@ async fn stop(broker: tokio::process::Child, signal: rustix::process::Signal) {
     assert!(output.status.success(), "exporter failed: {output:?}");
 }
 
-async fn check_command(config: &Path, alias: &str) {
+pub(super) async fn check_command(config: &Path, alias: &str) {
     let output = timeout(DEADLINE, ssh(config, alias, "printf expected").output())
         .await
         .unwrap()
@@ -350,6 +387,30 @@ fn runtime_files(configuration: &str) -> Vec<PathBuf> {
         .filter_map(|line| line.trim().strip_prefix("IdentityFile "))
         .map(|path| PathBuf::from(path.trim_matches('"')))
         .collect()
+}
+
+#[tokio::test]
+async fn exporter_readiness_waits_for_the_user_include_not_just_the_generated_fallback() {
+    let fixture = CliFixture::new();
+    fs::create_dir_all(fixture.path("home/.ssh/attached")).unwrap();
+    let fallback = "Host attached-*\n    ProxyCommand false\n";
+    fs::write(fixture.path("home/.ssh/attached/config"), fallback).unwrap();
+    let config = fixture.path("home/.ssh/config");
+    fs::write(&config, "# personal config\n").unwrap();
+    let ready = wait_config(&fixture, |text| text.contains("Host attached-*\n"));
+    tokio::pin!(ready);
+    assert!(
+        timeout(Duration::from_millis(100), &mut ready)
+            .await
+            .is_err(),
+        "generated fallback was mistaken for a fully installed SSH Include"
+    );
+    fs::write(
+        &config,
+        "# BEGIN Attached managed SSH configuration\nInclude attached/config\n",
+    )
+    .unwrap();
+    assert_eq!(timeout(DEADLINE, ready).await.unwrap(), fallback);
 }
 
 #[tokio::test]

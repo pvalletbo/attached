@@ -1,19 +1,17 @@
+use crate::client_transport::ClientEndpoint as Endpoint;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use attached_tunnel_protocol::{
     ATTACHED_UPDATE_ALPN, AttachedUpdateResponse, AttachedVersion, CapabilitySecret,
     UpdateOperationId, read_attached_update_response, write_attached_update_confirm_request,
     write_attached_update_start_request,
 };
-use iroh::{Endpoint, endpoint::presets};
 use std::time::Duration;
 use tokio::time::{sleep, timeout, timeout_at};
 const ATTACHED_UPDATE_START_TIMEOUT: Duration = Duration::from_secs(150);
 const ATTACHED_UPDATE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ATTACHED_RECONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 async fn bind_client_endpoint(local_identity: &iroh::SecretKey) -> Result<Endpoint> {
-    Endpoint::builder(presets::N0)
-        .secret_key(local_identity.clone())
-        .bind()
+    Endpoint::new(local_identity.clone())
         .await
         .context("could not bind persistent local Iroh identity")
 }

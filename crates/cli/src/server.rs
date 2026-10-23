@@ -294,6 +294,7 @@ fn server_endpoint_builder(
         .alpns(vec![
             ATTACHED_UPDATE_ALPN.to_vec(),
             crate::ssh::ALPN.to_vec(),
+            crate::forward::ALPN.to_vec(),
         ])
         .hooks(ConsumerIdentityAuthorization::new(
             authorized_consumer_identity,
@@ -847,6 +848,9 @@ async fn serve_endpoint(
                             .context("authenticated connection capacity is exhausted")?;
                         if connection.alpn() == crate::ssh::ALPN {
                             return crate::ssh::serve(connection, update_resources.config.state_dir.clone(), capability, child_cancellation, update_resources.master_key.clone()).await;
+                        }
+                        if connection.alpn() == crate::forward::ALPN {
+                            return crate::forward::serve(connection, update_resources.config.state_dir.clone(), capability, child_cancellation).await;
                         }
                         if connection.alpn() == ATTACHED_UPDATE_ALPN {
                             return serve_attached_update_connection(

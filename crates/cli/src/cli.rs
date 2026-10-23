@@ -49,9 +49,9 @@ enum Command {
         command: AccountCommand,
     },
 
-    /// Publish this machine and serve authorized SSH tunnels.
+    /// Publish this machine and serve authorized SSH and loopback TCP tunnels.
     ///
-    /// SSH access is enabled by default for the publish bundle's consumer.
+    /// SSH and loopback TCP access are enabled for the publish bundle's consumer.
     /// Commands run as this OS account; stop serving to end access.
     Serve {
         /// Stable label shown for this host in synchronized catalogs.
@@ -80,9 +80,7 @@ enum Command {
     /// Uses system OpenSSH and automatic, connection-scoped keys.
     /// Commands run as the publisher's OS account; SSH is enabled by default.
     /// For automatic OpenSSH aliases for all hosts, run `attached export-ssh-config`.
-    /// For concurrent relayed connections, use one broker: separate
-    /// Attached processes share the consumer Iroh identity and can displace one
-    /// another on relays.
+    /// Concurrent Attached commands share one automatically managed local network broker.
     Ssh {
         /// Publisher host label or stable endpoint ID.
         target: String,
@@ -104,6 +102,29 @@ enum Command {
         command: Vec<String>,
     },
 
+    /// Forward a local loopback TCP port to a port on a publisher's loopback interface.
+    ///
+    /// Example: attached forward office --local 4096 --remote 4096
+    /// Point the application at 127.0.0.1:4096 and keep this process running.
+    /// Both machines need a version of Attached that supports TCP forwarding.
+    /// Only TCP and remote loopback destinations are supported, never other hosts.
+    /// Can run alongside `attached export-ssh-config` and other port forwarders.
+    Forward {
+        /// Publisher host label or stable endpoint ID.
+        target: String,
+        /// TCP port to listen on at 127.0.0.1 (never a public interface).
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+        local: u16,
+        /// TCP port on the publisher's loopback interface (IPv4, then IPv6).
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+        remote: u16,
+        /// Refresh publisher discovery before connecting.
+        #[arg(long)]
+        no_cache: bool,
+        #[arg(long, hide = true)]
+        state_dir: Option<PathBuf>,
+    },
+
     /// Automatically configure OpenSSH for every authorized host; keep running until Ctrl-C.
     ///
     /// Run once in a terminal, then use `ssh attached-HOST [command]` without symlinks
@@ -120,6 +141,9 @@ enum Command {
         #[arg(long, hide = true)]
         state_dir: Option<PathBuf>,
     },
+
+    #[command(name = "__client-broker", hide = true)]
+    ClientBroker { runtime: PathBuf },
 
     #[command(name = "__ssh-local-proxy", hide = true)]
     SshLocalProxy { socket: PathBuf },
@@ -257,6 +281,10 @@ impl Cli {
             return crate::ssh::local_proxy(socket.clone()).await;
         }
 
+        if let Command::ClientBroker { runtime } = &self.command {
+            return crate::client_broker::run(runtime.clone()).await;
+        }
+
         let configuration =
             config::Config::load().context("could not load Attached configuration")?;
         local_encryption::configure_use_one_password(
@@ -287,6 +315,20 @@ impl Cli {
                 )
                 .await
             }
+            Command::Forward {
+                target,
+                local,
+                remote,
+                no_cache,
+                state_dir,
+            } => {
+                use std::io::IsTerminal;
+                local_encryption::configure_noninteractive(
+                    !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal(),
+                );
+                let state_dir = resolved_state_dir(state_dir, &configuration)?;
+                crate::forward::forward(&state_dir, &target, local, remote, no_cache).await
+            }
             Command::ExportSshConfig {
                 refresh_interval,
                 state_dir,
@@ -299,7 +341,7 @@ impl Cli {
                 crate::ssh::export(&state_dir, std::time::Duration::from_secs(refresh_interval))
                     .await
             }
-            Command::SshLocalProxy { .. } => unreachable!(),
+            Command::SshLocalProxy { .. } | Command::ClientBroker { .. } => unreachable!(),
             Command::Account { command } => {
                 match command {
                     AccountCommand::Create { service, state_dir } => {
@@ -494,6 +536,46 @@ mod tests {
             assert!(Cli::try_parse_from(["attached", "ssh-access", action]).is_err());
         }
         assert!(Cli::try_parse_from(["attached", "ssh-access"]).is_err());
+    }
+
+    #[test]
+    fn tcp_forwarding_requires_single_ports_and_never_accepts_addresses() {
+        let base = [
+            "attached", "forward", "office", "--local", "4096", "--remote", "8080",
+        ];
+        let cli = Cli::try_parse_from(base).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Forward {
+                local: 4096,
+                remote: 8080,
+                no_cache: false,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from(base.into_iter().chain(["--no-cache"])).is_ok());
+        for option in ["--local", "--remote"] {
+            for port in ["0", "65536", "-1", "nope", "127.0.0.1:80", "80:90"] {
+                let mut args = base.to_vec();
+                let position = args.iter().position(|arg| *arg == option).unwrap() + 1;
+                args[position] = port;
+                assert!(
+                    Cli::try_parse_from(args).is_err(),
+                    "accepted {option} {port}"
+                );
+            }
+        }
+        for extra in ["--bind", "--remote-host", "--socks", "--udp"] {
+            assert!(Cli::try_parse_from(base.into_iter().chain([extra, "0.0.0.0"])).is_err());
+        }
+        for args in [
+            vec!["attached", "forward", "office"],
+            vec!["attached", "forward", "office", "--local", "4096"],
+            vec!["attached", "forward", "office", "--remote", "4096"],
+            vec!["attached", "forward", "--local", "4096", "--remote", "4096"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
     }
 
     #[test]

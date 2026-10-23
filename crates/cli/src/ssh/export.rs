@@ -1,4 +1,4 @@
-//! One foreground, unlocked consumer endpoint for every discovered SSH publisher.
+//! Foreground SSH configuration/discovery, using the shared local network broker.
 use std::{
     collections::{BTreeMap, HashSet},
     path::Path,
@@ -6,9 +6,9 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use crate::client_transport::ClientEndpoint as Endpoint;
 use anyhow::{Context, Result};
 use attached_session_sync_protocol::account::ApiKeyScope;
-use iroh::{Endpoint, endpoint::presets};
 use tokio::{sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
@@ -84,15 +84,18 @@ pub(crate) async fn export(path: &Path, refresh_interval: Duration) -> Result<i3
     );
     let cancellation = CancellationToken::new();
     let _cancel = cancellation.clone().drop_guard();
+    // A lease, not endpoint ownership: TCP forwarders can join before or after
+    // this exporter and survive its shutdown or per-exporter resume cleanup.
+    let shutdown = async {
+        tokio::select! { _ = interrupt.recv() => {}, _ = terminate.recv() => {}, _ = hangup.recv() => {} }
+    };
+    tokio::pin!(shutdown);
+    let endpoint = tokio::select! {
+        endpoint = Endpoint::new(consumer) => endpoint?,
+        _ = &mut shutdown => return Ok(0),
+    };
     let run = async {
         loop {
-            // Never one endpoint per host: relays would displace the same
-            // consumer identity. Fully close the old endpoint before rebinding.
-            // Keep relay support even when the catalog is empty or local-only.
-            let endpoint = Endpoint::builder(presets::N0)
-                .secret_key(consumer.clone())
-                .bind()
-                .await?;
             let result = run(
                 &endpoint,
                 path,
@@ -103,19 +106,9 @@ pub(crate) async fn export(path: &Path, refresh_interval: Duration) -> Result<i3
             )
             .await;
             // All brokers and keys are gone. Do not leave stale proxy paths
-            // published while the next endpoint is binding/discovering hosts.
+            // published while this exporter rebuilds its per-host brokers.
             let discovery = managed.publish_discovery(&[], false);
             let unpublished = managed.publish("").and(discovery);
-            // QUIC draining can otherwise outlive shutdown/resume when a peer
-            // is unreachable. Drop the last endpoint handle even if draining
-            // times out, so the old relay registration cannot outlive this loop.
-            if tokio::time::timeout(Duration::from_secs(3), endpoint.close())
-                .await
-                .is_err()
-            {
-                tracing::debug!("SSH exporter stopped waiting for QUIC close acknowledgements");
-            }
-            drop(endpoint);
             unpublished?;
             if result? == RunExit::Shutdown || cancellation.is_cancelled() {
                 return Ok::<_, anyhow::Error>(());
@@ -132,11 +125,12 @@ pub(crate) async fn export(path: &Path, refresh_interval: Duration) -> Result<i3
     );
     let result = tokio::select! {
         result = &mut run => result,
-        _ = async { tokio::select! { _ = interrupt.recv() => {}, _ = terminate.recv() => {}, _ = hangup.recv() => {} } } => {
+        _ = &mut shutdown => {
             cancellation.cancel();
             run.await
         }
     };
+    endpoint.close().await;
     result?;
     Ok(0)
 }

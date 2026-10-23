@@ -4,11 +4,15 @@
 mod discovery;
 #[path = "encryption/environment.rs"]
 mod encryption_environment;
+#[path = "tcp/shared_client.rs"]
+mod shared_client;
 #[path = "ssh/export.rs"]
 mod ssh_export;
 #[path = "ssh/renewal.rs"]
 mod ssh_renewal;
 mod support;
+#[path = "tcp/forward.rs"]
+mod tcp_forward;
 
 use std::{fs, net::Ipv4Addr, time::Duration};
 

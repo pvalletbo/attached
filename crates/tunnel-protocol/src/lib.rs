@@ -1,3 +1,6 @@
+mod tcp_forward;
+pub use tcp_forward::*;
+
 use std::fmt;
 
 use anyhow::{Context, Result, bail, ensure};
