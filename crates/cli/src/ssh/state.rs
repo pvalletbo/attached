@@ -4,7 +4,6 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use attached_session_sync_protocol::account::ApiKeyScope;
 use russh::keys::{PrivateKey, ssh_key::private::Ed25519Keypair};
 use zeroize::Zeroizing;
 
@@ -26,15 +25,7 @@ pub(super) struct Policy {
 }
 
 pub(super) fn authorize(path: &Path, consumer: &[u8; 32]) -> Result<()> {
-    let account = sync::state::load_account(path, ApiKeyScope::Publish)?;
-    let authorized = account
-        .authorized_consumer_identity()
-        .context("publish bundle has no consumer identity")?;
-    ensure!(
-        authorized.as_bytes() == consumer,
-        "SSH access belongs to another consumer"
-    );
-    Ok(())
+    sync::state::authorize_consumer(path, consumer)
 }
 
 pub(super) fn policy(path: &Path, consumer: &[u8; 32]) -> Result<Policy> {
@@ -125,6 +116,7 @@ pub(super) fn pin_host(
 mod tests {
     use super::*;
     use crate::secure_state::StateDir;
+    use attached_session_sync_protocol::account::ApiKeyScope;
     use std::os::unix::fs::PermissionsExt;
 
     #[test]

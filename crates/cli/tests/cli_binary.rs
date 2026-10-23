@@ -9,6 +9,8 @@ mod ssh_export;
 #[path = "ssh/renewal.rs"]
 mod ssh_renewal;
 mod support;
+#[path = "tcp/forward.rs"]
+mod tcp_forward;
 
 use std::{fs, net::Ipv4Addr, time::Duration};
 

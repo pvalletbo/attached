@@ -233,6 +233,20 @@ fn install_account(state_dir: &Path, encoded: &[u8], allow_idempotent: bool) -> 
     })
 }
 
+/// Re-read publisher credentials so account removal or replacement also ends
+/// already-established services, not just new Iroh handshakes.
+pub(crate) fn authorize_consumer(path: &Path, consumer: &[u8; 32]) -> Result<()> {
+    let account = load_account(path, ApiKeyScope::Publish)?;
+    let authorized = account
+        .authorized_consumer_identity()
+        .context("publish bundle has no consumer identity")?;
+    ensure!(
+        authorized.as_bytes() == consumer,
+        "access belongs to another consumer"
+    );
+    Ok(())
+}
+
 #[tracing::instrument(name = "load_sync_account", level = "debug", skip_all)]
 pub fn load_account(state_dir: &Path, required_scope: ApiKeyScope) -> Result<AccountCredentials> {
     load_account_optional(state_dir, required_scope)?

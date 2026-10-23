@@ -49,9 +49,9 @@ enum Command {
         command: AccountCommand,
     },
 
-    /// Publish this machine and serve authorized SSH tunnels.
+    /// Publish this machine and serve authorized SSH and loopback TCP tunnels.
     ///
-    /// SSH access is enabled by default for the publish bundle's consumer.
+    /// SSH and loopback TCP access are enabled for the publish bundle's consumer.
     /// Commands run as this OS account; stop serving to end access.
     Serve {
         /// Stable label shown for this host in synchronized catalogs.
@@ -102,6 +102,30 @@ enum Command {
         /// Command interpreted by the publisher's account shell; omit for a non-PTY shell.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
+    },
+
+    /// Forward a local loopback TCP port to a port on a publisher's loopback interface.
+    ///
+    /// Example: attached forward office --local 4096 --remote 4096
+    /// Point the application at 127.0.0.1:4096 and keep this process running.
+    /// Both machines need a version of Attached that supports TCP forwarding.
+    /// Only TCP and remote loopback destinations are supported, never other hosts.
+    /// Separate Attached processes share the consumer Iroh identity and can
+    /// displace one another on relays; avoid concurrent relayed SSH brokers.
+    Forward {
+        /// Publisher host label or stable endpoint ID.
+        target: String,
+        /// TCP port to listen on at 127.0.0.1 (never a public interface).
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+        local: u16,
+        /// TCP port on the publisher's loopback interface (IPv4, then IPv6).
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+        remote: u16,
+        /// Refresh publisher discovery before connecting.
+        #[arg(long)]
+        no_cache: bool,
+        #[arg(long, hide = true)]
+        state_dir: Option<PathBuf>,
     },
 
     /// Automatically configure OpenSSH for every authorized host; keep running until Ctrl-C.
@@ -286,6 +310,20 @@ impl Cli {
                     trust_new_host_key,
                 )
                 .await
+            }
+            Command::Forward {
+                target,
+                local,
+                remote,
+                no_cache,
+                state_dir,
+            } => {
+                use std::io::IsTerminal;
+                local_encryption::configure_noninteractive(
+                    !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal(),
+                );
+                let state_dir = resolved_state_dir(state_dir, &configuration)?;
+                crate::forward::forward(&state_dir, &target, local, remote, no_cache).await
             }
             Command::ExportSshConfig {
                 refresh_interval,
@@ -494,6 +532,46 @@ mod tests {
             assert!(Cli::try_parse_from(["attached", "ssh-access", action]).is_err());
         }
         assert!(Cli::try_parse_from(["attached", "ssh-access"]).is_err());
+    }
+
+    #[test]
+    fn tcp_forwarding_requires_single_ports_and_never_accepts_addresses() {
+        let base = [
+            "attached", "forward", "office", "--local", "4096", "--remote", "8080",
+        ];
+        let cli = Cli::try_parse_from(base).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Forward {
+                local: 4096,
+                remote: 8080,
+                no_cache: false,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from(base.into_iter().chain(["--no-cache"])).is_ok());
+        for option in ["--local", "--remote"] {
+            for port in ["0", "65536", "-1", "nope", "127.0.0.1:80", "80:90"] {
+                let mut args = base.to_vec();
+                let position = args.iter().position(|arg| *arg == option).unwrap() + 1;
+                args[position] = port;
+                assert!(
+                    Cli::try_parse_from(args).is_err(),
+                    "accepted {option} {port}"
+                );
+            }
+        }
+        for extra in ["--bind", "--remote-host", "--socks", "--udp"] {
+            assert!(Cli::try_parse_from(base.into_iter().chain([extra, "0.0.0.0"])).is_err());
+        }
+        for args in [
+            vec!["attached", "forward", "office"],
+            vec!["attached", "forward", "office", "--local", "4096"],
+            vec!["attached", "forward", "office", "--remote", "4096"],
+            vec!["attached", "forward", "--local", "4096", "--remote", "4096"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
     }
 
     #[test]

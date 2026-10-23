@@ -106,6 +106,14 @@ pub struct RunningCli {
 }
 
 impl RunningCli {
+    pub fn stderr(&self) -> String {
+        fs::read_to_string(self.stderr.path()).unwrap()
+    }
+
+    pub fn signal(&self, signal: rustix::process::Signal) {
+        rustix::process::kill_process_group(self.pid, signal).unwrap();
+    }
+
     pub async fn wait(mut self) -> CliOutput {
         let result = tokio::time::timeout(DEADLINE, self.child.wait()).await;
         let stdout = fs::read_to_string(self.stdout.path()).unwrap();

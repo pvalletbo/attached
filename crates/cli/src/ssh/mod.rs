@@ -3,7 +3,6 @@
 mod account;
 mod client;
 mod configuration;
-mod descriptor;
 mod exec;
 mod export;
 mod state;

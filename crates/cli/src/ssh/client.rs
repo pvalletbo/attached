@@ -15,11 +15,10 @@ use tokio::{
     task::JoinSet,
 };
 
-use super::{
-    ALPN, Request, Response, SETUP_TIMEOUT, descriptor::Descriptors, read_frame, state, write_frame,
-};
+use super::{ALPN, Request, Response, SETUP_TIMEOUT, read_frame, state, write_frame};
 use crate::{
     proxy,
+    publisher_descriptor::Descriptors,
     secure_state::{self, StateDir},
     sync,
 };
