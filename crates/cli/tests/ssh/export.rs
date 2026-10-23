@@ -299,7 +299,11 @@ pub(super) async fn wait_config(fixture: &CliFixture, check: impl Fn(&str) -> bo
         loop {
             let content =
                 fs::read_to_string(fixture.path("home/.ssh/attached/config")).unwrap_or_default();
-            if check(&content) {
+            // Installation publishes the fail-closed generated file BEFORE the
+            // user's Include. Seeing that fallback alone is not exporter readiness.
+            let include_installed = fs::read_to_string(fixture.path("home/.ssh/config"))
+                .is_ok_and(|config| config.starts_with("# BEGIN Attached"));
+            if include_installed && check(&content) {
                 return content;
             }
             tokio::time::sleep(Duration::from_millis(40)).await;
@@ -383,6 +387,30 @@ fn runtime_files(configuration: &str) -> Vec<PathBuf> {
         .filter_map(|line| line.trim().strip_prefix("IdentityFile "))
         .map(|path| PathBuf::from(path.trim_matches('"')))
         .collect()
+}
+
+#[tokio::test]
+async fn exporter_readiness_waits_for_the_user_include_not_just_the_generated_fallback() {
+    let fixture = CliFixture::new();
+    fs::create_dir_all(fixture.path("home/.ssh/attached")).unwrap();
+    let fallback = "Host attached-*\n    ProxyCommand false\n";
+    fs::write(fixture.path("home/.ssh/attached/config"), fallback).unwrap();
+    let config = fixture.path("home/.ssh/config");
+    fs::write(&config, "# personal config\n").unwrap();
+    let ready = wait_config(&fixture, |text| text.contains("Host attached-*\n"));
+    tokio::pin!(ready);
+    assert!(
+        timeout(Duration::from_millis(100), &mut ready)
+            .await
+            .is_err(),
+        "generated fallback was mistaken for a fully installed SSH Include"
+    );
+    fs::write(
+        &config,
+        "# BEGIN Attached managed SSH configuration\nInclude attached/config\n",
+    )
+    .unwrap();
+    assert_eq!(timeout(DEADLINE, ready).await.unwrap(), fallback);
 }
 
 #[tokio::test]
