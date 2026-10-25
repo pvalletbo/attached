@@ -66,6 +66,47 @@ impl Broker {
             "incompatible local broker protocol; restart Attached client commands"
         );
         match request.operation {
+            Operation::Status { identity } => {
+                ensure!(identity == self.identity, "local broker identity mismatch");
+                let leases: Vec<_> = self.leases.lock().await.values().cloned().collect();
+                let mut connections = 0;
+                for lease in &leases {
+                    connections += lease.connections.lock().await.len();
+                }
+                ipc::write(
+                    stream,
+                    &Response::Status {
+                        identity,
+                        pid: std::process::id(),
+                        leases: leases.len(),
+                        connections,
+                    },
+                )
+                .await?;
+                Ok(())
+            }
+            Operation::Inspect { lease, connection } => {
+                let lease = self.lease(&lease).await?;
+                let connection = lease
+                    .connections
+                    .lock()
+                    .await
+                    .get(&connection)
+                    .cloned()
+                    .context("client connection ended")?;
+                ensure!(
+                    connection.close_reason().is_none(),
+                    "publisher connection ended"
+                );
+                ipc::write(
+                    stream,
+                    &Response::Inspected {
+                        info: ipc::ConnectionInfo::measure(&connection),
+                    },
+                )
+                .await?;
+                Ok(())
+            }
             Operation::Lease { identity } => {
                 ensure!(identity == self.identity, "local broker identity mismatch");
                 let token = ipc::token()?;

@@ -11,6 +11,7 @@ mod client_ipc;
 mod client_transport;
 mod config;
 mod diagnostics;
+mod doctor;
 mod download_account;
 mod endpoint_registry;
 mod forward;

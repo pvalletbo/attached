@@ -182,6 +182,41 @@ async fn shared_broker_uses_one_real_relay_registration_and_isolates_client_leas
             .is_err()
         );
         drop(wrong_scope);
+        let (_, status) = rpc(&path, Operation::Status { identity }).await;
+        assert!(matches!(
+            status,
+            Response::Status {
+                leases: 2,
+                connections: 2,
+                ..
+            }
+        ));
+        let (_, info) = rpc(
+            &path,
+            Operation::Inspect {
+                lease: ssh_lease,
+                connection: ssh,
+            },
+        )
+        .await;
+        let Response::Inspected { info } = info else {
+            panic!("expected path measurements");
+        };
+        assert_eq!(info.path, ipc::ConnectionPath::Relay);
+        assert!(info.rtt_ms.is_some());
+        let mut wrong_scope = UnixStream::connect(&path).await.unwrap();
+        assert!(
+            ipc::request(
+                &mut wrong_scope,
+                Operation::Inspect {
+                    lease: tcp_lease,
+                    connection: ssh,
+                }
+            )
+            .await
+            .is_err()
+        );
+        drop(wrong_scope);
         let mut ssh_stream = open(&path, ssh_lease, ssh).await;
         let mut tcp_stream = open(&path, tcp_lease, tcp).await;
         let bytes: Vec<u8> = (0..262_144).map(|n| n as u8).collect();
@@ -244,6 +279,19 @@ async fn broker_rejects_wrong_identity_version_and_unknown_sessions_without_dial
                 .clear_address_lookup()
         }));
         for request in [
+            Request {
+                version: ipc::VERSION,
+                operation: Operation::Status {
+                    identity: SecretKey::generate().public(),
+                },
+            },
+            Request {
+                version: ipc::VERSION,
+                operation: Operation::Inspect {
+                    lease: [0; 16],
+                    connection: [0; 16],
+                },
+            },
             Request {
                 version: ipc::VERSION + 1,
                 operation: Operation::Lease { identity },

@@ -35,6 +35,13 @@ pub(super) enum Operation {
         lease: Token,
         connection: Token,
     },
+    Status {
+        identity: EndpointId,
+    },
+    Inspect {
+        lease: Token,
+        connection: Token,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -49,9 +56,49 @@ pub(super) enum Response {
         connection: Token,
     },
     Open,
+    Status {
+        identity: EndpointId,
+        pid: u32,
+        leases: usize,
+        connections: usize,
+    },
+    Inspected {
+        info: ConnectionInfo,
+    },
     Error {
         message: String,
     },
+}
+
+/// Public transport measurements only: never addresses, keys, or IPC tokens.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConnectionInfo {
+    pub path: ConnectionPath,
+    pub rtt_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ConnectionPath {
+    Direct,
+    Relay,
+    Unknown,
+}
+
+impl ConnectionInfo {
+    pub(crate) fn measure(connection: &iroh::endpoint::Connection) -> Self {
+        let paths = connection.paths();
+        let selected = paths.iter().find(|path| path.is_selected());
+        Self {
+            path: match &selected {
+                Some(path) if path.is_ip() => ConnectionPath::Direct,
+                Some(path) if path.is_relay() => ConnectionPath::Relay,
+                _ => ConnectionPath::Unknown,
+            },
+            rtt_ms: selected.map(|path| path.rtt().as_millis().min(u64::MAX as u128) as u64),
+        }
+    }
 }
 
 pub(super) fn runtime(identity: EndpointId) -> Result<PathBuf> {

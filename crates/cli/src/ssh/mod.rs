@@ -5,6 +5,7 @@ mod client;
 mod configuration;
 mod exec;
 mod export;
+mod probe;
 mod state;
 
 use anyhow::{Context, Result, ensure};
@@ -21,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 pub(crate) use attached_tunnel_protocol::SSH_ALPN as ALPN;
 pub(crate) use client::{connect, local_proxy};
 pub(crate) use export::export;
+pub(crate) use probe::{ProbeFailure, probe};
 const SETUP_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Serving a publish bundle enables SSH for its consumer as the effective OS account.

@@ -43,6 +43,30 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Diagnose client configuration, credentials, discovery, broker, and live SSH access.
+    ///
+    /// Never prompts for a password, executes remote commands, or changes SSH trust.
+    /// Unlock credentials via ATTACHED_ENCRYPTION_PASSWORD or 1Password.
+    /// Exit code 1 means a failed check or live probe; warnings alone return 0.
+    Doctor(crate::doctor::Options),
+
+    /// Actively probe advertised SSH publishers, not just their last publication time.
+    ///
+    /// Uses the shared client broker. No remote commands are executed or host pins changed.
+    /// Noninteractive: unlock credentials via ATTACHED_ENCRYPTION_PASSWORD or 1Password.
+    /// JSON watch output is newline-delimited snapshots; Ctrl-C/SIGTERM ends cleanly.
+    Status {
+        #[command(flatten)]
+        options: crate::doctor::Options,
+        /// Keep refreshing discovery and probing until interrupted.
+        #[arg(long)]
+        watch: bool,
+        /// Seconds to wait after each snapshot (watch mode only).
+        #[arg(long, default_value_t = 5, requires = "watch",
+            value_parser = clap::value_parser!(u64).range(1..=3600))]
+        interval: u64,
+    },
+
     /// Create, export, or import synchronization credentials.
     Account {
         #[command(subcommand)]
@@ -285,6 +309,21 @@ impl Cli {
             return crate::client_broker::run(runtime.clone()).await;
         }
 
+        match &self.command {
+            Command::Doctor(options) => {
+                return crate::doctor::run(options, self.use_1password, true, false, 5).await;
+            }
+            Command::Status {
+                options,
+                watch,
+                interval,
+            } => {
+                return crate::doctor::run(options, self.use_1password, false, *watch, *interval)
+                    .await;
+            }
+            _ => {}
+        }
+
         let configuration =
             config::Config::load().context("could not load Attached configuration")?;
         local_encryption::configure_use_one_password(
@@ -292,6 +331,7 @@ impl Cli {
             configuration.one_password_item_tag(),
         )?;
         match self.command {
+            Command::Doctor(_) | Command::Status { .. } => unreachable!(),
             Command::Ssh {
                 target,
                 command,
@@ -575,6 +615,29 @@ mod tests {
             vec!["attached", "forward", "--local", "4096", "--remote", "4096"],
         ] {
             assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
+    fn health_commands_have_bounded_deadlines_and_watch_intervals() {
+        for command in ["doctor", "status"] {
+            assert!(Cli::try_parse_from(["attached", command]).is_ok());
+            assert!(
+                Cli::try_parse_from(["attached", command, "office", "--json", "--timeout", "1"])
+                    .is_ok()
+            );
+            for value in ["0", "121", "-1", "nan"] {
+                assert!(Cli::try_parse_from(["attached", command, "--timeout", value]).is_err());
+            }
+        }
+        assert!(Cli::try_parse_from(["attached", "status", "--watch", "--interval", "1"]).is_ok());
+        assert!(Cli::try_parse_from(["attached", "status", "--interval", "1"]).is_err());
+        assert!(Cli::try_parse_from(["attached", "doctor", "--watch"]).is_err());
+        for value in ["0", "3601", "-1", "nan"] {
+            assert!(
+                Cli::try_parse_from(["attached", "status", "--watch", "--interval", value])
+                    .is_err()
+            );
         }
     }
 
