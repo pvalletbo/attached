@@ -386,7 +386,7 @@ fn openssh_command(
     command
 }
 
-fn canonical_host_key(encoded: &str) -> Result<String> {
+pub(super) fn canonical_host_key(encoded: &str) -> Result<String> {
     let parsed = russh::keys::PublicKey::from_openssh(encoded)?;
     ensure!(
         parsed.algorithm() == russh::keys::Algorithm::Ed25519,

@@ -82,6 +82,24 @@ pub(super) fn host_key(path: &Path, master: &[u8; 32]) -> Result<PrivateKey> {
     )
 }
 
+/// Diagnostics check existing trust without creating or rotating a pin.
+pub(super) fn check_host_pin(
+    path: &Path,
+    peer: &iroh::EndpointId,
+    username: &str,
+    host_key: &str,
+) -> Result<bool> {
+    secure_state::with_locked_existing(path, "ssh-pins.lock", |dir| {
+        if let Some(bytes) = dir.read_secret_optional_bounded("ssh-pins.json", 1024 * 1024)? {
+            let pins: BTreeMap<String, (String, String)> = serde_json::from_slice(&bytes)?;
+            if let Some(previous) = pins.get(&peer.to_string()) {
+                return Ok(previous == &(username.to_owned(), host_key.to_owned()));
+            }
+        }
+        Ok(true)
+    })
+}
+
 pub(super) fn pin_host(
     path: &Path,
     peer: &iroh::EndpointId,
@@ -165,6 +183,24 @@ mod tests {
         pin_host(root.path(), &second, "account", "key-two", false).unwrap();
         pin_host(root.path(), &first, "account", "key-two", true).unwrap();
         pin_host(root.path(), &first, "account", "key-two", false).unwrap();
+    }
+
+    #[test]
+    fn diagnostic_pin_checks_never_create_or_rotate_host_trust() {
+        let root = crate::test_support::canonical_tempdir();
+        secure_state::prepare_private_dir(root.path()).unwrap();
+        let peer = iroh::SecretKey::generate().public();
+        assert!(check_host_pin(root.path(), &peer, "account", "key-one").unwrap());
+        assert!(!root.path().join("ssh-pins.json").exists());
+        pin_host(root.path(), &peer, "account", "key-one", false).unwrap();
+        let before = std::fs::read(root.path().join("ssh-pins.json")).unwrap();
+        assert!(check_host_pin(root.path(), &peer, "account", "key-one").unwrap());
+        assert!(!check_host_pin(root.path(), &peer, "account", "key-two").unwrap());
+        assert!(!check_host_pin(root.path(), &peer, "other", "key-one").unwrap());
+        assert_eq!(
+            std::fs::read(root.path().join("ssh-pins.json")).unwrap(),
+            before
+        );
     }
 
     #[test]

@@ -132,6 +132,33 @@ impl ClientEndpoint {
         .context("local broker connection setup timed out")?
     }
 
+    pub(crate) async fn status(&self) -> Result<(u32, usize, usize)> {
+        let lease = self.lease().await?;
+        timeout(RPC_TIMEOUT, async {
+            let mut stream =
+                UnixStream::connect(ipc::socket(&ipc::runtime(lease.identity)?)).await?;
+            let Response::Status {
+                identity,
+                pid,
+                leases,
+                connections,
+            } = ipc::request(
+                &mut stream,
+                Operation::Status {
+                    identity: lease.identity,
+                },
+            )
+            .await?
+            else {
+                bail!("incompatible local broker; restart Attached client commands");
+            };
+            ensure!(identity == lease.identity, "local broker identity mismatch");
+            Ok((pid, leases, connections))
+        })
+        .await
+        .context("local broker status timed out")?
+    }
+
     /// Releases this command's lease only. Other commands' tunnels and the shared
     /// endpoint remain alive; the broker exits automatically after the last lease.
     pub(crate) async fn close(&self) {
@@ -196,6 +223,31 @@ impl Connection {
             }
             #[cfg(test)]
             ConnectionKind::Direct(connection) => connection.close(code, reason),
+        }
+    }
+
+    pub(crate) async fn info(&self) -> Result<ipc::ConnectionInfo> {
+        match &*self.0 {
+            ConnectionKind::Shared { lease, token, .. } => timeout(RPC_TIMEOUT, async {
+                let mut stream =
+                    UnixStream::connect(ipc::socket(&ipc::runtime(lease.identity)?)).await?;
+                let Response::Inspected { info } = ipc::request(
+                    &mut stream,
+                    Operation::Inspect {
+                        lease: lease.token,
+                        connection: *token,
+                    },
+                )
+                .await?
+                else {
+                    bail!("incompatible local broker; restart Attached client commands");
+                };
+                Ok(info)
+            })
+            .await
+            .context("local broker inspection timed out")?,
+            #[cfg(test)]
+            ConnectionKind::Direct(connection) => Ok(ipc::ConnectionInfo::measure(connection)),
         }
     }
 
