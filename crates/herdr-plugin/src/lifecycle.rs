@@ -25,7 +25,7 @@ pub(crate) fn identity(path: &Path) -> Result<(u64, u64)> {
     Ok((metadata.dev(), metadata.ino()))
 }
 
-fn try_lock(path: &Path) -> Result<Option<File>> {
+pub(crate) fn try_lock(path: &Path) -> Result<Option<File>> {
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -55,13 +55,18 @@ fn exporter_running(home: &Path) -> Result<bool> {
 }
 
 #[derive(Default)]
-struct Exporter {
+pub(crate) struct Exporter {
     child: Option<ChildGroup>,
     reader: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Exporter {
-    async fn ensure(&mut self, home: &Path, attached: &CliAttached, log: &Log) -> Result<()> {
+    pub(crate) async fn ensure(
+        &mut self,
+        home: &Path,
+        attached: &CliAttached,
+        log: &Log,
+    ) -> Result<()> {
         if let Some(child) = &mut self.child {
             if child.child.try_wait()?.is_none() {
                 return Ok(());
@@ -101,7 +106,7 @@ impl Exporter {
         Ok(())
     }
 
-    async fn stop(&mut self) {
+    pub(crate) async fn stop(&mut self) {
         if let Some(mut child) = self.child.take() {
             child.stop().await;
         }

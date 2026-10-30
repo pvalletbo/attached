@@ -32,15 +32,19 @@ impl State {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        let parent = path.parent().context("state path has no parent")?;
-        let mut file = tempfile::NamedTempFile::new_in(parent)?;
-        serde_json::to_writer(file.as_file_mut(), self)?;
-        file.as_file().sync_all()?;
-        file.persist(path)
-            .context("could not save discovery state")?;
-        File::open(parent)?.sync_all()?;
-        Ok(())
+        save_json(path, self)
     }
+}
+
+pub(crate) fn save_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    let parent = path.parent().context("state path has no parent")?;
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    serde_json::to_writer(file.as_file_mut(), value)?;
+    file.as_file().sync_all()?;
+    file.persist(path)
+        .context("could not save discovery state")?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 #[derive(Clone)]

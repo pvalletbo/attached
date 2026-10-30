@@ -21,6 +21,7 @@ on:
       - crates/cli/**
       - crates/herdr-plugin/**
       - plugins/herdr/**
+      - plugins/herdr-app/**
       - crates/session-sync-protocol/**
       - crates/session-sync-worker/**
       - crates/tunnel-protocol/**
@@ -69,6 +70,7 @@ jobs:
               - 'crates/cli/**'
               - 'crates/herdr-plugin/**'
               - 'plugins/herdr/**'
+              - 'plugins/herdr-app/**'
               - 'crates/session-sync-protocol/**'
               - 'crates/session-sync-worker/**'
               - 'crates/tunnel-protocol/**'
@@ -123,6 +125,12 @@ jobs:
           --package attached-session-sync-worker
           --package attached-tunnel-protocol
           -- --check
+      - name: Install Node.js for desktop mod tests
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - name: Test the Herdr app mod without a running app
+        run: node --test plugins/herdr-app/tests/*.test.mjs
       - name: Run core workspace tests
         run: >-
           cargo test --workspace --locked
