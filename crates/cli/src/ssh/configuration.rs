@@ -22,12 +22,25 @@ const FALLBACK: &str =
     "Host attached-*\n    ProxyCommand false\n    CanonicalizeHostname no\nHost *\n";
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 
+struct ExporterLock(File);
+
+impl Drop for ExporterLock {
+    fn drop(&mut self) {
+        // Closing this fd alone is insufficient if another thread forked while
+        // it was locked: the pre-exec child shares the open file description.
+        // Explicitly unlock on both normal cleanup and failed installation.
+        if let Err(error) = FileExt::unlock(&self.0) {
+            tracing::warn!(%error, "could not unlock SSH exporter lock");
+        }
+    }
+}
+
 pub(super) struct ManagedConfig {
     source: PathBuf,
     target: PathBuf,
     block: String,
     directory: StateDir,
-    _lock: File,
+    _lock: ExporterLock,
 }
 
 impl ManagedConfig {
@@ -54,7 +67,8 @@ impl ManagedConfig {
         FileExt::try_lock(&lock).context(
             "another attached export-ssh-config is already running for this home directory",
         )?;
-        directory.verify_locked_file(&managed, "broker.lock", &lock)?;
+        let lock = ExporterLock(lock);
+        directory.verify_locked_file(&managed, "broker.lock", &lock.0)?;
         if let Some(bytes) = directory.read_secret_optional_bounded("config", MAX_CONFIG_BYTES)? {
             ensure!(
                 bytes.starts_with(HEADER.as_bytes()),
@@ -435,6 +449,27 @@ mod tests {
         drop(managed);
         assert!(source.is_symlink());
         assert_eq!(fs::read(&target).unwrap(), b"Host example\n  User test\n");
+    }
+
+    #[test]
+    fn cleanup_releases_the_lock_even_while_an_inherited_descriptor_is_open() {
+        let home = crate::test_support::canonical_tempdir();
+        let managed = ManagedConfig::install(home.path()).unwrap();
+        // A duplicate shares the open file description, just like a descriptor
+        // inherited by another thread's fork before the child reaches exec.
+        let inherited = managed._lock.0.try_clone().unwrap();
+        assert!(ManagedConfig::install(home.path()).is_err());
+        drop(managed);
+
+        let replacement = ManagedConfig::install(home.path())
+            .expect("cleanup must unlock even when an inherited descriptor stays open");
+        drop(inherited);
+        assert!(
+            ManagedConfig::install(home.path()).is_err(),
+            "closing the stale descriptor must not unlock the replacement exporter"
+        );
+        drop(replacement);
+        let _next = ManagedConfig::install(home.path()).unwrap();
     }
 
     #[test]
