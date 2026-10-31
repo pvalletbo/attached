@@ -1,4 +1,6 @@
+mod app;
 mod attached;
+mod core;
 mod discovery;
 mod herdr;
 mod lifecycle;
@@ -53,7 +55,24 @@ fn run() -> Result<()> {
             ));
             Ok(())
         }
-        _ => bail!("usage: attached-herdr-plugin install|ensure (launched by Herdr)"),
+        [action, home] if action == "app-install" => app::install(std::path::Path::new(home)),
+        [action, directory] if action == "app-heartbeat" || action == "app-pause" => {
+            app::heartbeat(
+                std::path::Path::new(directory),
+                action == "app-heartbeat",
+                false,
+            )
+        }
+        [action, directory, flag] if action == "app-heartbeat" && flag == "--install-core" => {
+            app::heartbeat(std::path::Path::new(directory), true, true)
+        }
+        [action, directory] if action == "app-run" => {
+            rustix::process::setsid().context("could not detach app discovery worker")?;
+            runtime()?.block_on(app::worker(std::path::Path::new(directory)))
+        }
+        _ => bail!(
+            "usage: attached-herdr-plugin install|ensure (legacy Herdr)\n  app-install <absolute-app-home>\n  app-heartbeat <absolute-state-directory> [--install-core]\n  app-pause <absolute-state-directory>"
+        ),
     }
 }
 
