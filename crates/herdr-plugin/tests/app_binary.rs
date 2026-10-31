@@ -242,7 +242,15 @@ fn installer_bundles_the_mod_and_worker_but_refuses_to_overwrite_personal_files(
     let installed = home.join("mods/attached-discovery");
     assert!(installed.join("worker").is_file());
     assert!(installed.join("main.js").is_file());
-    assert!(installed.join("mod.json").is_file());
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(installed.join("mod.json")).unwrap()).unwrap();
+    assert_eq!(manifest["place"], "none");
+    assert_eq!(manifest["overlay"]["kind"], "popup");
+    assert_eq!(
+        fs::read_to_string(installed.join("README.md")).unwrap(),
+        include_str!("../../../plugins/herdr-app/README.md")
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("mod.open"));
     assert_ne!(
         fs::metadata(installed.join("worker"))
             .unwrap()

@@ -114,8 +114,10 @@ test("worker errors are visible and do not wedge subsequent refreshes", async ()
   assert.equal(f.mod.error, null);
 });
 
-test("manifest offers panel placement without editing a shipped layout", async () => {
+test("manifest opens on demand as a popup and never auto-docks a panel", async () => {
   const manifest = JSON.parse(await readFile(new URL("../mods/attached-discovery/mod.json", import.meta.url), "utf8"));
-  assert.equal(manifest.place, "bottom");
-  assert.ok(manifest.size >= 100);
+  assert.equal(manifest.place, "none");
+  assert.equal(manifest.overlay.kind, "popup");
+  assert.ok(manifest.overlay.width >= 900);
+  assert.ok(manifest.overlay.height >= 124);
 });

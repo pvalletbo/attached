@@ -1,8 +1,8 @@
 // Build: cargo build --release --locked -p attached-herdr-plugin
 // Install: target/release/attached-herdr-plugin app-install "$HOME/.config/herdr-app"
-// Then mount content: {mod: "attached-discovery"} in a personal layout block
-// (e.g. a 124px footer). Clone a shipped layout with layout.clone first.
-// Or open a mod pane: herdr-app do tab.new --mod attached-discovery --name "Attached discovery"
+// Open on demand: herdr-app do mod.open --name attached-discovery
+// Closing the popup stops renewal unless another copy remains loaded.
+// A personal layout block or mod tab is optional; see the bundled README.md.
 // This mod runs programs (hc, ssh, attached) through its bundled Rust worker,
 // reads ~/.ssh/attached/discovery.json, and writes only its own app data.
 // It enrolls reachable publishers; core installs/upgrades require explicit opt-in.

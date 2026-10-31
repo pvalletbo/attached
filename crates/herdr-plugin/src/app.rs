@@ -216,10 +216,14 @@ pub(crate) fn install(home: &Path) -> Result<()> {
         staging.path().join("mod.json"),
         include_str!("../../../plugins/herdr-app/mods/attached-discovery/mod.json"),
     )?;
+    fs::write(
+        staging.path().join("README.md"),
+        include_str!("../../../plugins/herdr-app/README.md"),
+    )?;
     fs::copy(std::env::current_exe()?, staging.path().join("worker"))?;
     fs::rename(staging.path(), &destination)?;
     println!(
-        "Installed {}\nMount attached-discovery in a PERSONAL layout or mod pane to start discovery.\nFor startup discovery, keep its block in the layout you open the app with.\nClone shipped layouts before adding a block; no layouts were modified.\nIt executes hc/ssh/attached and reads ~/.ssh/attached/discovery.json.\nCore installation/upgrades are off until explicitly enabled in the panel.\nOwnership and logs: {}/data/attached-discovery\nValidate: herdr-app check {}",
+        "Installed {}\nOpen on demand: herdr-app do mod.open --name attached-discovery\nFor a custom app home, set HERDR_APP_HOME to that directory.\nDiscovery runs only while a mod copy is loaded; its lease expires after the last copy closes.\nNo layouts, panes or system services were created.\nIt executes hc/ssh/attached and reads ~/.ssh/attached/discovery.json.\nCore installation/upgrades are off until explicitly enabled in the popup.\nInstallation, removal and status checks: README.md in the installed mod folder.\nOwnership and logs: {}/data/attached-discovery\nValidate: herdr-app check {}",
         destination.display(),
         home.display(),
         destination.display()
