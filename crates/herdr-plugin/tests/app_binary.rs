@@ -192,7 +192,12 @@ fn heartbeat_starts_a_detached_worker_and_renews_one_shared_lease() {
             .unwrap();
         assert!(output.status.success());
         assert!(serde_json::from_slice::<serde_json::Value>(&output.stdout).is_ok());
-        fixture.until(|| fixture.events().contains("check"));
+        // The worker can finish its first hc query before the separately
+        // spawned exporter has written its readiness marker.
+        fixture.until(|| {
+            let events = fixture.events();
+            events.contains("check") && events.contains("exporter-start")
+        });
     }
     assert_eq!(fixture.events().matches("exporter-start").count(), 1);
     let output = fixture
