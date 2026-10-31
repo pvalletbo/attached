@@ -110,8 +110,8 @@ impl Core {
 
 fn machine_name(label: &str, endpoint: &str) -> String {
     // Duplicate publisher labels arrive as "host (endpoint-prefix)" from the
-    // shared reconciler. hc permits 32 characters total: reserve 18 for the
-    // attached- prefix and endpoint suffix, leaving 14 for the publisher label.
+    // shared reconciler. Keep the existing bounded host label and stable suffix,
+    // but reserve the attached- transport namespace for SSH aliases, not hc names.
     let host = label.split(' ').next().unwrap_or("machine");
     let host = host
         .chars()
@@ -124,7 +124,7 @@ fn machine_name(label: &str, endpoint: &str) -> String {
             }
         })
         .collect::<String>();
-    format!("attached-{host}-{}", &endpoint[..8])
+    format!("{host}-{}", &endpoint[..8])
 }
 
 impl MachineRegistry for Core {
@@ -387,6 +387,22 @@ esac
     }
 
     #[tokio::test]
+    async fn enrollment_omits_transport_prefix_but_preserves_ssh_target_and_ownership() {
+        let fixture = Fixture::new();
+        let core = fixture.core(false);
+        let target = format!("attached-{}", "01".repeat(32));
+        let ownership = core.add(&target, "Office").await.unwrap();
+        let machines = core.saved().await.unwrap();
+        assert_eq!(machines.len(), 1);
+        assert_eq!(machines[0].name, "office-01010101");
+        assert_eq!(machines[0].target, target);
+        assert_eq!(machines[0].ownership().unwrap(), ownership);
+        core.remove(&ownership).await.unwrap();
+        assert!(core.saved().await.unwrap().is_empty());
+        assert!(fixture.events().contains("remove office-01010101"));
+    }
+
+    #[tokio::test]
     async fn long_publisher_labels_enroll_with_names_accepted_by_hc() {
         let fixture = Fixture::new();
         let core = fixture.core(false);
@@ -434,15 +450,16 @@ esac
     fn names_are_bounded_safe_and_disambiguated_by_stable_endpoint() {
         let first = "01".repeat(32);
         let second = "02".repeat(32);
-        assert_eq!(
-            machine_name("Office (01010101)", &first),
-            "attached-office-01010101"
-        );
+        assert_eq!(machine_name("Office (01010101)", &first), "office-01010101");
         assert_ne!(
             machine_name("Office", &first),
             machine_name("Office", &second)
         );
-        assert_eq!(machine_name(&"X".repeat(100), &first).len(), 32);
+        assert_eq!(machine_name(&"X".repeat(100), &first).len(), 23);
+        assert_eq!(
+            machine_name("attached-office", &first),
+            "attached-offic-01010101"
+        );
         assert!(machine_name("proxmox-internal-1", &first).len() <= 32);
         assert!(machine_name("task-f157c02357a5482bb520a8fb76fe634f", &first).len() <= 32);
     }
